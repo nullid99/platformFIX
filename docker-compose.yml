@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fix-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fix_platform
+      POSTGRES_USER: fix_app
+      POSTGRES_PASSWORD: fix_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - fix-platform-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fix_app -d fix_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  fix-platform-postgres:
