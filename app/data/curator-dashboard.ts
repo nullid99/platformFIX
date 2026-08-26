@@ -1,6 +1,6 @@
 import type { AssignmentStatus, AssignmentTone } from "./student-dashboard";
 
-export type CuratorNav = "Кабинет куратора" | "Очередь проверки" | "Создать задание" | "Ученики" | "Расписание" | "Медиатека";
+export type CuratorNav = "Кабинет куратора" | "Очередь проверки" | "Создать задание" | "Ученики" | "Программа" | "Приглашения" | "Расписание" | "Стримы" | "Медиатека" | "Обсуждения";
 
 export type ReviewQueueItem = {
   id: string;
@@ -8,14 +8,26 @@ export type ReviewQueueItem = {
   studentInitials: string;
   assignmentTitle: string;
   module: string;
+  coverPath?: string | null;
   status: AssignmentStatus;
   tone: AssignmentTone;
   submittedAt: string;
   attempt: string;
   studentNote: string;
   answer: string;
+  requirements?: readonly string[];
   attachments: readonly string[];
+  attachmentFiles?: readonly { id: string; name: string; type: string; size: number; url: string }[];
+  /** All submissions for this assignment/student pair, oldest first. */
+  attemptHistory?: readonly { attempt: number; status: AssignmentStatus; submittedAt: string }[];
   progress: string;
+  reviewerId?: string | null;
+  reviewerName?: string | null;
+  /** False when reviewerId belongs to a different curator — disables deciding on this submission. */
+  isReviewerSelf?: boolean;
+  claimedAt?: string | null;
+  /** Requirement texts the curator had checked at decision time. Advisory only — not all need be checked to accept. */
+  checkedRequirements?: readonly string[] | null;
 };
 
 export const curatorDashboard = {

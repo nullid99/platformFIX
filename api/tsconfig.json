@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "..",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "../dist/api",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["src/**/*.ts", "../app/server/**/*.ts", "../app/generated/prisma/**/*.ts"]
+}

@@ -1,0 +1,76 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: fix-platform-staging-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env.staging}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env.staging}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.staging}
+    volumes:
+      - fix-platform-staging-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [staging]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: fix-platform-staging-api
+    restart: unless-stopped
+    env_file: .env.staging
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.staging}
+      API_PORT: 4000
+      TRUST_PROXY: "true"
+      TRUST_PROXY_HOPS: "1"
+    volumes:
+      - fix-platform-staging-storage:/app/.storage/private
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [staging]
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        API_PROXY_TARGET: http://api:4000
+        NEXT_PUBLIC_DEV_AUTH_ENABLED: ${NEXT_PUBLIC_DEV_AUTH_ENABLED:-false}
+    container_name: fix-platform-staging-web
+    restart: unless-stopped
+    env_file: .env.staging
+    environment:
+      API_PROXY_TARGET: http://api:4000
+      PORT: 3000
+    depends_on:
+      - api
+    networks: [staging]
+
+  # The only public entry point. It strips client-supplied forwarded headers
+  # and adds the real peer address before forwarding requests to the API.
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: fix-platform-staging-proxy
+    restart: unless-stopped
+    depends_on:
+      - api
+      - web
+    ports:
+      - "8082:80"
+    volumes:
+      - ./infra/nginx/staging.conf:/etc/nginx/nginx.conf:ro
+    networks: [staging]
+
+volumes:
+  fix-platform-staging-db:
+  fix-platform-staging-storage:
+
+networks:
+  staging:
+    name: fix-platform-staging-network

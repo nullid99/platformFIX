@@ -27,7 +27,6 @@
 Проверяют форматы интеграций:
 
 - Discord;
-- Telegram;
 - Vimeo;
 - email/webhook providers.
 

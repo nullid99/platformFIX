@@ -21,14 +21,14 @@ docs/
 
 ## Доменные модули
 
-- `auth`: вход, сессии, 2FA, passkeys, привязки Telegram и Discord;
+- `auth`: вход, сессии, 2FA, passkeys, привязка Discord;
 - `users`: профили и роли;
 - `cohorts`: практикумы, потоки, зачисления и сроки доступа;
 - `courses`: модули, уроки, материалы и прогресс;
 - `assignments`: ДЗ, попытки, вложения, статусы и проверки;
 - `scheduling`: конференции, места и записи;
 - `media`: видео, файлы, права просмотра и водяные знаки;
-- `notifications`: email, Telegram и Discord-уведомления;
+- `notifications`: email и Discord-уведомления;
 - `integrations`: внешние API и webhook-и;
 - `audit`: журнал критичных действий.
 

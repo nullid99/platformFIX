@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+!.env.staging.example
+.storage
+dist
+releases
+backups
+*.log
+tsconfig.tsbuildinfo

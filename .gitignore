@@ -6,3 +6,10 @@ node_modules/
 app/generated/
 prisma/*.db
 *.log
+*.tsbuildinfo
+.storage/
+dist/
+/test-results/
+/playwright-report/
+/e2e/.auth/
+!.env.staging.example

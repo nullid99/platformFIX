@@ -10,6 +10,7 @@ datasource db {
 enum UserRole {
   STUDENT
   CURATOR
+  OWNER
 }
 
 enum UserStatus {
@@ -28,8 +29,21 @@ enum InvitationStatus {
 
 enum SessionStatus {
   ACTIVE
+  PENDING
   REVOKED
   EXPIRED
+}
+
+enum IdentityProvider {
+  DISCORD
+  LOCAL
+}
+
+enum LoginEventOutcome {
+  SUCCESS
+  FAILED
+  CHALLENGE
+  BLOCKED
 }
 
 enum EnrollmentStatus {
@@ -47,6 +61,33 @@ enum LessonType {
   QA
 }
 
+enum MediaAssetKind {
+  LESSON_VIDEO
+  STREAM
+  QA
+  BREAKDOWN
+  TALKS
+}
+
+enum MediaAssetStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ScheduleEventType {
+  PRACTICE
+  QA
+  BREAKDOWN
+  BACKTEST
+}
+
+enum ModuleAccessStatus {
+  LOCKED
+  UNLOCKED
+  COMPLETED
+}
+
 enum AssignmentStatus {
   DRAFT
   PUBLISHED
@@ -61,9 +102,42 @@ enum SubmissionStatus {
   ACCEPTED
 }
 
+enum StoredFileStatus {
+  PENDING
+  UPLOADED
+  FAILED
+  DELETED
+}
+
+enum AssignmentMaterialKind {
+  LINK
+  FILE
+}
+
+enum DiscussionStatus {
+  NEW
+  WAITING
+  ANSWERED
+  CLOSED
+}
+
+enum DiscussionVisibility {
+  PRIVATE
+  COHORT
+}
+
+enum NotificationType {
+  NEW_ASSIGNMENT
+  NEW_MEDIA
+  NEW_EVENT
+  DISCUSSION_REPLY
+  REVIEW_DECISION
+  STREAM_LIVE
+}
+
 model User {
   id                 String               @id @default(cuid())
-  email              String               @unique
+  email              String?              @unique
   passwordHash       String?
   role               UserRole
   status             UserStatus           @default(INVITED)
@@ -71,31 +145,83 @@ model User {
   twoFactorEnabled   Boolean              @default(false)
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
+  externalIdentities ExternalIdentity[]
   sessions           Session[]
   sentInvitations    Invitation[]         @relation("InvitationSender")
+  acceptedInvitations Invitation[]        @relation("InvitationAcceptedBy")
   enrollments        Enrollment[]
   curatorAssignments CuratorAssignment[]  @relation("CuratorAssignments")
   studentAssignments CuratorAssignment[]  @relation("StudentAssignments")
   submissions        Submission[]
+  reviewClaims       Submission[]        @relation("SubmissionReviewer")
+  storedFiles         StoredFile[]
   feedback           Feedback[]           @relation("FeedbackAuthor")
+  studentDiscussionThreads DiscussionThread[] @relation("DiscussionStudentThreads")
+  curatorDiscussionThreads DiscussionThread[] @relation("DiscussionCuratorThreads")
+  discussionMessages DiscussionMessage[]
   auditLogs          AuditLog[]
+  loginEvents        LoginEvent[]
+  emailVerificationTokens EmailVerificationToken[]
+  streamMessages     StreamMessage[]
+  streamMessageReactions StreamMessageReaction[]
+  mediaPlaybackEvents MediaPlaybackEvent[]
+  notifications      Notification[]
+  backtestBookings   ScheduleEvent[]      @relation("ScheduleEventBooking")
 
   @@index([role, status])
 }
 
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  email     String
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt, usedAt])
+}
+
+model ExternalIdentity {
+  id             String           @id @default(cuid())
+  userId         String
+  provider       IdentityProvider
+  providerSubject String
+  username       String?
+  displayName    String?
+  avatarUrl      String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerSubject])
+  @@index([userId])
+}
+
 model Invitation {
-  id          String           @id @default(cuid())
-  email       String
-  role        UserRole
-  tokenHash   String           @unique
-  status      InvitationStatus @default(PENDING)
-  expiresAt   DateTime
-  acceptedAt  DateTime?
-  createdAt   DateTime         @default(now())
-  createdById String?
-  createdBy   User?            @relation("InvitationSender", fields: [createdById], references: [id], onDelete: SetNull)
+  id             String           @id @default(cuid())
+  email          String?
+  role           UserRole
+  tokenHash      String           @unique
+  status         InvitationStatus @default(PENDING)
+  targetProvider IdentityProvider?
+  targetSubject  String?
+  practicumId    String?
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdAt      DateTime         @default(now())
+  createdById    String?
+  acceptedById   String?
+  createdBy      User?            @relation("InvitationSender", fields: [createdById], references: [id], onDelete: SetNull)
+  acceptedBy     User?            @relation("InvitationAcceptedBy", fields: [acceptedById], references: [id], onDelete: SetNull)
+  practicum      Practicum?       @relation(fields: [practicumId], references: [id], onDelete: SetNull)
 
   @@index([email, status])
+  @@index([targetProvider, targetSubject, status])
+  @@index([practicumId, status])
   @@index([expiresAt, status])
 }
 
@@ -103,21 +229,61 @@ model Session {
   id             String        @id @default(cuid())
   userId         String
   tokenHash      String        @unique
+  deviceKeyHash  String?
   status         SessionStatus @default(ACTIVE)
   deviceName     String?
   userAgent      String?
   ipAddress      String?
+  ipHash         String?
   countryCode    String?
   city           String?
+  riskScore      Int?
+  riskReason     String?
   lastActiveAt   DateTime      @default(now())
   expiresAt      DateTime
   revokedAt      DateTime?
   createdAt      DateTime      @default(now())
   user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId, status])
+  @@index([userId, status, lastActiveAt])
+  @@index([deviceKeyHash, status])
   @@index([ipAddress, createdAt])
   @@index([expiresAt, status])
+}
+
+model LoginEvent {
+  id              String           @id @default(cuid())
+  userId          String?
+  provider        IdentityProvider?
+  providerSubject String?
+  outcome         LoginEventOutcome
+  deviceName      String?
+  userAgent       String?
+  ipAddress       String?
+  ipHash          String?
+  countryCode     String?
+  city            String?
+  riskScore       Int?
+  reasonCode      String?
+  createdAt       DateTime         @default(now())
+  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([outcome, createdAt])
+  @@index([ipHash, createdAt])
+}
+
+model DiscordAuthChallenge {
+  id                       String   @id @default(cuid())
+  stateHash                String   @unique
+  codeVerifierCiphertext   String
+  invitationTokenCiphertext String?
+  redirectUri              String
+  expiresAt                DateTime
+  usedAt                   DateTime?
+  createdAt                DateTime @default(now())
+
+  @@index([expiresAt, usedAt])
 }
 
 model Practicum {
@@ -125,10 +291,51 @@ model Practicum {
   title        String
   description  String?
   accessUntil  DateTime?
+  streamLiveInputUid String?
+  currentStreamSessionStartedAt DateTime?
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
   enrollments  Enrollment[]
   modules      Module[]
+  invitations  Invitation[]
+  mediaAssets  MediaAsset[]
+  scheduleEvents ScheduleEvent[]
+  streamMessages StreamMessage[]
+}
+
+model StreamMessage {
+  id          String     @id @default(cuid())
+  practicumId String
+  authorId    String
+  body        String
+  fileId      String?
+  replyToId   String?
+  createdAt   DateTime   @default(now())
+  practicum   Practicum  @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  author      User       @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  file        StoredFile? @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  // SetNull (not Cascade) — deleting the original leaves replies in place, just without a
+  // quoted preview, same as Discord "Original message was deleted".
+  replyTo     StreamMessage? @relation("StreamMessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies     StreamMessage[] @relation("StreamMessageReplies")
+  reactions   StreamMessageReaction[]
+
+  @@index([practicumId, createdAt])
+  @@index([fileId])
+  @@index([replyToId])
+}
+
+model StreamMessageReaction {
+  id        String        @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String
+  createdAt DateTime      @default(now())
+  message   StreamMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
 }
 
 model Enrollment {
@@ -141,6 +348,7 @@ model Enrollment {
   updatedAt   DateTime         @updatedAt
   student     User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
   practicum   Practicum        @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  moduleAccesses EnrollmentModuleAccess[]
 
   @@unique([studentId, practicumId])
   @@index([practicumId, status])
@@ -163,14 +371,45 @@ model Module {
   practicumId String
   title       String
   description String?
+  section     String     @default("Education")
+  coverPath   String?
   position    Int
+  // Source of truth for "is this module open to the whole cohort" — set by the curator's
+  // module-wide toggle. A student's own EnrollmentModuleAccess row still decides what THEY
+  // see; this only decides what a newly-enrolling student inherits and what the curator's
+  // admin screen reports (previously that screen just guessed from one arbitrary student's
+  // row, which is what caused open-looking-but-actually-locked modules).
+  defaultAccess ModuleAccessStatus @default(LOCKED)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   practicum   Practicum  @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   lessons     Lesson[]
+  accessRecords EnrollmentModuleAccess[]
+  discussionThreads DiscussionThread[]
 
   @@unique([practicumId, position])
   @@index([practicumId])
+}
+
+model EnrollmentModuleAccess {
+  id           String             @id @default(cuid())
+  enrollmentId String
+  moduleId     String
+  status       ModuleAccessStatus @default(LOCKED)
+  progress     Int                @default(0)
+  // True only when a curator explicitly set access for this one student (open or close),
+  // as opposed to inheriting the module's defaultAccess. The module-wide toggle skips
+  // override rows so it never silently clobbers a curator's individual decision.
+  isOverride   Boolean            @default(false)
+  unlockedAt   DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  enrollment   Enrollment         @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  module       Module             @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@unique([enrollmentId, moduleId])
+  @@index([moduleId, status])
 }
 
 model Lesson {
@@ -184,39 +423,122 @@ model Lesson {
   updatedAt   DateTime      @updatedAt
   module      Module        @relation(fields: [moduleId], references: [id], onDelete: Cascade)
   mediaAssets MediaAsset[]
-  assignment  Assignment?
+  assignments Assignment[]
+  discussionThreads DiscussionThread[]
 
   @@unique([moduleId, position])
   @@index([moduleId, type])
 }
 
 model MediaAsset {
-  id          String   @id @default(cuid())
-  lessonId    String
+  id          String           @id @default(cuid())
+  practicumId String
+  lessonId    String?
+  scheduleEventId String?
   provider    String
   providerKey String
+  kind        MediaAssetKind   @default(STREAM)
+  status      MediaAssetStatus @default(DRAFT)
   title       String?
+  description String?
   mimeType    String?
   durationSec Int?
-  createdAt   DateTime @default(now())
-  lesson      Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  position    Int              @default(0)
+  publishedAt DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  practicum   Practicum        @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  lesson      Lesson?          @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  scheduleEvent ScheduleEvent? @relation(fields: [scheduleEventId], references: [id], onDelete: SetNull)
   feedback    Feedback[]
+  playbackEvents MediaPlaybackEvent[]
 
-  @@unique([provider, providerKey])
-  @@index([lessonId])
+  @@unique([provider, providerKey, lessonId])
+  @@index([lessonId, status, position])
+  @@index([scheduleEventId, status, position])
+  @@index([practicumId, status, position])
+}
+
+/**
+ * One row per time a viewer actually opens a video (not per API fetch) — the
+ * audit trail behind the on-screen watermark. If a recording leaks, cross-referencing
+ * who opened that exact media around the leaked timestamp narrows down the source.
+ */
+/** Backs the in-app notification bell — real per-user events, not the static demo list it replaced. */
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  title     String
+  body      String?
+  entityId  String?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, read])
+}
+
+model MediaPlaybackEvent {
+  id           String     @id @default(cuid())
+  mediaAssetId String
+  userId       String
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime   @default(now())
+  mediaAsset   MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([mediaAssetId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model ScheduleEvent {
+  id          String            @id @default(cuid())
+  practicumId String
+  type        ScheduleEventType
+  title       String
+  date        DateTime          @db.Date
+  time        String
+  description String
+  live        Boolean           @default(false)
+  coverPath   String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  practicum   Practicum         @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  mediaAssets MediaAsset[]
+  // Individual BACKTEST slots: one event = one bookable time, claimed by at most one
+  // student. ScheduleService.book() additionally enforces one BACKTEST booking per
+  // student across the whole practicum — the personal review call is one-time, not a
+  // recurring resource, so the check is "does this student hold ANY booking" rather
+  // than a per-event capacity counter.
+  bookedByStudentId String?
+  bookedAt          DateTime?
+  bookedBy          User?             @relation("ScheduleEventBooking", fields: [bookedByStudentId], references: [id], onDelete: SetNull)
+
+  @@index([practicumId, date])
+  @@index([practicumId, type, date])
+  @@index([bookedByStudentId])
 }
 
 model Assignment {
   id          String           @id @default(cuid())
-  lessonId    String           @unique
+  lessonId    String
   title       String
   description String
+  requirements Json?
+  allowedFormats Json?
   status      AssignmentStatus @default(DRAFT)
   deadline    DateTime?
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
   lesson      Lesson           @relation(fields: [lessonId], references: [id], onDelete: Cascade)
   submissions Submission[]
+  materials   AssignmentMaterial[]
+  discussionThreads DiscussionThread[]
+
+  @@index([lessonId, status])
 }
 
 model Submission {
@@ -226,16 +548,77 @@ model Submission {
   attempt      Int              @default(1)
   status       SubmissionStatus @default(DRAFT)
   answerText   String?
+  attachments  Json?
   submittedAt  DateTime?
   createdAt    DateTime         @default(now())
   updatedAt    DateTime         @updatedAt
+  reviewerId   String?
+  claimedAt    DateTime?
+  // Snapshot (requirement text, not index — the assignment's own list can change later) of
+  // which criteria the curator had checked off at the moment they decided. Criteria are
+  // advisory, not a hard gate for acceptance — this is what lets the student/curator see
+  // later that a submission was accepted even though not every box was ticked.
+  checkedRequirements Json?
   assignment   Assignment       @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
   student      User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  reviewer     User?            @relation("SubmissionReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  fileAttachments SubmissionAttachment[]
   feedback     Feedback[]
 
   @@unique([assignmentId, studentId, attempt])
   @@index([studentId, status])
   @@index([assignmentId, status])
+  @@index([reviewerId, status])
+}
+
+model StoredFile {
+  id             String          @id @default(cuid())
+  ownerId        String
+  storageKey     String          @unique
+  originalName   String
+  mimeType       String
+  byteSize       Int
+  status         StoredFileStatus @default(PENDING)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  owner          User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  submissions    SubmissionAttachment[]
+  assignmentMaterials AssignmentMaterial[]
+  discussionAttachments DiscussionAttachment[]
+  streamMessages StreamMessage[]
+
+  @@index([ownerId, status])
+}
+
+model AssignmentMaterial {
+  id           String                 @id @default(cuid())
+  assignmentId String
+  kind         AssignmentMaterialKind
+  title        String
+  url          String?
+  fileId       String?
+  mimeType     String?
+  byteSize     Int?
+  position     Int                    @default(0)
+  createdAt    DateTime               @default(now())
+  assignment   Assignment             @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  file         StoredFile?            @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([assignmentId, position])
+  @@index([fileId])
+}
+
+model SubmissionAttachment {
+  id           String     @id @default(cuid())
+  submissionId String
+  fileId       String
+  position     Int        @default(0)
+  createdAt    DateTime   @default(now())
+  submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  file         StoredFile @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@unique([submissionId, fileId])
+  @@index([submissionId, position])
 }
 
 model Feedback {
@@ -250,6 +633,62 @@ model Feedback {
   mediaAsset   MediaAsset? @relation(fields: [mediaAssetId], references: [id], onDelete: SetNull)
 
   @@index([submissionId, createdAt])
+}
+
+model DiscussionThread {
+  id           String              @id @default(cuid())
+  studentId    String
+  curatorId    String?
+  moduleId     String?
+  lessonId     String?
+  assignmentId String?
+  title        String
+  status       DiscussionStatus    @default(NEW)
+  visibility   DiscussionVisibility @default(PRIVATE)
+  lastMessageAt DateTime           @default(now())
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  student      User                @relation("DiscussionStudentThreads", fields: [studentId], references: [id], onDelete: Cascade)
+  curator      User?               @relation("DiscussionCuratorThreads", fields: [curatorId], references: [id], onDelete: SetNull)
+  module       Module?             @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+  lesson       Lesson?             @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  assignment   Assignment?         @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  messages     DiscussionMessage[]
+
+  @@index([studentId, lastMessageAt])
+  @@index([curatorId, status, lastMessageAt])
+  @@index([lessonId, createdAt])
+  @@index([assignmentId, createdAt])
+}
+
+model DiscussionMessage {
+  id          String                 @id @default(cuid())
+  threadId    String
+  authorId    String
+  body        String
+  createdAt   DateTime               @default(now())
+  thread      DiscussionThread       @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  author      User                   @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  attachments DiscussionAttachment[]
+
+  @@index([threadId, createdAt])
+  @@index([authorId, createdAt])
+}
+
+model DiscussionAttachment {
+  id           String             @id @default(cuid())
+  messageId    String
+  fileId       String?
+  sourceUrl    String?
+  originalName String
+  mimeType     String
+  byteSize     Int
+  createdAt    DateTime           @default(now())
+  message      DiscussionMessage  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  file         StoredFile?        @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([messageId, createdAt])
+  @@index([fileId])
 }
 
 model AuditLog {

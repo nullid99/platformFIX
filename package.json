@@ -4,27 +4,56 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "api:dev": "tsx watch api/src/main.ts",
+    "api:build": "tsc -p api/tsconfig.json --noEmit",
+    "api:bootstrap-owner": "tsx api/src/bootstrap-owner.ts",
+    "api:bootstrap-course": "tsx api/src/bootstrap-course.ts",
+    "api:bootstrap-local-test-users": "tsx api/src/bootstrap-local-test-users.ts",
+    "api:bootstrap-stream-webhook": "tsx api/src/bootstrap-stream-webhook.ts",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@nestjs/common": "^11.1.28",
+    "@nestjs/core": "^11.1.28",
+    "@nestjs/platform-express": "^11.1.28",
+    "@nestjs/platform-socket.io": "^11.2.1",
+    "@nestjs/websockets": "^11.2.1",
+    "@prisma/adapter-pg": "^7.9.0",
     "@prisma/client": "^7.9.0",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.4.2",
+    "helmet": "^8.3.0",
+    "jose": "^6.2.4",
     "lucide-react": "latest",
     "next": "latest",
+    "pg": "^8.22.0",
     "prisma": "^7.9.0",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
     "@types/node": "latest",
+    "@types/pg": "^8.20.0",
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "eslint": "^9.39.5",
     "eslint-config-next": "^16.2.10",
-    "typescript": "^5.9.3"
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }
