@@ -613,7 +613,7 @@ export class AuthService {
         status: true,
         createdAt: true,
         externalIdentities: {
-          select: { provider: true, username: true, displayName: true },
+          select: { provider: true, username: true, displayName: true, avatarUrl: true },
         },
       },
     });
@@ -716,7 +716,7 @@ export class AuthService {
         status: true,
         createdAt: true,
         externalIdentities: {
-          select: { provider: true, username: true, displayName: true },
+          select: { provider: true, username: true, displayName: true, avatarUrl: true },
         },
         studentAssignments: {
           orderBy: { createdAt: "asc" },

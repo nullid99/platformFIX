@@ -317,9 +317,15 @@ export default function Home() {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [pendingDiscussionCount, setPendingDiscussionCount] = useState(0);
+  const [revisionAssignmentIds, setRevisionAssignmentIds] = useState<string[]>([]);
+  const [seenRevisionIds, setSeenRevisionIds] = useState<Set<string>>(new Set());
+  const pendingRevisionCount = revisionAssignmentIds.filter((id) => !seenRevisionIds.has(id)).length;
   const [unlockedModuleIds] = useState(() => new Set(practicumModules.filter((module) => !module.locked).map((module) => module.id)));
-  const currentNavItems = (role === "student" ? navItems : curatorNavItems).map((item) =>
-    item.label === "Обсуждения" && pendingDiscussionCount > 0 ? { ...item, badge: String(pendingDiscussionCount) } : item);
+  const currentNavItems = (role === "student" ? navItems : curatorNavItems).map((item) => {
+    if (item.label === "Обсуждения" && pendingDiscussionCount > 0) return { ...item, badge: String(pendingDiscussionCount) };
+    if (item.label === "Задания" && pendingRevisionCount > 0) return { ...item, badge: String(pendingRevisionCount) };
+    return item;
+  });
   // Real logged-in identity (Discord displayName/username) for whoever is viewing — used
   // for both roles now. It used to only replace the student fixture's name; the curator
   // side kept the static "Мария К." fixture regardless of who was actually logged in.
@@ -427,6 +433,26 @@ export default function Home() {
   }, [authenticated, role]);
 
   useEffect(() => {
+    // The "Задания" badge means "a curator sent this back for revision and you haven't
+    // opened the tab since" — it clears the moment the student visits, not when the
+    // assignment itself changes state (that still requires an actual resubmission).
+    if (!authenticated || role !== "student") return;
+    let cancelled = false;
+    const refresh = () => {
+      void fetch(`${API_ORIGIN}/api/assignments`, { credentials: "include", cache: "no-store" })
+        .then((response) => response.ok ? response.json() as Promise<{ data?: Assignment[] }> : null)
+        .then((payload) => {
+          if (cancelled || !payload?.data) return;
+          setRevisionAssignmentIds(payload.data.filter((assignment) => assignment.status === "Нужна доработка").map((assignment) => assignment.id));
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const poll = window.setInterval(refresh, 30_000);
+    return () => { cancelled = true; window.clearInterval(poll); };
+  }, [authenticated, role]);
+
+  useEffect(() => {
     if (!showNotifications) return;
     const handleClickOutside = (event: MouseEvent) => {
       if (!notificationWrapRef.current?.contains(event.target as Node)) setShowNotifications(false);
@@ -509,6 +535,7 @@ export default function Home() {
                 onClick={() => {
                   setActiveNav(item.label);
                   if (role === "student" && item.label === "Обсуждение") setRequestedDiscussionContext(null);
+                  if (role === "student" && item.label === "Задания") setSeenRevisionIds((current) => new Set([...current, ...revisionAssignmentIds]));
                   setMenuOpen(false);
                 }}
               >
@@ -802,7 +829,7 @@ function SectionView({ activeNav, unlockedModuleIds, requestedAssignmentId, requ
 function CuratorSectionView({ activeNav, onNavigate }: { activeNav: CuratorNav; onNavigate: (nextNav: CuratorNav) => void }) {
   const headings: Record<CuratorNav, { kicker: string; title: string; description: string }> = {
     "Кабинет куратора": { kicker: "РАБОЧИЙ ЦЕНТР", title: "Кабинет куратора", description: "Все работы, ученики и обратная связь по потоку собраны в одном рабочем контуре." },
-    "Очередь проверки": { kicker: "ПРОВЕРКА ДЗ", title: "Очередь проверки", description: "Начни с работ, которые ученики отправили сегодня, и не теряй контекст предыдущих попыток." },
+    "Очередь проверки": { kicker: "ПРОВЕРКА ДЗ", title: "Очередь проверки", description: "" },
     "Создать задание": { kicker: "НОВАЯ РАБОТА", title: "Создать задание", description: "Собери понятное ДЗ с критериями, сроком и форматом ответа для всего потока." },
     "Ученики": { kicker: "ПОТОК 04", title: "Ученики", description: "Прогресс, активность и история обратной связи по каждому участнику практикума." },
     "Программа": { kicker: "ДОСТУП К ПРОГРАММЕ", title: "Программа", description: "Управление доступностью модулей для участников потока." },
@@ -815,7 +842,7 @@ function CuratorSectionView({ activeNav, onNavigate }: { activeNav: CuratorNav; 
   const heading = headings[activeNav] ?? headings["Кабинет куратора"];
 
   const headingClass = activeNav === "Обсуждения" ? "curator-discussion-page-heading" : activeNav === "Медиатека" ? "media-page-heading" : activeNav === "Расписание" ? "schedule-page-heading" : activeNav === "Стримы" ? "curator-streams-page-heading" : activeNav === "Кабинет куратора" ? "curator-dashboard-page-heading" : activeNav === "Очередь проверки" ? "curator-queue-page-heading" : activeNav === "Создать задание" ? "curator-create-page-heading" : activeNav === "Ученики" ? "curator-students-page-heading" : activeNav === "Приглашения" ? "curator-invite-page-heading" : "";
-  return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1><p>{heading.description}</p></div></div>{activeNav === "Кабинет куратора" && <CuratorReviewWorkspace overview onNavigate={onNavigate} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace compact onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView onInvite={() => onNavigate("Приглашения")} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} />} {activeNav === "Приглашения" && <CuratorInvitationsView />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && <CuratorPlaceholder title={heading.title} />}</div>;
+  return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1>{heading.description && <p>{heading.description}</p>}</div></div>{activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView onInvite={() => onNavigate("Приглашения")} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} />} {activeNav === "Приглашения" && <CuratorInvitationsView />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && <CuratorPlaceholder title={heading.title} />}</div>;
 }
 
 async function fetchReviewQueue(): Promise<ReviewQueueItem[]> {
@@ -845,6 +872,7 @@ type CuratorDiscussion = {
   title: string;
   student: string;
   initials: string;
+  avatarUrl?: string | null;
   module: string;
   coverPath?: string | null;
   lesson: string;
@@ -861,7 +889,7 @@ type DiscussionApiThread = {
   module: { title: string; position: number; coverPath: string | null } | null;
   lesson: { title: string } | null;
   assignment: { title: string } | null;
-  student: { name: string | null; email: string | null };
+  student: { name: string | null; email: string | null; avatarUrl: string | null };
   messages: Array<{ id: string; authorRole: "STUDENT" | "CURATOR" | "OWNER"; authorName: string | null; body: string; createdAt: string; attachments: Array<{ originalName: string; mimeType: string; contentUrl: string | null; sourceUrl: string | null }> }>;
 };
 
@@ -876,6 +904,7 @@ function mapDiscussionApiThread(thread: DiscussionApiThread): CuratorDiscussion 
     title: thread.title,
     student: thread.student.name ?? thread.student.email ?? "Ученик",
     initials: getInitials(thread.student.name ?? thread.student.email ?? "Ученик", "УЧ"),
+    avatarUrl: thread.student.avatarUrl,
     module: courseModule,
     coverPath: discussionCoverForModule(thread.module?.position, thread.module?.coverPath),
     lesson: thread.lesson?.title ?? "",
@@ -1037,7 +1066,7 @@ function CuratorDiscussionsView() {
           })}
           <label className="curator-discussion-module-filter"><span>Урок / модуль</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
         </div>
-        <div className="curator-discussion-thread-list">{loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем обсуждения…</strong><span>Проверяем темы из базы данных.</span></div> : loadError ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить обсуждения</strong><span>{loadError}</span></div> : visibleThreads.length > 0 ? visibleThreads.map((thread) => <button className={`curator-discussion-thread-row ${thread.id === selectedThread?.id ? "selected" : ""}`} type="button" key={thread.id} onClick={() => setSelectedId(thread.id)}><div className={`profile-avatar ${thread.status === "ANSWERED" ? "curator" : ""} ${thread.coverPath ? "has-cover" : ""}`} style={thread.coverPath ? { backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.45), rgba(8,17,27,.85)), url("${thread.coverPath}")` } : undefined}>{!thread.coverPath && thread.initials}</div><div><strong>{thread.title}</strong><span>{thread.student} · {thread.module}</span><small>{thread.updatedAt} · {thread.messages.length} {thread.messages.length === 1 ? "сообщение" : "сообщения"}</small></div><b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b><ChevronRight size={15} /></button>) : <div className="empty-state"><MessageSquareText size={22} /><strong>Обсуждений пока нет</strong><span>Новые вопросы появятся здесь после отправки учеником.</span></div>}</div>
+        <div className="curator-discussion-thread-list">{loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем обсуждения…</strong><span>Проверяем темы из базы данных.</span></div> : loadError ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить обсуждения</strong><span>{loadError}</span></div> : visibleThreads.length > 0 ? visibleThreads.map((thread) => <button className={`curator-discussion-thread-row ${thread.id === selectedThread?.id ? "selected" : ""}`} type="button" key={thread.id} onClick={() => setSelectedId(thread.id)}>{thread.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={thread.avatarUrl} alt={thread.student} width={34} height={34} unoptimized /> : <div className={`profile-avatar ${thread.status === "ANSWERED" ? "curator" : ""}`}>{thread.initials}</div>}<div><strong>{thread.title}</strong><span>{thread.student} · {thread.module}</span><small>{thread.updatedAt} · {thread.messages.length} {thread.messages.length === 1 ? "сообщение" : "сообщения"}</small></div><b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b><ChevronRight size={15} /></button>) : <div className="empty-state"><MessageSquareText size={22} /><strong>Обсуждений пока нет</strong><span>Новые вопросы появятся здесь после отправки учеником.</span></div>}</div>
       </section>
       {selectedThread ? <section className="content-panel curator-discussion-detail">
         <div className="curator-discussion-detail-head"><div><span className="section-kicker">{selectedThread.module}</span><h2>{selectedThread.title}</h2><p>{selectedThread.student}{selectedThread.lesson ? ` · ${selectedThread.lesson}` : ""}{selectedThread.assignment ? ` · ${selectedThread.assignment}` : ""}</p></div><span className={`curator-discussion-status ${selectedThread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(selectedThread.status)}</span></div>
@@ -1050,7 +1079,110 @@ function CuratorDiscussionsView() {
   </div>;
 }
 
-function CuratorReviewWorkspace({ compact = false, overview = false, onNavigate }: { compact?: boolean; overview?: boolean; onNavigate?: (nextNav: CuratorNav) => void }) {
+function CuratorDashboardOverview({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
+  const [localQueue, setLocalQueue] = useState<ReviewQueueItem[]>([]);
+  const [studentCount, setStudentCount] = useState<number | null>(null);
+  const [discussions, setDiscussions] = useState<CuratorDiscussion[]>([]);
+  const [upcomingEvents, setUpcomingEvents] = useState<ScheduleEvent[]>([]);
+
+  useEffect(() => {
+    const handleSubmitted = (event: Event) => {
+      if (event.type !== assignmentSubmittedEvent) return;
+      void fetchReviewQueue().then(setLocalQueue).catch(() => setLocalQueue([]));
+    };
+    void fetchReviewQueue().then(setLocalQueue).catch(() => setLocalQueue([]));
+    window.addEventListener(assignmentSubmittedEvent, handleSubmitted);
+    return () => window.removeEventListener(assignmentSubmittedEvent, handleSubmitted);
+  }, []);
+
+  useEffect(() => {
+    void fetch(`${API_ORIGIN}/api/security/students`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ data?: unknown[] }> : null)
+      .then((payload) => { if (Array.isArray(payload?.data)) setStudentCount(payload.data.length); })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${API_ORIGIN}/api/discussions/manage`, { credentials: "include", cache: "no-store" }).then(async (response) => {
+      if (!response.ok) return;
+      const payload = await response.json() as { data?: DiscussionApiThread[] };
+      if (cancelled || !Array.isArray(payload.data)) return;
+      setDiscussions(payload.data.map(mapDiscussionApiThread));
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${API_ORIGIN}/api/schedule`, { credentials: "include", cache: "no-store" }).then(async (response) => {
+      if (!response.ok) return;
+      const payload = await response.json() as { data?: ScheduleApiEvent[] };
+      if (cancelled || !Array.isArray(payload.data)) return;
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const events = payload.data.map(scheduleApiToUi)
+        .filter((event) => new Date(`${event.date}T12:00:00`) >= today)
+        .sort((a, b) => eventStartDate(a).getTime() - eventStartDate(b).getTime());
+      setUpcomingEvents(events);
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  // Cohort-wide counts stay in the top row (curators share one queue); "Проверено вами" is
+  // scoped to this curator specifically — with 2-3 curators on one stream, a shared "Принято"
+  // number told nobody which of them was actually doing the reviewing.
+  const reviewCount = localQueue.filter((item) => item.status === "На проверке").length;
+  const revisionCount = localQueue.filter((item) => item.status === "Нужна доработка").length;
+  const reviewedByMeCount = localQueue.filter((item) => item.status === "Принято" && item.isReviewerSelf).length;
+  const recentQueue = localQueue.slice(0, 3);
+  const pendingDiscussions = discussions.filter((thread) => thread.status === "NEW" || thread.status === "WAITING").slice(0, 3);
+  const nextEvents = upcomingEvents.slice(0, 3);
+
+  return <>
+    <div className="stats-grid curator-stats">
+      <StatCard icon={<FileCheck2 size={17} />} label="Работы на проверке" value={String(reviewCount)} detail="Ждут решения куратора" accent="blue" onClick={() => onNavigate("Очередь проверки")} />
+      <StatCard icon={<RotateCcw size={17} />} label="Нужна доработка" value={String(revisionCount)} detail="Ждут ответа ученика" accent="amber" onClick={() => onNavigate("Очередь проверки")} />
+      <StatCard icon={<CheckCircle2 size={17} />} label="Проверено вами" value={String(reviewedByMeCount)} detail="Принято лично вами" accent="cyan" onClick={() => onNavigate("Очередь проверки")} />
+      <StatCard icon={<GraduationCap size={17} />} label="Ученики в потоке" value={studentCount === null ? "—" : String(studentCount)} detail="Активные участники" accent="blue" onClick={() => onNavigate("Ученики")} />
+    </div>
+    <div className="curator-dashboard-widgets">
+      <section className="content-panel curator-dashboard-widget">
+        <div className="section-heading"><div><h2>Последние работы</h2></div><span className="progress-inline">{localQueue.length}</span></div>
+        <div className="curator-dashboard-widget-list">
+          {recentQueue.length > 0 ? recentQueue.map((item) => <button className="curator-dashboard-widget-row" type="button" key={item.id} onClick={() => onNavigate("Очередь проверки")}>
+            {item.studentAvatarUrl ? <Image className="profile-avatar profile-avatar-image" src={item.studentAvatarUrl} alt={item.studentName} width={30} height={30} unoptimized /> : <div className="profile-avatar">{item.studentInitials}</div>}
+            <div className="curator-dashboard-widget-copy"><strong>{item.studentName}</strong><span>{item.assignmentTitle}</span></div>
+            <div className={`assignment-badge ${item.status === "Принято" ? "green" : item.tone}`}>{item.status}</div>
+          </button>) : <div className="empty-state"><FileCheck2 size={20} /><strong>Пока пусто</strong><span>Новые работы появятся здесь.</span></div>}
+        </div>
+        <button className="text-button" onClick={() => onNavigate("Очередь проверки")}>Открыть всю очередь <ChevronRight size={15} /></button>
+      </section>
+      <section className="content-panel curator-dashboard-widget">
+        <div className="section-heading"><div><h2>Вопросы учеников</h2></div><span className="progress-inline">{pendingDiscussions.length}</span></div>
+        <div className="curator-dashboard-widget-list">
+          {pendingDiscussions.length > 0 ? pendingDiscussions.map((thread) => <button className="curator-dashboard-widget-row" type="button" key={thread.id} onClick={() => onNavigate("Обсуждения")}>
+            {thread.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={thread.avatarUrl} alt={thread.student} width={30} height={30} unoptimized /> : <div className="profile-avatar">{thread.initials}</div>}
+            <div className="curator-dashboard-widget-copy"><strong>{thread.title}</strong><span>{thread.student} · {thread.module}</span></div>
+            <b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b>
+          </button>) : <div className="empty-state"><MessageSquareText size={20} /><strong>Нет открытых вопросов</strong><span>Новые вопросы появятся здесь.</span></div>}
+        </div>
+        <button className="text-button" onClick={() => onNavigate("Обсуждения")}>Открыть обсуждения <ChevronRight size={15} /></button>
+      </section>
+      <section className="content-panel curator-dashboard-widget">
+        <div className="section-heading"><div><h2>Расписание</h2></div><span className="progress-inline">{nextEvents.length}</span></div>
+        <div className="curator-dashboard-widget-list">
+          {nextEvents.length > 0 ? nextEvents.map((event) => <button className="curator-dashboard-widget-row" type="button" key={event.id} onClick={() => onNavigate("Расписание")}>
+            <div className="curator-dashboard-widget-date"><strong>{event.day}</strong><span>{event.month}</span></div>
+            <div className="curator-dashboard-widget-copy"><strong>{event.title}</strong><span>{event.time}</span></div>
+          </button>) : <div className="empty-state"><CalendarDays size={20} /><strong>Ничего не запланировано</strong><span>Добавь событие в расписании.</span></div>}
+        </div>
+        <button className="text-button" onClick={() => onNavigate("Расписание")}>Открыть расписание <ChevronRight size={15} /></button>
+      </section>
+    </div>
+  </>;
+}
+
+function CuratorReviewWorkspace({ onNavigate }: { onNavigate?: (nextNav: CuratorNav) => void }) {
   const [filter, setFilter] = useState<"all" | AssignmentStatus>("all");
   const [studentFilter, setStudentFilter] = useState("");
   const [localQueue, setLocalQueue] = useState<ReviewQueueItem[]>([]);
@@ -1073,24 +1205,8 @@ function CuratorReviewWorkspace({ compact = false, overview = false, onNavigate 
       .then((payload) => { if (Array.isArray(payload?.data)) setStudentCount(payload.data.length); })
       .catch(() => undefined);
   }, []);
-  const reviewCount = localQueue.filter((item) => item.status === "На проверке").length;
-  const revisionCount = localQueue.filter((item) => item.status === "Нужна доработка").length;
-  const acceptedCount = localQueue.filter((item) => item.status === "Принято").length;
-  const curatorDashboard = {
-    ...baseCuratorDashboard,
-    queue: localQueue,
-    stats: {
-      ...baseCuratorDashboard.stats,
-      review: String(reviewCount),
-      reviewDetail: `${reviewCount} отправлено в тестовом контуре`,
-      revision: String(revisionCount),
-      revisionDetail: "Решения появятся после проверки",
-      progress: String(acceptedCount),
-      progressDetail: "Работы приняты",
-    },
-  };
-  const studentOptions = useMemo(() => [...new Set(curatorDashboard.queue.map((item) => item.studentName).filter(Boolean))].sort((left, right) => left.localeCompare(right, "ru")), [curatorDashboard.queue]);
-  const studentQueue = studentFilter ? curatorDashboard.queue.filter((item) => item.studentName === studentFilter) : curatorDashboard.queue;
+  const studentOptions = useMemo(() => [...new Set(localQueue.map((item) => item.studentName).filter(Boolean))].sort((left, right) => left.localeCompare(right, "ru")), [localQueue]);
+  const studentQueue = studentFilter ? localQueue.filter((item) => item.studentName === studentFilter) : localQueue;
   const filteredQueue = filter === "all" ? studentQueue : studentQueue.filter((item) => item.status === filter);
   const selectedItem = filteredQueue.find((item) => item.id === selectedId) ?? filteredQueue[0] ?? emptyReviewQueueItem;
   const filters: Array<{ id: "all" | AssignmentStatus; label: string }> = [
@@ -1100,28 +1216,25 @@ function CuratorReviewWorkspace({ compact = false, overview = false, onNavigate 
     { id: "Принято", label: "Принято" },
   ];
 
-  const visibleQueue = overview ? filteredQueue.slice(0, 3) : filteredQueue;
-  return <>
-    {!compact && <div className="stats-grid curator-stats"><StatCard icon={<FileCheck2 size={17} />} label="Работы на проверке" value={curatorDashboard.stats.review} detail={curatorDashboard.stats.reviewDetail} accent="blue" /><StatCard icon={<RotateCcw size={17} />} label="Нужна доработка" value={curatorDashboard.stats.revision} detail={curatorDashboard.stats.revisionDetail} accent="amber" /><StatCard icon={<CheckCircle2 size={17} />} label="Принято" value={curatorDashboard.stats.progress} detail={curatorDashboard.stats.progressDetail} accent="cyan" /><StatCard icon={<GraduationCap size={17} />} label="Ученики в потоке" value={studentCount === null ? "—" : String(studentCount)} detail="Активные участники" accent="blue" /></div>}
-    <div className="curator-workspace">
-      <section className="content-panel review-queue">
-        <div className="section-heading"><div><span className="section-kicker">{curatorDashboard.cohort.name.toUpperCase()}</span><h2>{overview ? "Последние работы" : "Очередь проверки"}</h2></div><div className="section-heading-actions"><span className="progress-inline">{studentCount === null ? "…" : pluralizeStudents(studentCount)}</span>{onNavigate && <button className="primary-button compact-button curator-create-assignment-button" onClick={() => onNavigate("Создать задание")}><Plus size={15} /> Создать задание</button>}</div></div>
-        {!overview && <>
-          <div className="assignment-filter curator-filter">{filters.map((item) => { const count = item.id === "all" ? studentQueue.length : studentQueue.filter((queueItem) => queueItem.status === item.id).length; return <button className={`filter-chip ${filter === item.id ? "active" : ""}`} key={item.id} onClick={() => setFilter(item.id)} aria-pressed={filter === item.id}>{item.label} <span>{count}</span></button>; })}</div>
-          <label className="review-student-filter"><span>Ученик</span><select value={studentFilter} onChange={(event) => setStudentFilter(event.target.value)} aria-label="Фильтр очереди по ученику"><option value="">Все ученики</option>{studentOptions.map((student) => <option value={student} key={student}>{student}</option>)}</select></label>
-        </>}
-        <div className="review-queue-list">{visibleQueue.length > 0 ? visibleQueue.map((item) => <CuratorQueueRow item={item} selected={item.id === selectedItem.id} key={item.id} onOpen={() => setSelectedId(item.id)} />) : <div className="empty-state"><FileCheck2 size={22} /><strong>Очередь пуста</strong><span>{studentFilter ? "У выбранного ученика нет работ с таким статусом." : "Новые отправки появятся здесь после отправки задания учеником."}</span></div>}</div>
-        {overview && onNavigate && <button className="text-button" onClick={() => onNavigate("Очередь проверки")}>Открыть всю очередь <ChevronRight size={15} /></button>}
-      </section>
-      {!overview && <CuratorReviewPanel item={selectedItem} key={selectedItem.id} />}
-    </div>
-  </>;
+  return <div className="curator-workspace">
+    <section className="content-panel review-queue">
+      <div className="section-heading"><div><span className="section-kicker">{baseCuratorDashboard.cohort.name.toUpperCase()}</span><h2>Очередь проверки</h2></div><div className="section-heading-actions"><span className="progress-inline">{studentCount === null ? "…" : pluralizeStudents(studentCount)}</span>{onNavigate && <button className="primary-button compact-button curator-create-assignment-button" onClick={() => onNavigate("Создать задание")}><Plus size={15} /> Создать задание</button>}</div></div>
+      <div className="assignment-filter curator-filter">{filters.map((item) => { const count = item.id === "all" ? studentQueue.length : studentQueue.filter((queueItem) => queueItem.status === item.id).length; return <button className={`filter-chip ${filter === item.id ? "active" : ""}`} key={item.id} onClick={() => setFilter(item.id)} aria-pressed={filter === item.id}>{item.label} <span>{count}</span></button>; })}</div>
+      <label className="review-student-filter"><span>Ученик</span><select value={studentFilter} onChange={(event) => setStudentFilter(event.target.value)} aria-label="Фильтр очереди по ученику"><option value="">Все ученики</option>{studentOptions.map((student) => <option value={student} key={student}>{student}</option>)}</select></label>
+      <div className="review-queue-list">{filteredQueue.length > 0 ? filteredQueue.map((item) => <CuratorQueueRow item={item} selected={item.id === selectedItem.id} key={item.id} onOpen={() => setSelectedId(item.id)} />) : <div className="empty-state"><FileCheck2 size={22} /><strong>Очередь пуста</strong><span>{studentFilter ? "У выбранного ученика нет работ с таким статусом." : "Новые отправки появятся здесь после отправки задания учеником."}</span></div>}</div>
+    </section>
+    <CuratorReviewPanel item={selectedItem} key={selectedItem.id} />
+  </div>;
 }
 
 function CuratorQueueRow({ item, selected, onOpen }: { item: ReviewQueueItem; selected: boolean; onOpen: () => void }) {
-  const modulePosition = Number.parseInt(item.module.slice(0, 2), 10);
-  const coverPath = item.coverPath ?? discussionCoverForModule(Number.isNaN(modulePosition) ? undefined : modulePosition);
-  return <button className={`review-queue-row ${selected ? "selected" : ""}`} onClick={onOpen} aria-pressed={selected}><div className={`profile-avatar review-queue-cover ${item.coverPath ? "has-cover" : ""}`} role="img" aria-label={`Обложка ${item.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.28), rgba(8,17,27,.78)), url("${coverPath}")` }}>{!coverPath && item.studentInitials}</div><div className="review-queue-copy"><strong>{item.studentName}</strong><span>{item.assignmentTitle} · {item.module}</span><small>{item.submittedAt} · {item.attempt}</small></div><div className={`assignment-badge ${item.tone}`}>{item.status}</div><ChevronRight size={16} /></button>;
+  // A student's face is what a curator actually recognizes at a glance once the cohort
+  // grows — the module is already named in the row's own subtitle below.
+  // "Принято" shared the same blue badge as "На проверке" — a curator couldn't tell reviewed
+  // from pending at a glance. Green for accepted matches the tone the student's own
+  // assignment list already uses for the same status.
+  const effectiveTone = item.status === "Принято" ? "green" : item.tone;
+  return <button className={`review-queue-row ${selected ? "selected" : ""}`} onClick={onOpen} aria-pressed={selected}>{item.studentAvatarUrl ? <Image className="profile-avatar profile-avatar-image" src={item.studentAvatarUrl} alt={item.studentName} width={31} height={31} unoptimized /> : <div className="profile-avatar">{item.studentInitials}</div>}<div className="review-queue-copy"><strong>{item.studentName}</strong><span>{item.assignmentTitle} · {item.module}</span><small>{item.submittedAt} · {item.attempt}</small></div><div className={`assignment-badge ${effectiveTone}`}>{item.status}</div><ChevronRight size={16} /></button>;
 }
 
 function formatAttemptCount(count: number) {
@@ -1184,16 +1297,48 @@ function LegacyCuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
 function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
   const [feedback, setFeedback] = useState("");
   const [decisionError, setDecisionError] = useState("");
-  const [decision, setDecision] = useState<"accepted" | "revision" | null>(null);
   const [claimError, setClaimError] = useState("");
   const [claiming, setClaiming] = useState(false);
+  const [releasing, setReleasing] = useState(false);
   const [checkedCriteria, setCheckedCriteria] = useState<boolean[]>(() => (item.requirements ?? []).map(() => false));
   const [previewFile, setPreviewFile] = useState<NonNullable<ReviewQueueItem["attachmentFiles"]>[number] | null>(null);
+  const [feedbackAttachmentName, setFeedbackAttachmentName] = useState("");
+  const [feedbackSelectedFile, setFeedbackSelectedFile] = useState<File | null>(null);
+  const [feedbackAttachmentPreviewUrl, setFeedbackAttachmentPreviewUrl] = useState("");
+  const [feedbackAttachmentType, setFeedbackAttachmentType] = useState<"image" | "video" | "file" | "">("");
+  const [feedbackAttachmentError, setFeedbackAttachmentError] = useState("");
   const files = item.attachmentFiles ?? [];
   const currentAttemptNumber = Number.parseInt(item.attempt.replace(/\D/g, ""), 10) || 1;
   const attemptHistory = item.attemptHistory?.length ? item.attemptHistory : [{ attempt: currentAttemptNumber, status: item.status, submittedAt: item.submittedAt }];
 
   const canDecide = Boolean(item.reviewerId) && item.isReviewerSelf !== false;
+
+  useEffect(() => () => {
+    if (feedbackAttachmentPreviewUrl) URL.revokeObjectURL(feedbackAttachmentPreviewUrl);
+  }, [feedbackAttachmentPreviewUrl]);
+
+  const selectFeedbackAttachment = (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setFeedbackAttachmentError("Файл слишком большой. Максимальный размер — 10 МБ.");
+      return;
+    }
+    setFeedbackAttachmentError("");
+    setFeedbackAttachmentName(file.name);
+    setFeedbackSelectedFile(file);
+    setFeedbackAttachmentType(file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "file");
+    setFeedbackAttachmentPreviewUrl(URL.createObjectURL(file));
+  };
+
+  const handleFeedbackPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItem = Array.from(event.clipboardData.items).find((entry) => entry.type.startsWith("image/"));
+    if (!imageItem) return;
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    event.preventDefault();
+    const extension = imageItem.type.split("/")[1] || "png";
+    selectFeedbackAttachment(new File([file], `screenshot-${Date.now()}.${extension}`, { type: imageItem.type }));
+  };
 
   const submitDecision = async (nextDecision: "accepted" | "revision") => {
     if (!item.reviewerId) {
@@ -1203,18 +1348,32 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
     if (!canDecide) return;
     setDecisionError("");
     const checkedRequirements = (item.requirements ?? []).filter((_, index) => checkedCriteria[index]);
+    let uploadedFileId = "";
     try {
+      if (feedbackSelectedFile) {
+        const createResponse = await fetch(`${API_ORIGIN}/api/files`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalName: feedbackSelectedFile.name, mimeType: feedbackSelectedFile.type, byteSize: feedbackSelectedFile.size }) });
+        const createPayload = await createResponse.json().catch(() => ({})) as { message?: string; data?: { id: string; uploadUrl: string } };
+        if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
+        uploadedFileId = createPayload.data.id;
+        const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": feedbackSelectedFile.type }, body: feedbackSelectedFile });
+        if (!uploadResponse.ok) throw new Error("Не удалось загрузить файл.");
+      }
       const response = await fetch(`${API_ORIGIN}/api/review/submissions/${item.id}`, {
         method: "PATCH",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision: nextDecision, feedback: feedback.trim() || undefined, checkedRequirements: checkedRequirements.length > 0 ? checkedRequirements : undefined }),
+        body: JSON.stringify({
+          decision: nextDecision,
+          feedback: feedback.trim() || undefined,
+          checkedRequirements: checkedRequirements.length > 0 ? checkedRequirements : undefined,
+          attachment: feedbackSelectedFile && uploadedFileId ? { fileId: uploadedFileId, originalName: feedbackSelectedFile.name, mimeType: feedbackSelectedFile.type, byteSize: feedbackSelectedFile.size } : undefined,
+        }),
       });
       const payload = await response.json() as { message?: string };
       if (!response.ok) throw new Error(payload.message ?? "Не удалось сохранить решение.");
-      setDecision(nextDecision);
       window.dispatchEvent(new Event(assignmentSubmittedEvent));
     } catch (error) {
+      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
       setDecisionError(error instanceof Error ? error.message : "Не удалось сохранить решение.");
     }
   };
@@ -1235,30 +1394,47 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
     }
   };
 
+  // Claimed by mistake, or a curator ran out of time — releasing hands the submission back
+  // to the shared queue so another curator can pick it up instead of it sitting stuck.
+  const releaseWork = async () => {
+    if (releasing) return;
+    setReleasing(true);
+    setClaimError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/review/submissions/${item.id}/release`, { method: "POST", credentials: "include" });
+      const payload = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось отменить взятие работы.");
+      window.dispatchEvent(new Event(assignmentSubmittedEvent));
+    } catch (error) {
+      setClaimError(error instanceof Error ? error.message : "Не удалось отменить взятие работы.");
+    } finally {
+      setReleasing(false);
+    }
+  };
+
   if (!item.id) return <section className="content-panel curator-review directory-empty"><div className="empty-state"><FileCheck2 size={24} /><strong>Очередь проверки пока пуста</strong><span>После отправки задания работа появится здесь вместе с ответом и вложениями.</span></div></section>;
 
   return <section className="content-panel curator-review">
     {item.reviewerId ? (
       item.isReviewerSelf === false
         ? <div className="review-claim-banner review-claim-banner-other"><strong>Проверяет: {item.reviewerName ?? "другой куратор"}</strong><span>Работа закреплена за другим куратором — принять или вернуть на доработку нельзя.</span></div>
-        : <div className="review-claim-banner"><strong>Проверяете вы</strong><span>Работа закреплена за вами.</span></div>
+        : <div className="review-claim-banner"><strong>Проверяете вы</strong><span>Работа закреплена за вами.</span><button type="button" className="primary-button compact-button curator-create-assignment-button review-release-button" onClick={() => void releaseWork()} disabled={releasing}>{releasing ? "Отменяем…" : "Отменить взятие"}</button></div>
     ) : <button type="button" className="primary-button review-claim-button" onClick={() => void claimWork()} disabled={claiming}>{claiming ? "Закрепляем…" : "Взять на проверку"}</button>}
     {claimError && <div className="file-error" role="alert">{claimError}</div>}
-    <div className="curator-review-header"><div className="curator-student"><div className="profile-avatar">{item.studentInitials}</div><div><span className="section-kicker">{item.module}</span><strong>{item.studentName}</strong><small>Прогресс потока · {item.progress}</small></div></div><div className={`assignment-badge ${item.tone}`}>{decision === "accepted" ? "Принято" : decision === "revision" ? "Возвращено" : item.status}</div></div>
+    <div className="curator-review-header"><div className="curator-student">{item.studentAvatarUrl ? <Image className="profile-avatar profile-avatar-image" src={item.studentAvatarUrl} alt={item.studentName} width={31} height={31} unoptimized /> : <div className="profile-avatar">{item.studentInitials}</div>}<strong>{item.studentName}</strong></div></div>
     {item.coverPath && <div className="curator-review-cover" role="img" aria-label={`Обложка ${item.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(0,0,0,.92), rgba(0,0,0,.3)), url("${item.coverPath}")` }}><strong>{item.module}</strong><span>{item.assignmentTitle}</span></div>}
-    <div className="submission-meta"><span><Clock3 size={14} /> Отправлено {item.submittedAt}</span><span><FileCheck2 size={14} /> {item.attempt}</span></div>
     <div className="curator-review-body">
-      <div className="submission-section submission-answer-section"><span className="detail-label">КОММЕНТАРИЙ УЧЕНИКА</span><p className="submission-answer">{item.answer}</p><p className="student-note"><MessageSquareText size={14} /> {item.studentNote}</p></div>
-      {item.requirements && item.requirements.length > 0 && <div className="submission-section review-criteria"><div className="review-section-heading"><div><span className="detail-label">КРИТЕРИИ ПРОВЕРКИ</span><small>{item.status === "Принято" ? "Отмечено на момент принятия работы — необязательно все." : "Необязательно: отметь то, что проверил. Работу можно принять и без всех галочек."}</small></div><strong>{(item.status === "Принято" ? (item.checkedRequirements?.length ?? 0) : checkedCriteria.filter(Boolean).length)}/{item.requirements.length}</strong></div><div className="review-criteria-list">{item.requirements.map((requirement, index) => { const checked = item.status === "Принято" ? (item.checkedRequirements?.includes(requirement) ?? false) : (checkedCriteria[index] ?? false); return <label className={`review-criteria-item ${checked ? "checked" : ""}`} key={`${item.id}-${requirement}`}><input type="checkbox" checked={checked} disabled={item.status === "Принято"} onChange={() => setCheckedCriteria((current) => current.map((value, currentIndex) => currentIndex === index ? !value : value))} /><span className="review-criteria-box">✓</span><span>{requirement}</span></label>; })}</div></div>}
-      <div className="submission-section"><span className="detail-label">ВЛОЖЕНИЯ</span><div className="submission-files">
+      <div className="submission-section submission-answer-section"><span className="detail-label">ОТВЕТ УЧЕНИКА</span><p className="submission-answer">{item.answer}</p><p className="student-note"><MessageSquareText size={14} /> {item.studentNote}</p></div>
+      {item.requirements && item.requirements.length > 0 && <div className="submission-section review-criteria"><div className="review-section-heading"><div><span className="detail-label">КРИТЕРИИ ПРОВЕРКИ</span><small>{item.status === "Принято" ? "Отмечено на момент принятия работы — необязательно все." : "Отметь то, что ученик выполнил чётко. Работу можно принять и без всех галочек."}</small></div><strong>{(item.status === "Принято" ? (item.checkedRequirements?.length ?? 0) : checkedCriteria.filter(Boolean).length)}/{item.requirements.length}</strong></div><div className="review-criteria-list">{item.requirements.map((requirement, index) => { const checked = item.status === "Принято" ? (item.checkedRequirements?.includes(requirement) ?? false) : (checkedCriteria[index] ?? false); return <label className={`review-criteria-item ${checked ? "checked" : ""}`} key={`${item.id}-${requirement}`}><input type="checkbox" checked={checked} disabled={item.status === "Принято"} onChange={() => setCheckedCriteria((current) => current.map((value, currentIndex) => currentIndex === index ? !value : value))} /><span className="review-criteria-box">✓</span><span>{requirement}</span></label>; })}</div></div>}
+      {(files.length > 0 || item.attachments.length > 0) && <div className="submission-section"><span className="detail-label">ВЛОЖЕНИЯ</span><div className="submission-files">
         {files.length > 0 ? files.map((file) => <div className="submission-file-card has-preview" key={file.id}>
           {file.type.startsWith("image/") && <div className="submission-image-preview"><Image src={`${API_ORIGIN}${file.url}`} alt={`Предпросмотр вложения ${file.name}`} fill sizes="(max-width: 700px) 100vw, 720px" unoptimized /></div>}
           {file.type.startsWith("video/") && <video src={`${API_ORIGIN}${file.url}`} controls preload="metadata" />}
           <button type="button" className="submission-file" onClick={() => setPreviewFile(file)}><FileCheck2 size={16} /><span>{file.name}</span><Maximize2 size={14} /></button>
-        </div>) : item.attachments.length > 0 ? <div className="submission-legacy-file"><FileCheck2 size={16} /><div><strong>{[...new Set(item.attachments)].join(", ")}</strong><span>Это вложение сохранено до подключения защищённого хранилища. Попросите ученика отправить работу повторно.</span></div></div> : <p className="submission-empty-file">Работа отправлена без вложений.</p>}
-      </div>{(files.length > 0 || item.attachments.length > 0) && <p className="attachment-preview-note">Предпросмотр открыт внутри платформы и доступен только участникам этой проверки.</p>}</div>
-        <div className="submission-section review-history-section"><div className="review-section-heading"><div><span className="detail-label">ИСТОРИЯ ПОПЫТОК</span><small>Это одно и то же ДЗ: повторная отправка создаёт новую попытку, а не новую работу.</small></div><strong>{formatAttemptCount(attemptHistory.length)}</strong></div><div className="attempt-history">{attemptHistory.map((attempt) => { const isCurrent = attempt.attempt === currentAttemptNumber; const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted"; const statusLabel = attempt.status === "На проверке" ? "Отправлено на проверку" : attempt.status; return <div key={attempt.attempt}><span className={`attempt-dot ${dotTone}`} /><div><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><small>{attempt.submittedAt} · {statusLabel}</small></div></div>; })}</div></div>
-      <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ОБРАТНАЯ СВЯЗЬ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : "Напиши, что получилось и что нужно поправить..."} rows={4} disabled={item.status === "Принято" || !canDecide} />{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
+        </div>) : <div className="submission-legacy-file"><FileCheck2 size={16} /><div><strong>{[...new Set(item.attachments)].join(", ")}</strong><span>Это вложение сохранено до подключения защищённого хранилища. Попросите ученика отправить работу повторно.</span></div></div>}
+      </div><p className="attachment-preview-note">Предпросмотр открыт внутри платформы и доступен только участникам этой проверки.</p></div>}
+        <div className="submission-section review-history-section"><div className="review-section-heading"><span className="detail-label">ИСТОРИЯ ПОПЫТОК</span></div><div className="attempt-history">{attemptHistory.map((attempt) => { const isCurrent = attempt.attempt === currentAttemptNumber; const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted"; const statusLabel = attempt.status === "На проверке" ? "Отправлено на проверку" : attempt.status; return <div key={attempt.attempt}><span className={`attempt-dot ${dotTone}`} /><div><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><small>{attempt.submittedAt} · {statusLabel}</small></div></div>; })}</div></div>
+      <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ВАШ ОТВЕТ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} onPaste={handleFeedbackPaste} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : "Напиши, что получилось и что нужно поправить… Скриншот можно вставить через Ctrl+V"} rows={4} disabled={item.status === "Принято" || !canDecide} />{item.status !== "Принято" && canDecide && <label className={`discussion-attachment-picker ${feedbackAttachmentName ? "has-file" : ""}`} htmlFor="curator-feedback-attachment"><FileCheck2 size={17} /><span>{feedbackAttachmentName || "Прикрепить скриншот или файл"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V</small><input id="curator-feedback-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectFeedbackAttachment(event.target.files?.[0])} /></label>}{feedbackAttachmentError && <div className="file-error" role="alert">{feedbackAttachmentError}</div>}{feedbackAttachmentPreviewUrl && <div className="discussion-selected-preview">{feedbackAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${feedbackAttachmentName}`} style={{ backgroundImage: `url("${feedbackAttachmentPreviewUrl}")` }} />}{feedbackAttachmentType === "video" && <video src={feedbackAttachmentPreviewUrl} controls playsInline preload="metadata" />}{feedbackAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{feedbackAttachmentName}</span></div>}</div>}{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
     </div>
     {previewFile && <div className="attachment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Просмотр файла ${previewFile.name}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewFile(null); }}><div className="attachment-modal"><div className="video-modal-head"><strong>{previewFile.name}</strong><button className="icon-button" aria-label="Закрыть просмотр" onClick={() => setPreviewFile(null)}><X size={18} /></button></div>{previewFile.type.startsWith("image/") && <div className="attachment-modal-image" style={{ backgroundImage: `url("${API_ORIGIN}${previewFile.url}")` }} />}{previewFile.type.startsWith("video/") && <video src={`${API_ORIGIN}${previewFile.url}`} controls autoPlay playsInline />}{previewFile.type === "application/pdf" && <iframe src={`${API_ORIGIN}${previewFile.url}`} title={previewFile.name} />}</div></div>}
   </section>;
@@ -1269,7 +1445,7 @@ type StudentDirectoryRecord = {
   status: string;
   createdAt: string;
   email: string | null;
-  identities: Array<{ provider: string; username: string | null; displayName: string | null }>;
+  identities: Array<{ provider: string; username: string | null; displayName: string | null; avatarUrl: string | null }>;
   activeSessionCount: number;
   loginEventCount: number;
   submissionCount: number;
@@ -1382,7 +1558,7 @@ function CuratorStudentsView({ onInvite }: { onInvite: () => void }) {
   if (error) return <section className="content-panel directory-empty"><div className="empty-state"><ShieldCheck size={24} /><strong>{error}</strong><span>Список доступен владельцу и куратору только в рамках их прав.</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Открыть приглашения</button></div></section>;
   if (students.length === 0) return <section className="content-panel directory-empty"><div className="empty-state"><UsersRoundIcon /><strong>Пока нет учеников</strong><span>Создай первое приглашение, чтобы участник появился в этом списке.</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Создать приглашение</button></div></section>;
 
-  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<UsersRoundIcon />} label="Учеников в доступе" value={String(students.length)} detail="Активные участники потока" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /><StatCard icon={<FileCheck2 size={18} />} label="Отправлено работ" value={String(submissions)} detail="Всего в базе" accent="amber" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><span className="section-kicker">ПРОФИЛИ ПОТОКА</span><h2>Ученики</h2></div><div className="section-heading-actions"><span className="progress-inline">{students.length} профилей</span><button className="primary-button compact-button curator-create-assignment-button" onClick={onInvite}><UserPlus size={15} /> Создать приглашение</button></div></div><div className="directory-rows">{students.map((student) => { const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0]; return <button className={`directory-row ${student.id === selectedStudent.id ? "selected" : ""}`} key={student.id} onClick={() => setSelectedId(student.id)}><div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div><div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</span></div><div className="directory-row-meta"><strong>{student.submissionCount}</strong><span>ДЗ</span></div><ChevronRight size={16} /></button>; })}</div></section><StudentDirectoryDetail student={selectedStudent} onClaim={claimStudent} onTransfer={transferStudent} claiming={claimingStudentId === selectedStudent?.id} /></div></div>;
+  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<UsersRoundIcon />} label="Учеников в доступе" value={String(students.length)} detail="Активные участники потока" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /><StatCard icon={<FileCheck2 size={18} />} label="Отправлено работ" value={String(submissions)} detail="Всего в базе" accent="amber" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><span className="section-kicker">ПРОФИЛИ ПОТОКА</span><h2>Ученики</h2></div><div className="section-heading-actions"><span className="progress-inline">{students.length} профилей</span><button className="primary-button compact-button curator-create-assignment-button" onClick={onInvite}><UserPlus size={15} /> Создать приглашение</button></div></div><div className="directory-rows">{students.map((student) => { const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0]; return <button className={`directory-row ${student.id === selectedStudent.id ? "selected" : ""}`} key={student.id} onClick={() => setSelectedId(student.id)}>{identity?.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={31} height={31} unoptimized /> : <div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}<div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</span></div><div className="directory-row-meta"><strong>{student.submissionCount}</strong><span>ДЗ</span></div><ChevronRight size={16} /></button>; })}</div></section><StudentDirectoryDetail student={selectedStudent} onClaim={claimStudent} onTransfer={transferStudent} claiming={claimingStudentId === selectedStudent?.id} /></div></div>;
 }
 
 function StudentDirectoryFullPage({ student, onBack, onClaim, onTransfer, claiming }: { student: StudentDirectoryRecord; onBack: () => void; onClaim: (studentId: string) => Promise<void>; onTransfer?: (studentId: string, curatorId: string) => Promise<void>; claiming: boolean }) {
@@ -1731,7 +1907,7 @@ function StudentDirectoryDetailContent({ student, onClaim, onTransfer, claiming 
 
   return <section className="content-panel directory-detail">
     <div className="directory-detail-heading">
-      <div className="profile-avatar large">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>
+      {identity?.avatarUrl ? <Image className="profile-avatar large profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={46} height={46} unoptimized /> : <div className="profile-avatar large">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}
       <div className="directory-detail-title"><span className="section-kicker">ПРОФИЛЬ УЧЕНИКА</span><h2>{identity?.displayName ?? identity?.username ?? "Без имени"}</h2><p>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</p><div className={`student-assignment-status ${student.isAssignedToActor ? "current" : ""}`}><span>{student.isAssignedToActor ? "Закреплён за вами" : student.assignedCurator ? `Закреплён за: ${student.assignedCurator.name}` : "Не закреплён за куратором"}</span>{student.canClaim && <button type="button" className="secondary-button" onClick={() => void claimSelf()} disabled={claimingSelf || claiming}><UserPlus size={15} />{claimingSelf || claiming ? "Закрепляем…" : student.assignedCurator ? "Переназначить себе" : "Взять ученика"}</button>}</div>{claimError && <div className="file-error" role="alert">{claimError}</div>}</div>
     </div>
     <div className="directory-detail-grid">
@@ -3888,7 +4064,7 @@ function AssignmentsView({ requestedAssignmentId = "" }: { requestedAssignmentId
   ];
   const filteredAssignments = filter === "all" ? allAssignments : allAssignments.filter((assignment) => assignment.status === filter);
 
-  return <div className="assignment-workspace"><section className="content-panel assignment-inbox"><div className="section-heading"><div><span className="section-kicker">СТАТУСЫ РАБОТ</span><h2>Мои задания</h2><p className="section-heading-note">Следи за отправками и комментариями куратора в одном месте.</p></div></div><div className="assignment-filter">{filters.map((item) => { const count = item.id === "all" ? allAssignments.length : allAssignments.filter((assignment) => assignment.status === item.id).length; return <button className={`filter-chip ${filter === item.id ? "active" : ""}`} key={item.id} onClick={() => setFilter(item.id)} aria-pressed={filter === item.id}>{item.label} <span>{count}</span></button>; })}</div><div className="assignment-list">{filteredAssignments.length > 0 ? filteredAssignments.map((assignment) => <AssignmentRow assignment={assignment} key={assignment.id} selected={assignment.id === selectedAssignment.id} onOpen={() => setSelectedId(assignment.id)} />) : <div className="empty-state"><FileCheck2 size={22} /><strong>В этом фильтре пока пусто</strong><span>Новые статусы появятся после отправки работы или проверки куратором.</span></div>}</div><div className="assignment-inbox-footer"><span>Новые задания открываются по мере прохождения модулей практикума.</span></div></section><AssignmentDetail assignment={selectedAssignment} key={selectedAssignment.id} /></div>;
+  return <div className="assignment-workspace"><section className="content-panel assignment-inbox"><div className="section-heading"><div><h2>Мои задания</h2></div></div><div className="assignment-filter">{filters.map((item) => { const count = item.id === "all" ? allAssignments.length : allAssignments.filter((assignment) => assignment.status === item.id).length; return <button className={`filter-chip ${filter === item.id ? "active" : ""}`} key={item.id} onClick={() => setFilter(item.id)} aria-pressed={filter === item.id}>{item.label} <span>{count}</span></button>; })}</div><div className="assignment-list">{filteredAssignments.length > 0 ? filteredAssignments.map((assignment) => <AssignmentRow assignment={assignment} key={assignment.id} selected={assignment.id === selectedAssignment.id} onOpen={() => setSelectedId(assignment.id)} />) : <div className="empty-state"><FileCheck2 size={22} /><strong>В этом фильтре пока пусто</strong><span>Новые статусы появятся после отправки работы или проверки куратором.</span></div>}</div></section><AssignmentDetail assignment={selectedAssignment} key={selectedAssignment.id} /></div>;
 }
 
 type ScheduleApiEvent = CourseScheduleEvent;
@@ -4547,8 +4723,10 @@ function ChartScene() {
   return <section className="chart-panel" aria-label="Учебный график EUR/USD с уровнями поддержки и сопротивления"><div className="chart-topline"><span>EUR / USD</span><span className="chart-timeframe">1H <ChevronRight size={13} /></span></div><div className="chart-gridlines"><i /><i /><i /><i /></div><div className="resistance-line"><span>Сопротивление</span></div><div className="support-line"><span>Поддержка</span></div><div className="candles">{candles.map((candle) => <div className={`candle ${candle.positive ? "positive" : "negative"}`} key={candle.x} style={{ left: `${candle.x}%`, height: `${candle.h}px`, top: `${candle.top}px` }}><i /></div>)}</div><svg className="chart-path" viewBox="0 0 500 260" preserveAspectRatio="none" aria-hidden="true"><path d="M0 218 C44 215 44 170 85 177 S118 222 154 181 S195 103 225 131 S273 192 311 137 S346 66 372 111 S421 160 442 98 S475 35 500 18" /></svg><div className="chart-label chart-label-top">КЛЮЧЕВОЙ УРОВЕНЬ</div><div className="chart-label chart-label-bottom">Учебный пример · смотри на реакцию цены</div><div className="chart-axis"><span>09:00</span><span>12:00</span><span>15:00</span><span>18:00</span></div><div className="chart-scanline" /></section>;
 }
 
-function StatCard({ icon, label, value, detail, accent }: { icon: React.ReactNode; label: string; value: string; detail: string; accent: string }) {
-  return <div className="stat-card"><div className={`stat-icon ${accent}`}>{icon}</div><div className="stat-copy"><span>{label}</span><strong className={`stat-value ${accent}`}>{value}</strong><small>{detail}</small></div></div>;
+function StatCard({ icon, label, value, detail, accent, onClick }: { icon: React.ReactNode; label: string; value: string; detail: string; accent: string; onClick?: () => void }) {
+  const content = <><div className={`stat-icon ${accent}`}>{icon}</div><div className="stat-copy"><span>{label}</span><strong className={`stat-value ${accent}`}>{value}</strong><small>{detail}</small></div></>;
+  if (onClick) return <button type="button" className="stat-card" onClick={onClick}>{content}</button>;
+  return <div className="stat-card">{content}</div>;
 }
 
 function assignmentStatusIcon(status: AssignmentStatus, tone: AssignmentTone) {
@@ -4561,11 +4739,14 @@ function AssignmentRow({ assignment, onOpen, selected = false }: { assignment: A
   const modulePosition = Number.parseInt(assignment.module.slice(0, 2), 10);
   const coverPath = assignment.coverPath ?? discussionCoverForModule(Number.isNaN(modulePosition) ? undefined : modulePosition);
   const effectiveTone = assignment.status === "Принято" ? "green" : assignment.tone;
-  return <button className={`assignment-row ${selected ? "selected" : ""}`} onClick={onOpen} aria-pressed={selected}><div className={`assignment-status assignment-status-cover ${effectiveTone}`} role="img" aria-label={`Обложка: ${assignment.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.28), rgba(8,17,27,.78)), url("${coverPath}")` }}><span className="assignment-status-cover-icon">{assignmentStatusIcon(assignment.status, assignment.tone)}</span></div><div className="assignment-copy"><strong>{assignment.title}</strong><span>{assignment.module}</span><small className="assignment-hint">{assignment.status === "Принято" && <CheckCircle2 size={12} aria-hidden="true" />}{assignmentHint(assignment.status)}</small></div><div className={`assignment-badge ${effectiveTone}`}><span className="assignment-badge-icon">{assignmentStatusIcon(assignment.status, assignment.tone)}</span>{assignment.status}</div><span className="assignment-date">{assignment.date}</span><ChevronRight size={16} className="assignment-chevron" /></button>;
+  return <button className={`assignment-row ${selected ? "selected" : ""}`} onClick={onOpen} aria-pressed={selected}><div className={`assignment-status assignment-status-cover ${effectiveTone}`} role="img" aria-label={`Обложка: ${assignment.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.28), rgba(8,17,27,.78)), url("${coverPath}")` }}><span className="assignment-status-cover-icon">{assignmentStatusIcon(assignment.status, assignment.tone)}</span></div><div className="assignment-copy"><strong>{assignment.title}</strong><span>{assignment.module}</span>{assignmentHint(assignment.status) && <small className="assignment-hint">{assignmentHint(assignment.status)}</small>}</div><div className={`assignment-badge ${effectiveTone}`}><span className="assignment-badge-icon">{assignmentStatusIcon(assignment.status, assignment.tone)}</span>{assignment.status}</div><span className="assignment-date">{assignment.date}</span><ChevronRight size={16} className="assignment-chevron" /></button>;
 }
 
 function assignmentHint(status: AssignmentStatus) {
-  return status === "На проверке" ? "Отправлено сегодня" : status === "Нужна доработка" ? "Есть комментарий куратора" : status === "Не начато" ? "Ещё не отправлено" : "Работа принята";
+  // "Работа принята" duplicated the badge right next to it — the other hints stay because
+  // they add information the badge alone doesn't ("Есть комментарий куратора" tells the
+  // student there's a note attached to "Нужна доработка", not just the status word again).
+  return status === "На проверке" ? "Отправлено сегодня" : status === "Нужна доработка" ? "Есть комментарий куратора" : status === "Не начато" ? "Ещё не отправлено" : "";
 }
 
 function LegacyAssignmentDetail({ assignment }: { assignment: Assignment }) {
@@ -4650,7 +4831,7 @@ function LegacyAssignmentDetail({ assignment }: { assignment: Assignment }) {
     return <section className="content-panel assignment-detail directory-empty"><div className="empty-state"><FileCheck2 size={24} /><strong>Выбери опубликованное задание</strong><span>Когда куратор опубликует ДЗ, оно появится в этом списке.</span></div></section>;
   }
 
-  return <section className="content-panel assignment-detail"><div className="detail-header"><div><span className="section-kicker">{assignment.module}</span><h2>{assignment.title}</h2></div><div className={`assignment-badge ${assignment.status === "Принято" ? "green" : assignment.tone}`}>{submitted ? "На проверке" : assignment.status}</div></div><div className="detail-meta"><span><Clock3 size={14} /> {assignment.deadline}</span><span><FileCheck2 size={14} /> {isAccepted ? "Проверено куратором" : "Можно отправлять заново после доработки"}</span></div><div className="detail-body"><p className="detail-description">{assignment.description}</p><div className="detail-section"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span><ul className="detail-checklist">{assignment.requirements.map((requirement) => <li key={requirement}><span />{requirement}</li>)}</ul></div>{isAccepted ? <div className="detail-feedback accepted"><Target size={17} /><div><strong>Задание принято</strong><p>Куратор подтвердил работу. Материал сохранён в истории практикума.</p></div></div> : assignment.blockedByModuleTitle ? <div className="detail-feedback locked"><LockKeyhole size={17} /><div><strong>Пока недоступно</strong><p>Сначала сдайте ДЗ модуля «{assignment.blockedByModuleTitle}» — вернитесь туда и отправьте работу, тогда это задание откроется.</p></div></div> : <><div className="detail-section"><label className="detail-label" htmlFor="assignment-answer">ТВОЙ КОММЕНТАРИЙ</label><textarea id="assignment-answer" value={draft} onChange={(event) => { setDraft(event.target.value); setSaved(false); setSubmitted(false); }} onPaste={handleAnswerPaste} placeholder="Опиши логику решения или добавь контекст к файлу... Скриншот можно вставить сюда через Ctrl+V" rows={5} /></div><label className={`file-dropzone ${fileName ? "has-file" : ""}`} htmlFor="assignment-file"><FileCheck2 size={19} /><span>{fileName || "Прикрепить разметку, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле комментария</small><input id="assignment-file" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => handleFileChange(event.target.files?.[0])} /></label>{fileError && <div className="file-error" role="alert">{fileError}</div>}{filePreviewUrl && <div className="assignment-preview"><div className="assignment-preview-heading"><span>ПРЕДПРОСМОТР</span><strong>{fileName}</strong></div>{fileType.startsWith("image/") && <div className="assignment-preview-image-wrap"><Image src={filePreviewUrl} alt={`Предпросмотр файла ${fileName}`} fill sizes="(max-width: 700px) 100vw, 420px" unoptimized className="assignment-preview-image" /></div>}{fileType === "application/pdf" && <iframe src={filePreviewUrl} title={`Предпросмотр PDF ${fileName}`} />}{fileType.startsWith("video/") && <video src={filePreviewUrl} controls preload="metadata" />}</div>}{(saved || submitted) && <div className="detail-feedback"><Target size={17} /><div><strong>{submitted ? "Работа отправлена куратору" : "Черновик сохранён в этой сессии"}</strong><p>{submitted ? "Ответ и вложение сохранены. Куратор увидит их в очереди проверки." : "Можно вернуться к заданию и продолжить подготовку ответа."}</p></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={() => setSaved(true)} disabled={!draft.trim() && !fileName}>Сохранить черновик</button><button className="primary-button" onClick={() => setSubmitted(true)} disabled={!draft.trim() && !fileName}>Отправить на проверку <ChevronRight size={16} /></button></div></>}</div></section>;
+  return <section className="content-panel assignment-detail"><div className="detail-header"><div><span className="section-kicker">{assignment.module}</span><h2>{assignment.title}</h2></div><div className={`assignment-badge ${assignment.status === "Принято" ? "green" : assignment.tone}`}>{submitted ? "На проверке" : assignment.status}</div></div><div className="detail-meta"><span><Clock3 size={14} /> {assignment.deadline}</span><span><FileCheck2 size={14} /> {isAccepted ? "Проверено куратором" : "Можно отправлять заново после доработки"}</span></div><div className="detail-body"><p className="detail-description">{assignment.description}</p><div className="detail-section"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span><ul className="detail-checklist">{assignment.requirements.map((requirement) => <li key={requirement}><span />{requirement}</li>)}</ul></div>{isAccepted ? <div className="detail-feedback accepted"><CheckCircle2 size={17} /><div><strong>Задание принято</strong><p>Куратор подтвердил работу. Материал сохранён в истории практикума.</p></div></div> : assignment.blockedByModuleTitle ? <div className="detail-feedback locked"><LockKeyhole size={17} /><div><strong>Пока недоступно</strong><p>Сначала сдайте ДЗ модуля «{assignment.blockedByModuleTitle}» — вернитесь туда и отправьте работу, тогда это задание откроется.</p></div></div> : <><div className="detail-section"><label className="detail-label" htmlFor="assignment-answer">ТВОЙ КОММЕНТАРИЙ</label><textarea id="assignment-answer" value={draft} onChange={(event) => { setDraft(event.target.value); setSaved(false); setSubmitted(false); }} onPaste={handleAnswerPaste} placeholder="Опиши логику решения или добавь контекст к файлу... Скриншот можно вставить сюда через Ctrl+V" rows={5} /></div><label className={`file-dropzone ${fileName ? "has-file" : ""}`} htmlFor="assignment-file"><FileCheck2 size={19} /><span>{fileName || "Прикрепить разметку, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле комментария</small><input id="assignment-file" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => handleFileChange(event.target.files?.[0])} /></label>{fileError && <div className="file-error" role="alert">{fileError}</div>}{filePreviewUrl && <div className="assignment-preview"><div className="assignment-preview-heading"><span>ПРЕДПРОСМОТР</span><strong>{fileName}</strong></div>{fileType.startsWith("image/") && <div className="assignment-preview-image-wrap"><Image src={filePreviewUrl} alt={`Предпросмотр файла ${fileName}`} fill sizes="(max-width: 700px) 100vw, 420px" unoptimized className="assignment-preview-image" /></div>}{fileType === "application/pdf" && <iframe src={filePreviewUrl} title={`Предпросмотр PDF ${fileName}`} />}{fileType.startsWith("video/") && <video src={filePreviewUrl} controls preload="metadata" />}</div>}{(saved || submitted) && <div className="detail-feedback"><Target size={17} /><div><strong>{submitted ? "Работа отправлена куратору" : "Черновик сохранён в этой сессии"}</strong><p>{submitted ? "Ответ и вложение сохранены. Куратор увидит их в очереди проверки." : "Можно вернуться к заданию и продолжить подготовку ответа."}</p></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={() => setSaved(true)} disabled={!draft.trim() && !fileName}>Сохранить черновик</button><button className="primary-button" onClick={() => setSubmitted(true)} disabled={!draft.trim() && !fileName}>Отправить на проверку <ChevronRight size={16} /></button></div></>}</div></section>;
 }
 
 function assignmentMaterialEmbed(url: string): string | null {
@@ -4696,10 +4877,10 @@ function AssignmentSubmissionSummary({ assignment }: { assignment: Assignment })
       const isCurrent = attempt.attempt === submission.attempt;
       const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted";
       return <div className="assignment-history-attempt" key={attempt.attempt}>
-        <div className="assignment-history-attempt-head"><span className={`attempt-dot ${dotTone}`} /><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><span className="assignment-history-attempt-status">{attempt.status}</span></div>
+        <div className="assignment-history-attempt-head"><span className={`attempt-dot ${dotTone}`} /><strong>Попытка {attempt.attempt}{isCurrent && history.length > 1 ? " · текущая" : ""}</strong></div>
         <div className="assignment-history-grid">
-          <div><span className="detail-label">ТВОЙ ОТВЕТ</span><p>{attempt.answerText || "Ответ отправлен вложением."}</p>{attempt.submittedAt && <small>Отправлено {new Date(attempt.submittedAt).toLocaleString("ru-RU")}</small>}</div>
-          {attempt.feedback.length > 0 && <div className="assignment-history-feedback"><span className="detail-label">ОТВЕТ КУРАТОРА</span>{attempt.feedback.map((item) => <p key={item.id}>{item.text}<br /><small>{new Date(item.createdAt).toLocaleString("ru-RU")}</small></p>)}</div>}
+          <div><span className="detail-label">ТВОЙ ОТВЕТ</span><p>{attempt.answerText || "Ответ отправлен вложением."}</p></div>
+          {attempt.feedback.length > 0 && <div className="assignment-history-feedback"><span className="detail-label">ОТВЕТ КУРАТОРА</span>{attempt.feedback.map((item) => <div key={item.id}>{item.text && <p>{item.text}</p>}{item.attachments.map((file) => file.mimeType.startsWith("image/") ? <a key={file.id} className="assignment-history-feedback-image" href={`${API_ORIGIN}${file.url}`} target="_blank" rel="noreferrer"><Image src={`${API_ORIGIN}${file.url}`} alt={file.originalName} fill sizes="320px" unoptimized /></a> : <a key={file.id} className="submission-file" href={`${API_ORIGIN}${file.url}`} target="_blank" rel="noreferrer"><FileCheck2 size={14} /><span>{file.originalName}</span><ArrowUpRight size={12} /></a>)}<small>{new Date(item.createdAt).toLocaleString("ru-RU")}</small></div>)}</div>}
         </div>
       </div>;
     })}</div>

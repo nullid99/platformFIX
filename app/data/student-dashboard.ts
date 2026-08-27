@@ -12,6 +12,13 @@ export type DashboardNav =
 export type AssignmentTone = "blue" | "amber" | "gray";
 export type AssignmentStatus = "На проверке" | "Нужна доработка" | "Не начато" | "Принято";
 
+export type AssignmentFeedback = {
+  id: string;
+  text: string;
+  createdAt: string;
+  attachments: readonly { id: string; originalName: string; mimeType: string; byteSize: number; url: string }[];
+};
+
 export type Assignment = {
   id: string;
   title: string;
@@ -31,7 +38,7 @@ export type Assignment = {
     attempt: number;
     answerText: string | null;
     submittedAt: string | null;
-    feedback: readonly { id: string; text: string; createdAt: string }[];
+    feedback: readonly AssignmentFeedback[];
     files: readonly { id: string; originalName: string; mimeType: string; byteSize: number }[];
   };
   /** Every submitted attempt for this assignment, oldest first — includes revision rounds, not just the latest. */
@@ -40,7 +47,7 @@ export type Assignment = {
     status: AssignmentStatus;
     answerText: string | null;
     submittedAt: string | null;
-    feedback: readonly { id: string; text: string; createdAt: string }[];
+    feedback: readonly AssignmentFeedback[];
     files: readonly { id: string; originalName: string; mimeType: string; byteSize: number }[];
   }[];
 };

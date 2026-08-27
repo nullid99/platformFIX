@@ -585,6 +585,7 @@ model StoredFile {
   submissions    SubmissionAttachment[]
   assignmentMaterials AssignmentMaterial[]
   discussionAttachments DiscussionAttachment[]
+  feedbackAttachments FeedbackAttachment[]
   streamMessages StreamMessage[]
 
   @@index([ownerId, status])
@@ -631,8 +632,24 @@ model Feedback {
   submission   Submission  @relation(fields: [submissionId], references: [id], onDelete: Cascade)
   author       User        @relation("FeedbackAuthor", fields: [authorId], references: [id], onDelete: Restrict)
   mediaAsset   MediaAsset? @relation(fields: [mediaAssetId], references: [id], onDelete: SetNull)
+  attachments  FeedbackAttachment[]
 
   @@index([submissionId, createdAt])
+}
+
+model FeedbackAttachment {
+  id           String     @id @default(cuid())
+  feedbackId   String
+  fileId       String
+  originalName String
+  mimeType     String
+  byteSize     Int
+  createdAt    DateTime   @default(now())
+  feedback     Feedback   @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  file         StoredFile @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([feedbackId, createdAt])
+  @@index([fileId])
 }
 
 model DiscussionThread {

@@ -69,7 +69,7 @@ function normalizeAttachments(values: DiscussionAttachmentInput[] | undefined): 
 
 function threadInclude() {
   return {
-    student: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true }, orderBy: { createdAt: "asc" as const }, take: 1 } } },
+    student: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true, avatarUrl: true, provider: true }, orderBy: { createdAt: "asc" as const } } } },
     curator: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true }, orderBy: { createdAt: "asc" as const }, take: 1 } } },
     module: { select: { id: true, title: true, position: true, coverPath: true } },
     lesson: { select: { id: true, title: true } },
@@ -89,6 +89,14 @@ type DiscussionThreadWithRelations = Prisma.DiscussionThreadGetPayload<{ include
 function personName(person: DiscussionThreadWithRelations["student"] | DiscussionThreadWithRelations["curator"]): string | null {
   if (!person) return null;
   return person.externalIdentities[0]?.displayName ?? person.externalIdentities[0]?.username ?? person.email;
+}
+
+// Curators recognize students by face faster than by initials once a cohort grows past a
+// handful of people — prefer the Discord avatar (highest-fidelity provider) over whichever
+// identity happens to be oldest.
+function personAvatarUrl(person: DiscussionThreadWithRelations["student"]): string | null {
+  const identities = person.externalIdentities;
+  return identities.find((identity) => identity.provider === "DISCORD")?.avatarUrl ?? identities[0]?.avatarUrl ?? null;
 }
 
 export class DiscussionService {
@@ -304,8 +312,8 @@ export class DiscussionService {
       lesson: thread.lesson ? { id: thread.lesson.id, title: thread.lesson.title } : null,
       assignment: thread.assignment ? { id: thread.assignment.id, title: thread.assignment.title } : null,
       student: anonymizeStudent
-        ? { id: null, name: "Ученик потока", email: null }
-        : { id: thread.student.id, name: personName(thread.student), email: thread.student.email },
+        ? { id: null, name: "Ученик потока", email: null, avatarUrl: null }
+        : { id: thread.student.id, name: personName(thread.student), email: thread.student.email, avatarUrl: personAvatarUrl(thread.student) },
       curator: thread.curator ? { id: thread.curator.id, name: personName(thread.curator), email: thread.curator.email } : null,
       messages: thread.messages.map((message) => {
         const isStudentAuthor = message.author.role === UserRole.STUDENT;

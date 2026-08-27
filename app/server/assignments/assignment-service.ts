@@ -38,16 +38,24 @@ type SubmissionInput = {
   fileIds?: string[];
 };
 
+type FeedbackAttachmentInput = {
+  fileId: string;
+  originalName: string;
+  mimeType: string;
+  byteSize: number;
+};
+
 type AssignmentWithRelations = Prisma.AssignmentGetPayload<{
   include: {
     lesson: { include: { module: { select: { title: true; position: true; coverPath: true } } } };
-    submissions: { include: { feedback: { select: { id: true, text: true, createdAt: true } }, fileAttachments: { include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } };
+    submissions: { include: { feedback: { select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } };
     materials: { orderBy: { position: "asc" } };
   };
 }>;
 
 type StudentHistoryFile = { id: string; originalName: string; mimeType: string; byteSize: number };
-type StudentHistoryFeedback = { id: string; text: string; createdAt: Date };
+type StudentHistoryFeedbackAttachment = { id: string; originalName: string; mimeType: string; byteSize: number; url: string };
+type StudentHistoryFeedback = { id: string; text: string; createdAt: Date; attachments: StudentHistoryFeedbackAttachment[] };
 type StudentHistoryAttempt = {
   id: string;
   attempt: number;
@@ -191,6 +199,17 @@ function getAttachments(value: Prisma.JsonValue | null): Array<{ name: string; t
   });
 }
 
+function mapFeedback(feedback: readonly { id: string; text: string; createdAt: Date; attachments: readonly { id: string; originalName: string; mimeType: string; byteSize: number; fileId: string; file: { status: StoredFileStatus } | null }[] }[]): StudentHistoryFeedback[] {
+  return feedback.map((item) => ({
+    id: item.id,
+    text: item.text,
+    createdAt: item.createdAt,
+    attachments: item.attachments
+      .filter((attachment) => attachment.file?.status === StoredFileStatus.UPLOADED)
+      .map((attachment) => ({ id: attachment.id, originalName: attachment.originalName, mimeType: attachment.mimeType, byteSize: attachment.byteSize, url: `/api/files/${attachment.fileId}/content` })),
+  }));
+}
+
 function formatDate(date: Date | null): string {
   if (!date) return "Срок не указан";
   return `Срок: ${new Intl.DateTimeFormat("ru-RU").format(date)}`;
@@ -225,7 +244,7 @@ export class AssignmentService {
           where: { studentId },
           orderBy: { attempt: "desc" },
           include: {
-            feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true } },
+            feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
             fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } },
           },
         },
@@ -254,7 +273,7 @@ export class AssignmentService {
         lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } },
         submissions: {
           include: {
-            feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true } },
+            feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
             fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } },
           },
         },
@@ -345,7 +364,7 @@ export class AssignmentService {
         lesson: { include: { module: { select: { id: true, practicumId: true, title: true, position: true, coverPath: true } } } },
         submissions: {
           include: {
-            feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true } },
+            feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
             fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } },
           },
         },
@@ -386,7 +405,7 @@ export class AssignmentService {
       }
       return tx.assignment.update({
         where: { id: assignmentId }, data,
-        include: { lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } }, submissions: { orderBy: { attempt: "desc" }, take: 1, include: { feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } }, materials: { orderBy: { position: "asc" } } },
+        include: { lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } }, submissions: { orderBy: { attempt: "desc" }, take: 1, include: { feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } }, materials: { orderBy: { position: "asc" } } },
       });
     });
     return this.toStudentDto(updated);
@@ -462,7 +481,7 @@ export class AssignmentService {
       include: {
         assignment: { include: { lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } } } },
         fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } },
-        student: { include: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1 } } },
+        student: { include: { externalIdentities: { orderBy: { createdAt: "asc" } } } },
         reviewer: { include: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1 } } },
       },
     });
@@ -529,7 +548,7 @@ export class AssignmentService {
     await this.assertCurator(actorId);
     const submissions = await prisma.submission.findMany({
       where: { studentId }, orderBy: [{ createdAt: "desc" }, { attempt: "desc" }], take: 100,
-      include: { assignment: { include: { lesson: { include: { module: { select: { title: true, position: true } } } } } }, feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } },
+      include: { assignment: { include: { lesson: { include: { module: { select: { title: true, position: true } } } } } }, feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } },
     });
     const grouped = new Map<string, StudentHistoryGroup>();
     for (const submission of submissions) {
@@ -540,7 +559,7 @@ export class AssignmentService {
         answerText: submission.answerText,
         submittedAt: submission.submittedAt,
         createdAt: submission.createdAt,
-        feedback: submission.feedback,
+        feedback: mapFeedback(submission.feedback),
         files: submission.fileAttachments.map((attachment) => attachment.file),
       };
       const current = grouped.get(submission.assignmentId);
@@ -568,8 +587,16 @@ export class AssignmentService {
       .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime());
   }
 
-  public async decide(actorId: string, submissionId: string, decision: "accepted" | "revision", feedback?: string, checkedRequirements?: string[]) {
+  public async decide(actorId: string, submissionId: string, decision: "accepted" | "revision", feedback?: string, checkedRequirements?: string[], attachment?: FeedbackAttachmentInput) {
     const actor = await this.assertCurator(actorId);
+    if (attachment) {
+      requiredText(attachment.originalName, "attachment.originalName", MAX_ATTACHMENT_NAME_LENGTH);
+      if (!Number.isSafeInteger(attachment.byteSize) || attachment.byteSize < 1 || attachment.byteSize > MAX_ATTACHMENT_SIZE) {
+        throw new AuthServiceError("INVALID_INPUT", "attachment is invalid");
+      }
+      const file = await prisma.storedFile.findFirst({ where: { id: attachment.fileId, ownerId: actorId, status: StoredFileStatus.UPLOADED }, select: { id: true } });
+      if (!file) throw new AuthServiceError("FORBIDDEN", "Attachment ownership is invalid");
+    }
     try {
       const result = await prisma.$transaction(async (tx) => {
         const current = await tx.submission.findUnique({
@@ -588,7 +615,16 @@ export class AssignmentService {
           data: { status: nextStatus, checkedRequirements: checkedRequirements ? (checkedRequirements as Prisma.InputJsonValue) : undefined },
           select: { id: true, status: true },
         });
-        if (feedback?.trim()) await tx.feedback.create({ data: { submissionId, authorId: actorId, text: feedback.trim().slice(0, MAX_TEXT_LENGTH) } });
+        if (feedback?.trim() || attachment) {
+          await tx.feedback.create({
+            data: {
+              submissionId,
+              authorId: actorId,
+              text: feedback?.trim().slice(0, MAX_TEXT_LENGTH) ?? "",
+              attachments: attachment ? { create: { fileId: attachment.fileId, originalName: attachment.originalName, mimeType: attachment.mimeType, byteSize: attachment.byteSize } } : undefined,
+            },
+          });
+        }
 
         // Accepting a submission only accepts THAT submission — a module can hold several
         // assignments (or none at all), so only a curator can judge when the module itself
@@ -664,7 +700,7 @@ export class AssignmentService {
         attempt: latest.attempt,
         answerText: latest.answerText,
         submittedAt: latest.submittedAt,
-        feedback: latest.feedback,
+        feedback: mapFeedback(latest.feedback),
         files: latest.fileAttachments.map((attachment) => attachment.file),
       } : undefined,
       // Every attempt, not just the latest — a resubmission after "на доработку" is a new
@@ -677,15 +713,19 @@ export class AssignmentService {
           status: assignmentStatusFromSubmission(entry.status),
           answerText: entry.answerText,
           submittedAt: entry.submittedAt,
-          feedback: entry.feedback,
+          feedback: mapFeedback(entry.feedback),
           files: entry.fileAttachments.map((attachment) => attachment.file),
         })),
     };
   }
 
-  private toQueueDto(submission: Awaited<ReturnType<typeof prisma.submission.findFirst>> & { assignment: { title: string; requirements: unknown; lesson: { module: { title: string; position: number; coverPath: string | null } } }; student: { externalIdentities: Array<{ displayName: string | null; username: string | null }> }; reviewer: { id: string; email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null; fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>; checkedRequirements?: Prisma.JsonValue }, attemptHistory: readonly QueueAttempt[], actorId: string) {
+  private toQueueDto(submission: Awaited<ReturnType<typeof prisma.submission.findFirst>> & { assignment: { title: string; requirements: unknown; lesson: { module: { title: string; position: number; coverPath: string | null } } }; student: { externalIdentities: Array<{ displayName: string | null; username: string | null; avatarUrl: string | null; provider: string }> }; reviewer: { id: string; email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null; fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>; checkedRequirements?: Prisma.JsonValue }, attemptHistory: readonly QueueAttempt[], actorId: string) {
     const identity = submission.student.externalIdentities[0];
     const studentName = identity?.displayName ?? identity?.username ?? "Ученик";
+    // Curators recognize students by face faster than by initials once a cohort grows past a
+    // handful of people — prefer the Discord avatar (highest-fidelity provider) over whichever
+    // identity happens to be oldest.
+    const studentAvatarUrl = submission.student.externalIdentities.find((entry) => entry.provider === "DISCORD")?.avatarUrl ?? submission.student.externalIdentities[0]?.avatarUrl ?? null;
     const status = assignmentStatusFromSubmission(submission.status);
     const metadataAttachments = getAttachments(submission.attachments);
     const storedAttachments = submission.fileAttachments.map((item) => item.file);
@@ -696,6 +736,7 @@ export class AssignmentService {
       id: submission.id,
       studentName,
       studentInitials: studentName.slice(0, 2).toUpperCase(),
+      studentAvatarUrl,
       assignmentTitle: submission.assignment.title,
       requirements: getRequirements(submission.assignment.requirements as Prisma.JsonValue),
       module: `${String(submission.assignment.lesson.module.position).padStart(2, "0")} · ${submission.assignment.lesson.module.title}`,

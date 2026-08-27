@@ -188,6 +188,7 @@ export class FileService {
           assignmentMaterials: { select: { assignmentId: true } },
           streamMessages: { select: { practicumId: true } },
           discussionAttachments: { select: { message: { select: { thread: { select: { studentId: true, module: { select: { practicumId: true } } } } } } } },
+          feedbackAttachments: { select: { feedback: { select: { submission: { select: { studentId: true } } } } } },
         },
       }),
     ]);
@@ -228,7 +229,13 @@ export class FileService {
       const studentDiscussionAccess = actor.role === UserRole.STUDENT && discussionPracticumIds.length > 0
         ? await prisma.enrollment.count({ where: { studentId: actorId, practicumId: { in: discussionPracticumIds }, status: EnrollmentStatus.ACTIVE, OR: [{ accessUntil: null }, { accessUntil: { gt: new Date() } }] } })
         : 0;
-      if (actor.role !== UserRole.OWNER && !isLocalTestCurator && assigned === 0 && studentMaterialAccess === 0 && moduleCoverAccess === 0 && curatorModuleAccess === 0 && curatorStreamChatAccess === 0 && studentStreamChatAccess === 0 && curatorDiscussionAccess === 0 && studentDiscussionAccess === 0) throw new AuthServiceError("FORBIDDEN", "File access is not allowed");
+      // A curator's feedback attachment (screenshot pasted while reviewing a submission)
+      // needs to reach the student it was written for, plus any curator reviewing the
+      // same submission — same access shape as the student's own submission attachments.
+      const feedbackStudentIds = file.feedbackAttachments.map((attachment) => attachment.feedback.submission.studentId);
+      const curatorFeedbackAccess = actor.role === UserRole.CURATOR && feedbackStudentIds.length > 0 ? 1 : 0;
+      const studentFeedbackAccess = actor.role === UserRole.STUDENT && feedbackStudentIds.includes(actorId) ? 1 : 0;
+      if (actor.role !== UserRole.OWNER && !isLocalTestCurator && assigned === 0 && studentMaterialAccess === 0 && moduleCoverAccess === 0 && curatorModuleAccess === 0 && curatorStreamChatAccess === 0 && studentStreamChatAccess === 0 && curatorDiscussionAccess === 0 && studentDiscussionAccess === 0 && curatorFeedbackAccess === 0 && studentFeedbackAccess === 0) throw new AuthServiceError("FORBIDDEN", "File access is not allowed");
     }
     return { id: file.id, storageKey: file.storageKey, originalName: file.originalName, mimeType: file.mimeType, byteSize: file.byteSize };
   }

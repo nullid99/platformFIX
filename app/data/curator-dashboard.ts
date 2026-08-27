@@ -6,6 +6,7 @@ export type ReviewQueueItem = {
   id: string;
   studentName: string;
   studentInitials: string;
+  studentAvatarUrl?: string | null;
   assignmentTitle: string;
   module: string;
   coverPath?: string | null;
