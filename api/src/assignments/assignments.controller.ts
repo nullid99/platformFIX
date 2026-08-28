@@ -46,11 +46,9 @@ function feedbackAttachmentInput(value: unknown): { fileId: string; originalName
 
 function assignmentInput(body: JsonBody, partial = false) {
   return {
-    lessonId: text(body.lessonId, "lessonId", true),
+    moduleId: text(body.moduleId, "moduleId", partial),
     title: text(body.title, "title", partial),
     description: text(body.description, "description", partial),
-    moduleNumber: text(body.moduleNumber, "moduleNumber", partial),
-    moduleTitle: text(body.moduleTitle, "moduleTitle", partial),
     deadline: text(body.deadline, "deadline", true),
     requirements: stringArray(body.requirements, "requirements", partial),
     allowedFormats: stringArray(body.allowedFormats, "allowedFormats", partial),

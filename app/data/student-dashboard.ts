@@ -23,7 +23,6 @@ export type Assignment = {
   id: string;
   title: string;
   module: string;
-  lessonTitle?: string | null;
   coverPath?: string | null;
   status: AssignmentStatus;
   tone: AssignmentTone;
@@ -89,7 +88,6 @@ export type StreamItem = {
   title: string;
   kind: StreamKind;
   module: string;
-  lesson: string;
   date: string;
   duration: string;
   progress: number;
@@ -130,14 +128,14 @@ export const studentDashboard = {
   },
   focus: {
     title: "Разметка зон поддержки и сопротивления",
-    subtitle: "Модуль 03 · Практика на истории",
+    subtitle: "Урок 03 · Практика на истории",
     progress: 72,
   },
   modules: [
     { id: "context", number: "01", title: "Контекст и структура рынка", status: "Завершён", progress: 100, lessons: 6, description: "Базовая карта рынка, структура движения и рабочий контекст перед разметкой.", locked: false },
     { id: "scenarios", number: "02", title: "Сценарии движения цены", status: "Завершён", progress: 100, lessons: 5, description: "Как заранее описывать сценарий и не менять правила после появления позиции.", locked: false },
     { id: "zones", number: "03", title: "Зоны поддержки и сопротивления", status: "В процессе", progress: 72, lessons: 7, description: "Находим рабочие зоны, проверяем реакцию цены и готовим разметку к проверке.", locked: false },
-    { id: "execution", number: "04", title: "Торговый план и исполнение", status: "Откроется после модуля 03", progress: 0, lessons: 6, description: "Соберём торговый план и переведём наблюдения в понятные правила исполнения.", locked: true },
+    { id: "execution", number: "04", title: "Торговый план и исполнение", status: "Откроется после урока 03", progress: 0, lessons: 6, description: "Соберём торговый план и переведём наблюдения в понятные правила исполнения.", locked: true },
   ] satisfies CourseModule[],
   progress: {
     practicum: `${practicumProgress}%`,
@@ -151,7 +149,7 @@ export const studentDashboard = {
     {
       id: "zones-markup",
       title: "Разметка зон",
-      module: "Модуль 03",
+      module: "Урок 03",
       status: "На проверке",
       tone: "blue",
       date: "Сегодня",
@@ -162,7 +160,7 @@ export const studentDashboard = {
     {
       id: "trade-review",
       title: "Разбор двух сделок",
-      module: "Модуль 02",
+      module: "Урок 02",
       status: "Нужна доработка",
       tone: "amber",
       date: "Вчера",
@@ -173,7 +171,7 @@ export const studentDashboard = {
     {
       id: "weekly-plan",
       title: "Торговый план на неделю",
-      module: "Модуль 04",
+      module: "Урок 04",
       status: "Не начато",
       tone: "gray",
       date: "До 21 июля",
@@ -184,7 +182,7 @@ export const studentDashboard = {
     {
       id: "entry-logic",
       title: "Логика входа в сделку",
-      module: "Модуль 01",
+      module: "Урок 01",
       status: "Принято",
       tone: "blue",
       date: "18 июля",
@@ -194,10 +192,10 @@ export const studentDashboard = {
     },
   ] satisfies Assignment[],
   streams: [
-    { id: "eur-zones", title: "Разбор зоны на EUR/USD", kind: "Разбор", module: "Модуль 03", lesson: "Разметка зон", date: "Сегодня", duration: "18:42", progress: 32, description: "Разбираем реакцию цены на зоне и последовательность подтверждений перед входом.", cover: "/fix-logo.jpg", isNew: true },
-    { id: "live-practice", title: "Практика на живом рынке", kind: "Стрим", module: "Модуль 03", lesson: "Практика с куратором", date: "21 июля", duration: "1:24:08", progress: 0, description: "Запись практической части с разбором сценариев и вопросов участников потока.", cover: null, isNew: false },
-    { id: "two-trades", title: "Разбор двух сделок", kind: "Разбор", module: "Модуль 02", lesson: "Разбор сделок", date: "19 июля", duration: "26:15", progress: 76, description: "Сравниваем план сделки с исполнением и отмечаем точку, где сценарий потерял силу.", cover: null, isNew: false },
-    { id: "weekly-plan", title: "Как собрать торговый план", kind: "Разбор", module: "Модуль 04", lesson: "Торговый план на неделю", date: "17 июля", duration: "31:04", progress: 0, description: "Пошагово собираем план наблюдения на неделю и условия отмены сценария.", cover: null, isNew: false },
+    { id: "eur-zones", title: "Разбор зоны на EUR/USD", kind: "Разбор", module: "Урок 03", date: "Сегодня", duration: "18:42", progress: 32, description: "Разбираем реакцию цены на зоне и последовательность подтверждений перед входом.", cover: "/fix-logo.jpg", isNew: true },
+    { id: "live-practice", title: "Практика на живом рынке", kind: "Стрим", module: "Урок 03", date: "21 июля", duration: "1:24:08", progress: 0, description: "Запись практической части с разбором сценариев и вопросов участников потока.", cover: null, isNew: false },
+    { id: "two-trades", title: "Разбор двух сделок", kind: "Разбор", module: "Урок 02", date: "19 июля", duration: "26:15", progress: 76, description: "Сравниваем план сделки с исполнением и отмечаем точку, где сценарий потерял силу.", cover: null, isNew: false },
+    { id: "weekly-plan", title: "Как собрать торговый план", kind: "Разбор", module: "Урок 04", date: "17 июля", duration: "31:04", progress: 0, description: "Пошагово собираем план наблюдения на неделю и условия отмены сценария.", cover: null, isNew: false },
   ] satisfies StreamItem[],
   // Real events come from GET /api/schedule (ScheduleView / CuratorScheduleView fetch
   // them). This stays empty rather than seeded with demo rows — a demo event here used

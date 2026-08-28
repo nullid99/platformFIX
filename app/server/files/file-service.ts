@@ -210,7 +210,7 @@ export class FileService {
           where: {
             id: { in: file.assignmentMaterials.map((material) => material.assignmentId) },
             status: AssignmentStatus.PUBLISHED,
-            lesson: { module: { practicum: { enrollments: { some: { studentId: actorId, status: EnrollmentStatus.ACTIVE } } } } },
+            module: { practicum: { enrollments: { some: { studentId: actorId, status: EnrollmentStatus.ACTIVE } } } },
           },
         })
         : 0;

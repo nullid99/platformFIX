@@ -53,14 +53,6 @@ enum EnrollmentStatus {
   COMPLETED
 }
 
-enum LessonType {
-  TEXT
-  VIDEO
-  STREAM
-  ASSIGNMENT
-  QA
-}
-
 enum MediaAssetKind {
   LESSON_VIDEO
   STREAM
@@ -383,7 +375,8 @@ model Module {
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   practicum   Practicum  @relation(fields: [practicumId], references: [id], onDelete: Cascade)
-  lessons     Lesson[]
+  mediaAssets MediaAsset[]
+  assignments Assignment[]
   accessRecords EnrollmentModuleAccess[]
   discussionThreads DiscussionThread[]
 
@@ -412,28 +405,10 @@ model EnrollmentModuleAccess {
   @@index([moduleId, status])
 }
 
-model Lesson {
-  id          String        @id @default(cuid())
-  moduleId    String
-  title       String
-  type        LessonType
-  position    Int
-  description String?
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
-  module      Module        @relation(fields: [moduleId], references: [id], onDelete: Cascade)
-  mediaAssets MediaAsset[]
-  assignments Assignment[]
-  discussionThreads DiscussionThread[]
-
-  @@unique([moduleId, position])
-  @@index([moduleId, type])
-}
-
 model MediaAsset {
   id          String           @id @default(cuid())
   practicumId String
-  lessonId    String?
+  moduleId    String?
   scheduleEventId String?
   provider    String
   providerKey String
@@ -448,13 +423,13 @@ model MediaAsset {
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
   practicum   Practicum        @relation(fields: [practicumId], references: [id], onDelete: Cascade)
-  lesson      Lesson?          @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  module      Module?          @relation(fields: [moduleId], references: [id], onDelete: SetNull)
   scheduleEvent ScheduleEvent? @relation(fields: [scheduleEventId], references: [id], onDelete: SetNull)
   feedback    Feedback[]
   playbackEvents MediaPlaybackEvent[]
 
-  @@unique([provider, providerKey, lessonId])
-  @@index([lessonId, status, position])
+  @@unique([provider, providerKey, moduleId])
+  @@index([moduleId, status, position])
   @@index([scheduleEventId, status, position])
   @@index([practicumId, status, position])
 }
@@ -524,7 +499,7 @@ model ScheduleEvent {
 
 model Assignment {
   id          String           @id @default(cuid())
-  lessonId    String
+  moduleId    String
   title       String
   description String
   requirements Json?
@@ -533,12 +508,12 @@ model Assignment {
   deadline    DateTime?
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
-  lesson      Lesson           @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  module      Module           @relation(fields: [moduleId], references: [id], onDelete: Cascade)
   submissions Submission[]
   materials   AssignmentMaterial[]
   discussionThreads DiscussionThread[]
 
-  @@index([lessonId, status])
+  @@index([moduleId, status])
 }
 
 model Submission {
@@ -657,7 +632,6 @@ model DiscussionThread {
   studentId    String
   curatorId    String?
   moduleId     String?
-  lessonId     String?
   assignmentId String?
   title        String
   status       DiscussionStatus    @default(NEW)
@@ -668,13 +642,11 @@ model DiscussionThread {
   student      User                @relation("DiscussionStudentThreads", fields: [studentId], references: [id], onDelete: Cascade)
   curator      User?               @relation("DiscussionCuratorThreads", fields: [curatorId], references: [id], onDelete: SetNull)
   module       Module?             @relation(fields: [moduleId], references: [id], onDelete: SetNull)
-  lesson       Lesson?             @relation(fields: [lessonId], references: [id], onDelete: SetNull)
   assignment   Assignment?         @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
   messages     DiscussionMessage[]
 
   @@index([studentId, lastMessageAt])
   @@index([curatorId, status, lastMessageAt])
-  @@index([lessonId, createdAt])
   @@index([assignmentId, createdAt])
 }
 

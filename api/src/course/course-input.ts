@@ -6,12 +6,10 @@ export type CreateModuleBody = {
   description?: string;
   section?: string;
   coverPath?: string;
-  lessonTitle?: string;
-  lessonDescription?: string;
 };
 
 export type CreateVimeoMediaBody = {
-  lessonId?: string;
+  moduleId?: string;
   scheduleEventId?: string;
   title: string;
   description?: string;
@@ -21,7 +19,7 @@ export type CreateVimeoMediaBody = {
 
 export type UpdateMediaKindBody = {
   kind: MediaAssetKind;
-  lessonId?: string;
+  moduleId?: string;
   scheduleEventId?: string;
 };
 
@@ -51,8 +49,6 @@ export function parseCreateModuleBody(value: unknown): CreateModuleBody {
     description: optionalText(body.description, "description", 5_000),
     section: optionalText(body.section, "section", 40),
     coverPath,
-    lessonTitle: optionalText(body.lessonTitle, "lessonTitle", 180),
-    lessonDescription: optionalText(body.lessonDescription, "lessonDescription", 5_000),
   };
 }
 
@@ -67,12 +63,12 @@ export function parseCreateVimeoMediaBody(value: unknown): CreateVimeoMediaBody 
     throw new BadRequestException("kind is invalid");
   }
 
-  const lessonId = text(body.lessonId, "lessonId", 100, true);
+  const moduleId = text(body.moduleId, "moduleId", 100, true);
   const scheduleEventId = text(body.scheduleEventId, "scheduleEventId", 100, true);
-  if (kind !== MediaAssetKind.TALKS && !lessonId && !scheduleEventId) throw new BadRequestException("lessonId is required unless media is linked to a schedule event");
+  if (kind !== MediaAssetKind.TALKS && !moduleId && !scheduleEventId) throw new BadRequestException("moduleId is required unless media is linked to a schedule event");
 
   return {
-    lessonId,
+    moduleId,
     scheduleEventId,
     title: text(body.title, "title", 180)!,
     description: text(body.description, "description", 2_000, true),
@@ -92,9 +88,9 @@ export function parseUpdateMediaKindBody(value: unknown): UpdateMediaKindBody {
     throw new BadRequestException("kind is invalid");
   }
 
-  const lessonId = text(body.lessonId, "lessonId", 100, true);
+  const moduleId = text(body.moduleId, "moduleId", 100, true);
   const scheduleEventId = text(body.scheduleEventId, "scheduleEventId", 100, true);
-  if (kind !== MediaAssetKind.TALKS && !lessonId && !scheduleEventId) throw new BadRequestException("lessonId is required unless media is linked to a schedule event");
+  if (kind !== MediaAssetKind.TALKS && !moduleId && !scheduleEventId) throw new BadRequestException("moduleId is required unless media is linked to a schedule event");
 
-  return { kind: kind as MediaAssetKind, lessonId, scheduleEventId };
+  return { kind: kind as MediaAssetKind, moduleId, scheduleEventId };
 }

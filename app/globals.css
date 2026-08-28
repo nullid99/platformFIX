@@ -682,6 +682,7 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 .form-section-heading > div { display: grid; gap: 5px; }
 .form-section-heading small { color: #68778a; font-size: 10px; }
 .requirement-editor { display: grid; gap: 7px; }
+.requirement-add-button { margin-top: 10px; }
 .requirement-input { min-height: 37px; display: flex; align-items: center; gap: 8px; }
 .requirement-input > span { width: 24px; color: #6288b7; font: 9px 'DM Mono', monospace; }
 .requirement-input input { min-width: 0; height: 35px; flex: 1; padding: 0 10px; color: #dce6f2; background: #0d1218; border: 1px solid #2a3542; outline: 0; font: 11px 'Manrope', sans-serif; }
@@ -1542,6 +1543,9 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 .curator-invite-page-heading { justify-content: center; text-align: center; }
 .curator-invite-page-heading > div { display: grid; justify-items: center; }
 .curator-invite-page-heading p { margin-left: auto; margin-right: auto; }
+.curator-program-page-heading { justify-content: center; text-align: center; }
+.curator-program-page-heading > div { display: grid; justify-items: center; }
+.curator-program-page-heading p { margin-left: auto; margin-right: auto; }
 .curator-streams-page-heading { justify-content: center; text-align: center; }
 .curator-streams-page-heading > div { display: grid; justify-items: center; }
 .curator-streams-page-heading p { margin-left: auto; margin-right: auto; }
@@ -2646,20 +2650,17 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 }
 
 .learner-course-view .course-map .section-heading .section-kicker,
-.learner-course-view .module-detail .module-detail-head .section-kicker {
-  color: rgba(255, 255, 255, .48);
+.learner-course-view .module-detail .module-detail-head .section-kicker,
+.learner-course-view .module-detail .next-lesson .section-kicker {
+  color: rgba(255, 255, 255, .6);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .4px;
 }
 
 .learner-course-view .course-map .progress-inline {
-  color: transparent;
-  font-family: inherit;
-  font-size: 0;
-  letter-spacing: -.6px;
-}
-
-.learner-course-view .course-map .progress-inline::after {
   color: rgba(255, 255, 255, .58);
-  content: attr(data-module-count) " Уроков";
+  font-family: inherit;
   font-size: 30px;
   letter-spacing: -.8px;
 }
@@ -2696,11 +2697,17 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 }
 
 .learner-course-view .module-detail .module-detail-summary p::before {
-  color: rgba(255, 255, 255, .42);
+  color: rgba(255, 255, 255, .6);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .4px;
 }
 
 .learner-course-view .module-content-heading span {
-  color: rgba(255, 255, 255, .48);
+  color: rgba(255, 255, 255, .6);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .4px;
 }
 
 .learner-course-view .module-detail .module-content-item {
@@ -4810,6 +4817,10 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
   box-shadow: none;
 }
 
+.learner-course-view .create-assignment-layout .assignment-preview {
+  margin-top: 0;
+}
+
 .learner-course-view .create-assignment-form .section-heading,
 .learner-course-view .assignment-preview .section-heading,
 .learner-course-view .assignment-material-panel .section-heading {
@@ -4835,7 +4846,10 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 
 .learner-course-view .form-field > span,
 .learner-course-view .form-section-heading > div > span {
-  color: rgba(255, 255, 255, .5);
+  color: rgba(255, 255, 255, .68);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .3px;
 }
 
 .learner-course-view .form-field input,
@@ -7276,10 +7290,6 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
   }
 
   .learner-course-view .course-map .progress-inline {
-    font-size: 0;
-  }
-
-  .learner-course-view .course-map .progress-inline::after {
     font-size: 20px;
   }
 

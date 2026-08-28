@@ -1,7 +1,6 @@
 import { Prisma } from "@/app/generated/prisma/client";
 import {
   AssignmentStatus,
-  LessonType,
   StoredFileStatus,
   SubmissionStatus,
   UserRole,
@@ -21,11 +20,9 @@ type AssignmentMaterialInput =
   | { kind: "FILE"; title: string; fileId: string };
 
 type AssignmentInput = {
-  lessonId?: string;
+  moduleId: string;
   title: string;
   description: string;
-  moduleNumber: string;
-  moduleTitle: string;
   deadline?: string;
   requirements: string[];
   allowedFormats: string[];
@@ -47,7 +44,7 @@ type FeedbackAttachmentInput = {
 
 type AssignmentWithRelations = Prisma.AssignmentGetPayload<{
   include: {
-    lesson: { include: { module: { select: { title: true; position: true; coverPath: true } } } };
+    module: { select: { title: true; position: true; coverPath: true } };
     submissions: { include: { feedback: { select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } };
     materials: { orderBy: { position: "asc" } };
   };
@@ -107,14 +104,6 @@ function parseDate(value: string | undefined): Date | undefined {
     throw new AuthServiceError("INVALID_INPUT", "deadline is invalid");
   }
   return date;
-}
-
-function parseModulePosition(value: string): number {
-  const position = Number.parseInt(value, 10);
-  if (!Number.isInteger(position) || position < 0 || position > 99) {
-    throw new AuthServiceError("INVALID_INPUT", "moduleNumber is invalid");
-  }
-  return position;
 }
 
 function normalizeRequirements(values: string[]): string[] {
@@ -239,7 +228,7 @@ export class AssignmentService {
       where: { status: AssignmentStatus.PUBLISHED },
       orderBy: { createdAt: "desc" },
       include: {
-        lesson: { include: { module: { select: { title: true, position: true, coverPath: true, practicumId: true } } } },
+        module: { select: { title: true, position: true, coverPath: true, practicumId: true } },
         submissions: {
           where: { studentId },
           orderBy: { attempt: "desc" },
@@ -256,9 +245,9 @@ export class AssignmentService {
     // needs its own gate check against the module before it, not just "is the module open."
     const gateCache = new Map<string, string | null>();
     return Promise.all(assignments.map(async (assignment) => {
-      const cacheKey = `${assignment.lesson.module.practicumId}:${assignment.lesson.module.position}`;
+      const cacheKey = `${assignment.module.practicumId}:${assignment.module.position}`;
       if (!gateCache.has(cacheKey)) {
-        gateCache.set(cacheKey, await assignmentPrerequisiteGate(prisma, studentId, assignment.lesson.module.practicumId, assignment.lesson.module.position));
+        gateCache.set(cacheKey, await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position));
       }
       return this.toStudentDto(assignment, gateCache.get(cacheKey) ?? null);
     }));
@@ -270,7 +259,7 @@ export class AssignmentService {
       where: { status: { not: AssignmentStatus.ARCHIVED } },
       orderBy: { createdAt: "desc" },
       include: {
-        lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } },
+        module: { select: { title: true, position: true, coverPath: true } },
         submissions: {
           include: {
             feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
@@ -289,38 +278,15 @@ export class AssignmentService {
   public async create(actorId: string, input: AssignmentInput) {
     await this.assertCurator(actorId);
     const normalized = this.normalizeAssignmentInput(input);
-    const position = parseModulePosition(normalized.moduleNumber);
 
     const assignment = await prisma.$transaction(async (tx) => {
-      // Matching every other lookup in the app (course-service.ts, stream-service.ts) —
-      // the earliest-created practicum, not a hardcoded title. A title match is fragile
-      // across environments (staging's practicum is titled "Practicum 04", not "Практикум
-      // 04") and silently spawned a second, disconnected practicum + module whenever it
-      // missed, which is what produced "Lesson does not belong to this module": the
-      // existing lessonId pointed at a lesson under the REAL module, not the phantom one
-      // just created under the mismatched practicum.
-      const practicum = await tx.practicum.findFirst({ orderBy: { createdAt: "asc" } });
+      const courseModule = await tx.module.findUnique({ where: { id: normalized.moduleId }, select: { id: true, practicumId: true } });
+      if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
+      const practicum = await tx.practicum.findUnique({ where: { id: courseModule.practicumId } });
       if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
-      const courseModule = await tx.module.upsert({
-        where: { practicumId_position: { practicumId: practicum.id, position } },
-        update: { title: normalized.moduleTitle },
-        create: { practicumId: practicum.id, position, title: normalized.moduleTitle },
-      });
-      const lesson = normalized.lessonId
-        ? await tx.lesson.findFirst({ where: { id: normalized.lessonId, moduleId: courseModule.id } })
-        : await tx.lesson.create({
-            data: {
-              moduleId: courseModule.id,
-              position: (await tx.lesson.count({ where: { moduleId: courseModule.id } })) + 1,
-              title: normalized.title,
-              type: LessonType.ASSIGNMENT,
-              description: normalized.description,
-            },
-          });
-      if (!lesson) throw new AuthServiceError("INVALID_INPUT", "Lesson does not belong to this module");
       const created = await tx.assignment.create({
         data: {
-          lessonId: lesson.id,
+          moduleId: courseModule.id,
           title: normalized.title,
           description: normalized.description,
           requirements: normalized.requirements as Prisma.InputJsonValue,
@@ -361,7 +327,7 @@ export class AssignmentService {
     const created = await prisma.assignment.findUniqueOrThrow({
       where: { id: assignment },
       include: {
-        lesson: { include: { module: { select: { id: true, practicumId: true, title: true, position: true, coverPath: true } } } },
+        module: { select: { id: true, practicumId: true, title: true, position: true, coverPath: true } },
         submissions: {
           include: {
             feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
@@ -371,11 +337,11 @@ export class AssignmentService {
         materials: { orderBy: { position: "asc" } },
       },
     });
-    void activeStudentEmails(created.lesson.module.practicumId)
-      .then((emails) => Promise.all(emails.map((to) => sendNewAssignmentNotification({ to, assignmentTitle: created.title, moduleTitle: created.lesson.module.title, assignmentId: created.id }))))
+    void activeStudentEmails(created.module.practicumId)
+      .then((emails) => Promise.all(emails.map((to) => sendNewAssignmentNotification({ to, assignmentTitle: created.title, moduleTitle: created.module.title, assignmentId: created.id }))))
       .catch((error: unknown) => console.error("Assignment recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-    void activeStudentIds(created.lesson.module.practicumId)
-      .then((studentIds) => notificationService.createMany(studentIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.lesson.module.title, created.id))
+    void activeStudentIds(created.module.practicumId)
+      .then((studentIds) => notificationService.createMany(studentIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.module.title, created.id))
       .catch((error: unknown) => console.error("Assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     return this.toStudentDto(created);
   }
@@ -405,7 +371,7 @@ export class AssignmentService {
       }
       return tx.assignment.update({
         where: { id: assignmentId }, data,
-        include: { lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } }, submissions: { orderBy: { attempt: "desc" }, take: 1, include: { feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } }, materials: { orderBy: { position: "asc" } } },
+        include: { module: { select: { title: true, position: true, coverPath: true } }, submissions: { orderBy: { attempt: "desc" }, take: 1, include: { feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } } }, materials: { orderBy: { position: "asc" } } },
       });
     });
     return this.toStudentDto(updated);
@@ -421,10 +387,10 @@ export class AssignmentService {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
     const assignment = await prisma.assignment.findFirst({
       where: { id: assignmentId, status: AssignmentStatus.PUBLISHED },
-      select: { id: true, lesson: { select: { module: { select: { position: true, practicumId: true } } } } },
+      select: { id: true, module: { select: { position: true, practicumId: true } } },
     });
     if (!assignment) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
-    const blockedByModuleTitle = await assignmentPrerequisiteGate(prisma, studentId, assignment.lesson.module.practicumId, assignment.lesson.module.position);
+    const blockedByModuleTitle = await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position);
     if (blockedByModuleTitle) throw new AuthServiceError("INVALID_INPUT", `Сначала нужно сдать ДЗ модуля «${blockedByModuleTitle}»`);
     const answerText = optionalText(input.answerText, MAX_TEXT_LENGTH);
     const attachments = normalizeAttachments(input.attachments);
@@ -479,7 +445,7 @@ export class AssignmentService {
       },
       orderBy: { submittedAt: "desc" },
       include: {
-        assignment: { include: { lesson: { include: { module: { select: { title: true, position: true, coverPath: true } } } } } },
+        assignment: { include: { module: { select: { title: true, position: true, coverPath: true } } } },
         fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } },
         student: { include: { externalIdentities: { orderBy: { createdAt: "asc" } } } },
         reviewer: { include: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1 } } },
@@ -534,9 +500,14 @@ export class AssignmentService {
 
   public async releaseClaim(actorId: string, submissionId: string) {
     const actor = await this.assertCurator(actorId);
-    const current = await prisma.submission.findUnique({ where: { id: submissionId }, select: { id: true, reviewerId: true, status: true } });
+    const current = await prisma.submission.findUnique({ where: { id: submissionId }, select: { id: true, reviewerId: true, status: true, attempt: true } });
     if (!current) throw new AuthServiceError("INVALID_INPUT", "Submission does not exist");
     if (current.reviewerId !== actorId && actor.role !== UserRole.OWNER) throw new AuthServiceError("FORBIDDEN", "Only the assigned curator can release this work");
+    // A curator who already sent a previous attempt of this same work back for revision is
+    // automatically re-assigned to it on resubmission (see submit()'s carriedReviewerId) —
+    // they can't bail out of that follow-up review, so the student doesn't lose the context
+    // of who has already been working with them on it.
+    if (current.attempt > 1 && actor.role !== UserRole.OWNER) throw new AuthServiceError("FORBIDDEN", "Нельзя отменить взятие: вы уже отправляли эту работу на доработку");
     return prisma.submission.update({
       where: { id: submissionId },
       data: { reviewerId: null, claimedAt: null, status: current.status === SubmissionStatus.IN_REVIEW ? SubmissionStatus.SUBMITTED : current.status },
@@ -548,7 +519,7 @@ export class AssignmentService {
     await this.assertCurator(actorId);
     const submissions = await prisma.submission.findMany({
       where: { studentId }, orderBy: [{ createdAt: "desc" }, { attempt: "desc" }], take: 100,
-      include: { assignment: { include: { lesson: { include: { module: { select: { title: true, position: true } } } } } }, feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } },
+      include: { assignment: { include: { module: { select: { title: true, position: true } } } }, feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } }, fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } } },
     });
     const grouped = new Map<string, StudentHistoryGroup>();
     for (const submission of submissions) {
@@ -568,7 +539,7 @@ export class AssignmentService {
           ...attempt,
           assignmentId: submission.assignmentId,
           title: submission.assignment.title,
-          module: `${String(submission.assignment.lesson.module.position).padStart(2, "0")} · ${submission.assignment.lesson.module.title}`,
+          module: `${String(submission.assignment.module.position).padStart(2, "0")} · ${submission.assignment.module.title}`,
           attempts: [attempt],
         });
         continue;
@@ -601,7 +572,7 @@ export class AssignmentService {
       const result = await prisma.$transaction(async (tx) => {
         const current = await tx.submission.findUnique({
           where: { id: submissionId },
-          include: { student: { select: { email: true } }, assignment: { include: { lesson: { include: { module: true } } } } },
+          include: { student: { select: { email: true } }, assignment: { include: { module: true } } },
         });
         if (!current) throw new AuthServiceError("INVALID_INPUT", "Submission does not exist");
         if (!current.reviewerId) throw new AuthServiceError("AUTH_CONFLICT", "Take the work for review before deciding");
@@ -649,11 +620,9 @@ export class AssignmentService {
 
   private normalizeAssignmentInput(input: AssignmentInput) {
     return {
-      lessonId: input.lessonId?.trim() || undefined,
+      moduleId: requiredText(input.moduleId, "moduleId", 100),
       title: requiredText(input.title, "title"),
       description: requiredText(input.description, "description", MAX_TEXT_LENGTH),
-      moduleNumber: requiredText(input.moduleNumber, "moduleNumber", 10),
-      moduleTitle: requiredText(input.moduleTitle, "moduleTitle"),
       deadline: parseDate(input.deadline),
       requirements: normalizeRequirements(input.requirements),
       allowedFormats: normalizeFormats(input.allowedFormats),
@@ -678,9 +647,8 @@ export class AssignmentService {
     return {
       id: assignment.id,
       title: assignment.title,
-      module: `${String(assignment.lesson.module.position).padStart(2, "0")} · ${assignment.lesson.module.title}`,
-      lessonTitle: assignment.lesson.title,
-      coverPath: assignment.lesson.module.coverPath,
+      module: `${String(assignment.module.position).padStart(2, "0")} · ${assignment.module.title}`,
+      coverPath: assignment.module.coverPath,
       status,
       blockedByModuleTitle,
       tone: toneFromStatus(status),
@@ -719,7 +687,7 @@ export class AssignmentService {
     };
   }
 
-  private toQueueDto(submission: Awaited<ReturnType<typeof prisma.submission.findFirst>> & { assignment: { title: string; requirements: unknown; lesson: { module: { title: string; position: number; coverPath: string | null } } }; student: { externalIdentities: Array<{ displayName: string | null; username: string | null; avatarUrl: string | null; provider: string }> }; reviewer: { id: string; email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null; fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>; checkedRequirements?: Prisma.JsonValue }, attemptHistory: readonly QueueAttempt[], actorId: string) {
+  private toQueueDto(submission: Awaited<ReturnType<typeof prisma.submission.findFirst>> & { assignment: { title: string; requirements: unknown; module: { title: string; position: number; coverPath: string | null } }; student: { externalIdentities: Array<{ displayName: string | null; username: string | null; avatarUrl: string | null; provider: string }> }; reviewer: { id: string; email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null; fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>; checkedRequirements?: Prisma.JsonValue }, attemptHistory: readonly QueueAttempt[], actorId: string) {
     const identity = submission.student.externalIdentities[0];
     const studentName = identity?.displayName ?? identity?.username ?? "Ученик";
     // Curators recognize students by face faster than by initials once a cohort grows past a
@@ -739,8 +707,8 @@ export class AssignmentService {
       studentAvatarUrl,
       assignmentTitle: submission.assignment.title,
       requirements: getRequirements(submission.assignment.requirements as Prisma.JsonValue),
-      module: `${String(submission.assignment.lesson.module.position).padStart(2, "0")} · ${submission.assignment.lesson.module.title}`,
-      coverPath: submission.assignment.lesson.module.coverPath,
+      module: `${String(submission.assignment.module.position).padStart(2, "0")} · ${submission.assignment.module.title}`,
+      coverPath: submission.assignment.module.coverPath,
       status,
       tone: toneFromStatus(status),
       submittedAt: submission.submittedAt ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(submission.submittedAt) : "Без даты",

@@ -60,7 +60,7 @@ const API_ORIGIN = "";
 const SOCKET_ORIGIN = process.env.NEXT_PUBLIC_API_URL?.trim() || "";
 const SOCKET_PATH = "/api/socket.io/";
 const ASSIGNMENT_TARGET_MODULE_KEY = "curator-assignment-target-module";
-const ASSIGNMENT_TARGET_LESSON_KEY = "curator-assignment-target-lesson";
+const OPEN_MODULE_AFTER_PUBLISH_KEY = "curator-open-module-after-publish";
 const baseCuratorDashboard = curatorDashboard;
 const defaultPracticumModules = practicumModules;
 const defaultCourseModules: readonly CourseModule[] = defaultPracticumModules.map((module, position) => ({ ...module, position, coverPath: null }));
@@ -84,9 +84,25 @@ function pluralizeStudents(count: number): string {
   return `${count} учеников`;
 }
 
+function pluralizeLessons(count: number): string {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod10 === 1 && mod100 !== 11) return `${count} урок`;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return `${count} урока`;
+  return `${count} уроков`;
+}
+
+function pluralizeMaterials(count: number): string {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod10 === 1 && mod100 !== 11) return `${count} материал`;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return `${count} материала`;
+  return `${count} материалов`;
+}
+
 type UserRole = "student" | "curator";
 type AppNav = DashboardNav | CuratorNav | "Профиль";
-type DiscussionContext = { module: string; lesson: string; coverPath?: string | null; moduleId?: string; lessonId?: string; assignmentId?: string };
+type DiscussionContext = { module: string; coverPath?: string | null; moduleId?: string; assignmentId?: string };
 
 // Identifies the current viewer on the on-screen video watermark (see TrackedVideo below).
 const ViewerLabelContext = createContext<string>("");
@@ -173,13 +189,6 @@ type SessionProfile = {
 
 const visibleStudentAssignments: Assignment[] = [];
 
-type LessonVideo = {
-  title: string;
-  source: "vimeo" | "upload";
-  url: string;
-  duration: string;
-};
-
 type CourseLessonMedia = {
   id: string;
   scheduleEventId?: string | null;
@@ -195,21 +204,13 @@ type CourseLessonMedia = {
   thumbnailUrl: string | null;
 };
 
-type CourseLesson = {
+type CourseAssignmentSummary = {
   id: string;
-  position: number;
   title: string;
-  type: "TEXT" | "VIDEO" | "STREAM" | "ASSIGNMENT" | "QA";
-  description: string | null;
-  media: CourseLessonMedia[];
-  assignments: Array<{
-    id: string;
-    title: string;
-    description: string;
-    requirements: string[];
-    allowedFormats: string[];
-    deadline: string | null;
-  }>;
+  description: string;
+  requirements: string[];
+  allowedFormats: string[];
+  deadline: string | null;
 };
 
 type CourseApiModule = {
@@ -223,7 +224,8 @@ type CourseApiModule = {
   locked: boolean;
   progress: number;
   status: string;
-  lessons: CourseLesson[];
+  media: CourseLessonMedia[];
+  assignments: CourseAssignmentSummary[];
 };
 
 type CourseModule = PracticumModule & { position: number; coverPath: string | null };
@@ -233,7 +235,7 @@ type CourseApiPayload = { data?: { modules?: CourseApiModule[]; media?: CourseLe
 
 type CourseState = {
   modules: readonly CourseModule[];
-  lessonsByModule: Readonly<Record<string, CourseLesson[]>>;
+  contentByModule: Readonly<Record<string, CourseApiModule>>;
   globalMedia: CourseLessonMedia[];
   scheduleEvents: CourseScheduleEvent[];
 };
@@ -248,14 +250,14 @@ function normalizeCourse(payload: CourseApiPayload): CourseState | null {
     title: module.title,
     status: module.status,
     progress: module.progress,
-    lessons: module.lessons.length,
+    lessons: module.media.length + module.assignments.length,
     description: module.description ?? "",
     locked: module.locked,
     position: module.position,
     coverPath: module.coverPath,
   }));
-  const lessonsByModule = Object.fromEntries(records.map((module) => [module.id, module.lessons]));
-  return { modules, lessonsByModule, globalMedia: payload.data?.media ?? [], scheduleEvents: payload.data?.scheduleEvents ?? [] };
+  const contentByModule = Object.fromEntries(records.map((module) => [module.id, module]));
+  return { modules, contentByModule, globalMedia: payload.data?.media ?? [], scheduleEvents: payload.data?.scheduleEvents ?? [] };
 }
 
 function formatDuration(seconds: number | null): string {
@@ -265,16 +267,6 @@ function formatDuration(seconds: number | null): string {
   const remainingSeconds = Math.floor(seconds % 60).toString().padStart(2, "0");
   return hours > 0 ? `${hours}:${minutes}:${remainingSeconds}` : `${minutes}:${remainingSeconds}`;
 }
-
-type MediaLibraryItem = LessonVideo & {
-  id: string;
-  type: "Запись стрима" | "Видеоразбор" | "Материал урока";
-  kind: "stream" | "breakdown" | "file";
-  module: string;
-  lessonId: string;
-  status: "Опубликовано" | "Черновик" | "Привязан к уроку";
-  cover: string;
-};
 
 type NavItem = {
   label: AppNav;
@@ -614,7 +606,7 @@ export default function Home() {
           <div className="hero-grid">
             <section className="focus-panel">
               <div className="panel-topline"><span className="status-marker"><span /> СЛЕДУЮЩИЙ ШАГ</span><button className="quiet-button" aria-label="Открыть задание" onClick={() => setActiveNav("Задания")}><ArrowUpRight size={17} /></button></div>
-              <div className="focus-copy"><div className="focus-context"><span>МОДУЛЬ 03</span><span>ПРАКТИКА · EUR/USD</span></div><h2>{studentDashboard.focus.title}</h2><p>{studentDashboard.focus.subtitle}</p><div className="focus-guidance"><strong>Осталось {100 - studentDashboard.focus.progress}%</strong><span>Добавь объяснение сценария и отправь работу куратору.</span></div></div>
+              <div className="focus-copy"><div className="focus-context"><span>УРОК 03</span><span>ПРАКТИКА · EUR/USD</span></div><h2>{studentDashboard.focus.title}</h2><p>{studentDashboard.focus.subtitle}</p><div className="focus-guidance"><strong>Осталось {100 - studentDashboard.focus.progress}%</strong><span>Добавь объяснение сценария и отправь работу куратору.</span></div></div>
               <div className="focus-footer"><div className="progress-label"><span>Готово</span><strong>{studentDashboard.focus.progress}% выполнено</strong></div><div className="progress-track"><span style={{ width: `${studentDashboard.focus.progress}%` }} /></div><button className="primary-button" onClick={() => setActiveNav("Задания")}>Открыть задание <ChevronRight size={17} /></button></div>
             </section>
             <ChartScene />
@@ -786,7 +778,7 @@ function SectionView({ activeNav, unlockedModuleIds, requestedAssignmentId, requ
     "Мой практикум": {
       kicker: "ПРОГРАММА ОБУЧЕНИЯ",
       title: "Мой практикум",
-      description: "Двигайся по модулям в своём темпе. Все записи и материалы останутся доступны после завершения.",
+      description: "Двигайся по урокам в своём темпе. Все записи и материалы останутся доступны после завершения.",
     },
     "Задания": {
       kicker: "ПРОВЕРКА И ПРОГРЕСС",
@@ -830,9 +822,9 @@ function CuratorSectionView({ activeNav, onNavigate }: { activeNav: CuratorNav; 
   const headings: Record<CuratorNav, { kicker: string; title: string; description: string }> = {
     "Кабинет куратора": { kicker: "РАБОЧИЙ ЦЕНТР", title: "Кабинет куратора", description: "Все работы, ученики и обратная связь по потоку собраны в одном рабочем контуре." },
     "Очередь проверки": { kicker: "ПРОВЕРКА ДЗ", title: "Очередь проверки", description: "" },
-    "Создать задание": { kicker: "НОВАЯ РАБОТА", title: "Создать задание", description: "Собери понятное ДЗ с критериями, сроком и форматом ответа для всего потока." },
+    "Создать задание": { kicker: "НОВАЯ РАБОТА", title: "Создать задание", description: "" },
     "Ученики": { kicker: "ПОТОК 04", title: "Ученики", description: "Прогресс, активность и история обратной связи по каждому участнику практикума." },
-    "Программа": { kicker: "ДОСТУП К ПРОГРАММЕ", title: "Программа", description: "Управление доступностью модулей для участников потока." },
+    "Программа": { kicker: "ДОСТУП К ПРОГРАММЕ", title: "Программа", description: "" },
     "Приглашения": { kicker: "ДОСТУП К ПОТОКУ", title: "Приглашения", description: "Создавай персональные ссылки для новых участников и контролируй срок их действия." },
     "Расписание": { kicker: "СОБЫТИЯ ПОТОКА", title: "Расписание", description: "Стримы, групповые проверки и встречи, которые нужно подготовить для потока." },
     "Стримы": { kicker: "ЭФИРЫ ПОТОКА", title: "Стримы", description: "Ближайшие эфиры и записи, которые видят ученики этого потока." },
@@ -841,7 +833,7 @@ function CuratorSectionView({ activeNav, onNavigate }: { activeNav: CuratorNav; 
   };
   const heading = headings[activeNav] ?? headings["Кабинет куратора"];
 
-  const headingClass = activeNav === "Обсуждения" ? "curator-discussion-page-heading" : activeNav === "Медиатека" ? "media-page-heading" : activeNav === "Расписание" ? "schedule-page-heading" : activeNav === "Стримы" ? "curator-streams-page-heading" : activeNav === "Кабинет куратора" ? "curator-dashboard-page-heading" : activeNav === "Очередь проверки" ? "curator-queue-page-heading" : activeNav === "Создать задание" ? "curator-create-page-heading" : activeNav === "Ученики" ? "curator-students-page-heading" : activeNav === "Приглашения" ? "curator-invite-page-heading" : "";
+  const headingClass = activeNav === "Обсуждения" ? "curator-discussion-page-heading" : activeNav === "Медиатека" ? "media-page-heading" : activeNav === "Расписание" ? "schedule-page-heading" : activeNav === "Стримы" ? "curator-streams-page-heading" : activeNav === "Кабинет куратора" ? "curator-dashboard-page-heading" : activeNav === "Очередь проверки" ? "curator-queue-page-heading" : activeNav === "Создать задание" ? "curator-create-page-heading" : activeNav === "Ученики" ? "curator-students-page-heading" : activeNav === "Приглашения" ? "curator-invite-page-heading" : activeNav === "Программа" ? "curator-program-page-heading" : "";
   return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1>{heading.description && <p>{heading.description}</p>}</div></div>{activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView onInvite={() => onNavigate("Приглашения")} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} />} {activeNav === "Приглашения" && <CuratorInvitationsView />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && <CuratorPlaceholder title={heading.title} />}</div>;
 }
 
@@ -875,7 +867,6 @@ type CuratorDiscussion = {
   avatarUrl?: string | null;
   module: string;
   coverPath?: string | null;
-  lesson: string;
   assignment?: string;
   status: CuratorDiscussionStatus;
   updatedAt: string;
@@ -887,7 +878,6 @@ type DiscussionApiThread = {
   title: string;
   status: "NEW" | "WAITING" | "ANSWERED" | "CLOSED";
   module: { title: string; position: number; coverPath: string | null } | null;
-  lesson: { title: string } | null;
   assignment: { title: string } | null;
   student: { name: string | null; email: string | null; avatarUrl: string | null };
   messages: Array<{ id: string; authorRole: "STUDENT" | "CURATOR" | "OWNER"; authorName: string | null; body: string; createdAt: string; attachments: Array<{ originalName: string; mimeType: string; contentUrl: string | null; sourceUrl: string | null }> }>;
@@ -898,7 +888,7 @@ function mapDiscussionApiStatus(status: DiscussionApiThread["status"]): CuratorD
 }
 
 function mapDiscussionApiThread(thread: DiscussionApiThread): CuratorDiscussion {
-  const courseModule = thread.module ? `${String(thread.module.position).padStart(2, "0")} · ${thread.module.title}` : "Без модуля";
+  const courseModule = thread.module ? `${String(thread.module.position).padStart(2, "0")} · ${thread.module.title}` : "Без урока";
   return {
     id: thread.id,
     title: thread.title,
@@ -907,7 +897,6 @@ function mapDiscussionApiThread(thread: DiscussionApiThread): CuratorDiscussion 
     avatarUrl: thread.student.avatarUrl,
     module: courseModule,
     coverPath: discussionCoverForModule(thread.module?.position, thread.module?.coverPath),
-    lesson: thread.lesson?.title ?? "",
     assignment: thread.assignment?.title,
     status: mapDiscussionApiStatus(thread.status),
     updatedAt: thread.messages[thread.messages.length - 1]?.createdAt ? new Date(thread.messages[thread.messages.length - 1].createdAt).toLocaleString("ru-RU") : "только что",
@@ -953,7 +942,6 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
     student: "Алексей К.",
     initials: "АК",
     module: "01 · Контекст и структура рынка",
-    lesson: "Market Logic: базовые принципы",
     status: "NEW",
     updatedAt: "18 минут назад",
     messages: [
@@ -962,11 +950,10 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
   },
   {
     id: "discussion-2",
-    title: "Дополнительное ДЗ по модулю 03",
+    title: "Дополнительное ДЗ по уроку 03",
     student: "Мария К.",
     initials: "МК",
     module: "03 · Зоны поддержки и сопротивления",
-    lesson: "Delivery A.B. Part 1&2",
     assignment: "Тестовое задание к первому уроку",
     status: "WAITING",
     updatedAt: "вчера",
@@ -981,7 +968,6 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
     student: "Елена С.",
     initials: "ЕС",
     module: "02 · Narrative и Reversal",
-    lesson: "Практика с куратором",
     status: "ANSWERED",
     updatedAt: "2 дня назад",
     messages: [
@@ -1064,14 +1050,14 @@ function CuratorDiscussionsView() {
             const label = item === "all" ? "Все" : curatorDiscussionStatusLabel(item);
             return <button className={`filter-chip ${filter === item ? "active" : ""}`} type="button" key={item} onClick={() => setFilter(item)} aria-pressed={filter === item}>{label} <span>{count}</span></button>;
           })}
-          <label className="curator-discussion-module-filter"><span>Урок / модуль</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+          <label className="curator-discussion-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
         </div>
         <div className="curator-discussion-thread-list">{loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем обсуждения…</strong><span>Проверяем темы из базы данных.</span></div> : loadError ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить обсуждения</strong><span>{loadError}</span></div> : visibleThreads.length > 0 ? visibleThreads.map((thread) => <button className={`curator-discussion-thread-row ${thread.id === selectedThread?.id ? "selected" : ""}`} type="button" key={thread.id} onClick={() => setSelectedId(thread.id)}>{thread.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={thread.avatarUrl} alt={thread.student} width={34} height={34} unoptimized /> : <div className={`profile-avatar ${thread.status === "ANSWERED" ? "curator" : ""}`}>{thread.initials}</div>}<div><strong>{thread.title}</strong><span>{thread.student} · {thread.module}</span><small>{thread.updatedAt} · {thread.messages.length} {thread.messages.length === 1 ? "сообщение" : "сообщения"}</small></div><b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b><ChevronRight size={15} /></button>) : <div className="empty-state"><MessageSquareText size={22} /><strong>Обсуждений пока нет</strong><span>Новые вопросы появятся здесь после отправки учеником.</span></div>}</div>
       </section>
       {selectedThread ? <section className="content-panel curator-discussion-detail">
-        <div className="curator-discussion-detail-head"><div><span className="section-kicker">{selectedThread.module}</span><h2>{selectedThread.title}</h2><p>{selectedThread.student}{selectedThread.lesson ? ` · ${selectedThread.lesson}` : ""}{selectedThread.assignment ? ` · ${selectedThread.assignment}` : ""}</p></div><span className={`curator-discussion-status ${selectedThread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(selectedThread.status)}</span></div>
-        <div className="curator-discussion-module-cover" role="img" aria-label={`Обложка ${selectedThread.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(0,0,0,.9), rgba(0,0,0,.28)), url("${selectedThread.coverPath ?? discussionCoverForContext({ module: selectedThread.module, lesson: selectedThread.lesson })}")` }}><strong>{selectedThread.module}</strong>{selectedThread.lesson && <span>{selectedThread.lesson}</span>}</div>
-        <div className="curator-discussion-context">{selectedThread.lesson && <span><BookOpen size={14} /> {selectedThread.lesson}</span>}{selectedThread.assignment && <span><FileCheck2 size={14} /> {selectedThread.assignment}</span>}<span><MessageSquareText size={14} /> Личная тема ученика</span></div>
+        <div className="curator-discussion-detail-head"><div><span className="section-kicker">{selectedThread.module}</span><h2>{selectedThread.title}</h2><p>{selectedThread.student}{selectedThread.assignment ? ` · ${selectedThread.assignment}` : ""}</p></div><span className={`curator-discussion-status ${selectedThread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(selectedThread.status)}</span></div>
+        <div className="curator-discussion-module-cover" role="img" aria-label={`Обложка ${selectedThread.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(0,0,0,.9), rgba(0,0,0,.28)), url("${selectedThread.coverPath ?? discussionCoverForContext({ module: selectedThread.module })}")` }}><strong>{selectedThread.module}</strong></div>
+        <div className="curator-discussion-context">{selectedThread.assignment && <span><FileCheck2 size={14} /> {selectedThread.assignment}</span>}<span><MessageSquareText size={14} /> Личная тема ученика</span></div>
         <div className="curator-discussion-messages">{selectedThread.messages.map((message) => <article className={`curator-discussion-message ${message.author}`} key={message.id}><div className="curator-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{message.body}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
         <form className="curator-discussion-reply" onSubmit={sendReply}><label htmlFor="curator-discussion-reply">ОТВЕТ КУРАТОРА</label><textarea id="curator-discussion-reply" value={reply} onChange={(event) => setReply(event.target.value)} placeholder="Напиши ответ и добавь ученику следующий шаг…" rows={4} /><div><span className="curator-discussion-draft-note"><FileCheck2 size={14} /> Ответ сохранится в истории этой темы</span><button className="primary-button" type="submit" disabled={!reply.trim() || replySaving}>{replySaving ? "Сохраняем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div>{replyError && <div className="file-error" role="alert">{replyError}</div>}</form>
       </section> : <section className="content-panel curator-discussion-empty empty-state"><MessageSquareText size={22} /><strong>Выбери тему</strong><span>Справа появится история вопроса и форма ответа.</span></section>}
@@ -1418,7 +1404,7 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
     {item.reviewerId ? (
       item.isReviewerSelf === false
         ? <div className="review-claim-banner review-claim-banner-other"><strong>Проверяет: {item.reviewerName ?? "другой куратор"}</strong><span>Работа закреплена за другим куратором — принять или вернуть на доработку нельзя.</span></div>
-        : <div className="review-claim-banner"><strong>Проверяете вы</strong><span>Работа закреплена за вами.</span><button type="button" className="primary-button compact-button curator-create-assignment-button review-release-button" onClick={() => void releaseWork()} disabled={releasing}>{releasing ? "Отменяем…" : "Отменить взятие"}</button></div>
+        : (() => { const hasPriorRevision = (item.attemptHistory?.length ?? 0) > 1; return <div className="review-claim-banner"><strong>Проверяете вы</strong><span>{hasPriorRevision ? "Вы уже отправляли эту работу на доработку — доведите проверку до конца." : "Работа закреплена за вами."}</span>{!hasPriorRevision && <button type="button" className="primary-button compact-button curator-create-assignment-button review-release-button" onClick={() => void releaseWork()} disabled={releasing}>{releasing ? "Отменяем…" : "Отменить взятие"}</button>}</div>; })()
     ) : <button type="button" className="primary-button review-claim-button" onClick={() => void claimWork()} disabled={claiming}>{claiming ? "Закрепляем…" : "Взять на проверку"}</button>}
     {claimError && <div className="file-error" role="alert">{claimError}</div>}
     <div className="curator-review-header"><div className="curator-student">{item.studentAvatarUrl ? <Image className="profile-avatar profile-avatar-image" src={item.studentAvatarUrl} alt={item.studentName} width={31} height={31} unoptimized /> : <div className="profile-avatar">{item.studentInitials}</div>}<strong>{item.studentName}</strong></div></div>
@@ -1625,11 +1611,11 @@ function StudentModuleAccessPanel({ student }: { student: StudentDirectoryRecord
     try {
       const response = await fetch(`${API_ORIGIN}/api/course/students/${student.id}/access`, { credentials: "include", cache: "no-store" });
       const payload = await response.json().catch(() => ({})) as { data?: StudentModuleAccessRow[]; message?: string };
-      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось загрузить доступ к модулям");
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось загрузить доступ к урокам");
       setRows(payload.data);
       setError("");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Не удалось загрузить доступ к модулям");
+      setError(reason instanceof Error ? reason.message : "Не удалось загрузить доступ к урокам");
     }
   }, [student.id]);
 
@@ -1652,14 +1638,14 @@ function StudentModuleAccessPanel({ student }: { student: StudentDirectoryRecord
   };
 
   const markCompleted = async (moduleId: string) => {
-    if (!window.confirm("Отметить модуль пройденным? Откроется содержимое следующего модуля, а ДЗ следующего модуля станет доступно для отправки этому ученику.")) return;
+    if (!window.confirm("Отметить урок пройденным? Откроется содержимое следующего урока, а ДЗ следующего урока станет доступно для отправки этому ученику.")) return;
     setBusy(moduleId); setError("");
     try {
       const response = await fetch(`${API_ORIGIN}/api/course/modules/${moduleId}/students/${student.id}/complete`, { method: "POST", credentials: "include" });
-      if (!response.ok) throw new Error("Не удалось отметить модуль пройденным");
+      if (!response.ok) throw new Error("Не удалось отметить урок пройденным");
       await load();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Не удалось отметить модуль пройденным");
+      setError(reason instanceof Error ? reason.message : "Не удалось отметить урок пройденным");
     } finally {
       setBusy("");
     }
@@ -1670,7 +1656,7 @@ function StudentModuleAccessPanel({ student }: { student: StudentDirectoryRecord
 
   return <section className="student-module-access-panel">
     <button className="student-module-access-toggle" type="button" onClick={() => setExpanded((current) => !current)} aria-expanded={expanded}>
-      <div className="student-module-access-head"><span className="section-kicker">ДОСТУП К МОДУЛЯМ</span><strong>Точечно для этого ученика</strong><span>Открыть/закрыть — не трогает общий переключатель на «Программе», действует только на этого ученика. «Отметить пройденным» — открывает следующий модуль и разблокирует его ДЗ.</span></div>
+      <div className="student-module-access-head"><span className="section-kicker">ДОСТУП К УРОКАМ</span><strong>Точечно для этого ученика</strong><span>Открыть/закрыть — не трогает общий переключатель на «Программе», действует только на этого ученика. «Отметить пройденным» — открывает следующий урок и разблокирует его ДЗ.</span></div>
       <ChevronDown size={16} className={`student-module-access-chevron ${expanded ? "is-open" : ""}`} aria-hidden="true" />
     </button>
     {expanded && <>
@@ -2141,97 +2127,12 @@ function CuratorInvitationsLegacy() {
 
 void CuratorInvitationsLegacy;
 
-type BuilderLesson = Pick<CourseLesson, "id" | "title" | "description" | "media" | "assignments">;
-
-function CuratorLessonPageLegacy({ module, lesson, lessons, onBack, onNavigate, onSwitchLesson }: { module: CourseApiModule; lesson: CourseLesson; lessons: CourseLesson[]; onBack: () => void; onNavigate: (nextNav: CuratorNav) => void; onSwitchLesson: (lessonId: string) => void }) {
-  const studentModule: PracticumModule = { id: module.id, section: ["Welcome", "Education", "Q&A", "Practice"].includes(module.section) ? module.section as PracticumSection : "Education", number: module.number, title: module.title, status: module.status, progress: module.progress, lessons: module.lessons.length, description: module.description ?? "", locked: module.locked };
+function CuratorLessonPage({ module, onBack, onNavigate }: { module: CourseApiModule; onBack: () => void; onNavigate: (nextNav: CuratorNav) => void }) {
+  const studentModule: PracticumModule = { id: module.id, section: ["Welcome", "Education", "Q&A", "Practice"].includes(module.section) ? module.section as PracticumSection : "Education", number: module.number, title: module.title, status: module.status, progress: module.progress, lessons: module.media.length + module.assignments.length, description: module.description ?? "", locked: module.locked };
   const fallback = modulePageContentFor(studentModule);
-  const lessonMedia = lesson.media ?? [];
-  const [media, setMedia] = useState<CourseLessonMedia[]>(lessonMedia);
-  const [assignments, setAssignments] = useState<CourseLesson["assignments"]>(lesson.assignments ?? []);
-  const [description, setDescription] = useState(lesson.description ?? "");
-  const [selectedId, setSelectedId] = useState(lessonMedia.find((item) => item.kind !== "QA")?.id ?? "");
-  const [showAssignmentForm, setShowAssignmentForm] = useState(false);
-  const [assignmentTitle, setAssignmentTitle] = useState("");
-  const [assignmentDescription, setAssignmentDescription] = useState("");
-  const [assignmentRequirement, setAssignmentRequirement] = useState("");
-  const [draggedId, setDraggedId] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [notice, setNotice] = useState("");
-  const thematicMedia = media.filter((item) => item.kind !== "QA");
-  const selectedMedia = thematicMedia.find((item) => item.id === selectedId) ?? thematicMedia[0];
-
-  const openMediaLibrary = (targetKind: "STREAM" | "QA" | "BREAKDOWN") => {
-    window.sessionStorage.setItem("curator-target-lesson", lesson.id);
-    window.sessionStorage.setItem("curator-target-kind", targetKind);
-    onNavigate("Медиатека");
-  };
-
-  const createAssignment = async () => {
-    if (!assignmentTitle.trim() || !assignmentDescription.trim()) return;
-    setSaving(true); setNotice("");
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/assignments`, {
-        method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lessonId: lesson.id,
-          title: assignmentTitle.trim(),
-          description: assignmentDescription.trim(),
-          moduleNumber: module.number,
-          moduleTitle: module.title,
-          requirements: assignmentRequirement.trim() ? [assignmentRequirement.trim()] : [],
-          allowedFormats: ["comment", "image"],
-        }),
-      });
-      const payload = await response.json().catch(() => ({})) as { data?: CourseLesson["assignments"][number]; message?: string };
-      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать домашнее задание");
-      setAssignments((current) => [...current, payload.data as CourseLesson["assignments"][number]]);
-      setAssignmentTitle(""); setAssignmentDescription(""); setAssignmentRequirement(""); setShowAssignmentForm(false);
-      setNotice("Домашнее задание добавлено в этот урок.");
-    } catch (reason) {
-      setNotice(reason instanceof Error ? reason.message : "Не удалось создать домашнее задание");
-    } finally { setSaving(false); }
-  };
-
-  const moveMedia = (targetId: string) => {
-    if (!draggedId || draggedId === targetId) return;
-    setMedia((current) => {
-      const from = current.findIndex((item) => item.id === draggedId);
-      const to = current.findIndex((item) => item.id === targetId);
-      if (from < 0 || to < 0) return current;
-      const next = [...current];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
-      return next;
-    });
-  };
-
-  const save = async () => {
-    setSaving(true); setNotice("");
-    try {
-      const [lessonResponse, orderResponse] = await Promise.all([
-        fetch(`${API_ORIGIN}/api/course/lessons/${lesson.id}`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: lesson.title, description }) }),
-        fetch(`${API_ORIGIN}/api/course/lessons/${lesson.id}/media/reorder`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaIds: media.map((item) => item.id) }) }),
-      ]);
-      if (!lessonResponse.ok || !orderResponse.ok) throw new Error("Не удалось сохранить изменения урока");
-      setNotice("Изменения сохранены. Именно так урок увидит ученик.");
-    } catch (reason) {
-      setNotice(reason instanceof Error ? reason.message : "Не удалось сохранить изменения урока");
-    } finally { setSaving(false); }
-  };
-
-  return <div className="module-page curator-lesson-page"><div className="module-page-toolbar"><button className="secondary-button" type="button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к программе</button><span className="module-page-breadcrumb">{module.section} / {module.title} / {lesson.title}</span><div className="curator-lesson-switcher">{lessons.map((item) => <button className={item.id === lesson.id ? "active" : ""} type="button" key={item.id} onClick={() => onSwitchLesson(item.id)}>{item.title}</button>)}</div><div className="curator-lesson-toolbar-actions"><button className="secondary-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button><button className="primary-button" type="button" disabled={saving} onClick={() => void save()}>{saving ? "Сохраняем…" : "Сохранить урок"}</button></div></div><header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> МОДУЛЬ {module.number} · РЕДАКТИРОВАНИЕ</span><h2>{module.title}</h2><p>{module.title} · страница полностью повторяет вид ученика.</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено учениками</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header><div className="curator-lesson-hint"><Settings2 size={16} /><span>Перетаскивайте карточки стримов в нужном порядке. Текст и материалы сохраняются для страницы ученика.</span></div><div className="module-resource-grid"><section className="module-resource-card module-description-card"><div className="module-resource-heading"><BookOpen size={17} /><h3>Описание</h3><span>Редактируется</span></div><textarea className="curator-lesson-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Добавьте описание урока…" /></section><section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Записи стримов</h3><span>{media.length} {media.length === 1 ? "материал" : "материалов"}</span><button className="quiet-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button></div>{selectedMedia?.embedUrl ? <div className="module-video-stage"><iframe src={selectedMedia.embedUrl} title={selectedMedia.title ?? "Запись стрима"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /><span className="module-video-label">{selectedMedia.title ?? "Запись стрима"}</span><span className="stream-duration">{selectedMedia.status === "PUBLISHED" ? "ОПУБЛИКОВАНО" : "ЧЕРНОВИК"}</span></div> : media.length === 0 ? <div className="module-video-stage curator-fallback-video"><video src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" poster="/market-logic-cover.png" controls playsInline /><span className="module-video-label">{fallback.streamTitle}</span></div> : <div className="module-media-empty"><Play size={20} /><strong>Добавьте первый стрим</strong><span>После добавления он появится здесь отдельной карточкой.</span></div>}{media.length > 0 && <div className="module-media-playlist curator-media-playlist">{media.map((item, index) => <button className={`module-media-item ${item.id === selectedMedia?.id ? "selected" : ""}`} type="button" draggable onDragStart={() => setDraggedId(item.id)} onDragEnd={() => setDraggedId(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => moveMedia(item.id)} key={item.id} onClick={() => setSelectedId(item.id)}><span className="curator-drag-handle">⋮⋮</span><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.title ?? "Материал без названия"}</strong><small>{item.kind === "QA" ? "Q&A" : item.kind === "BREAKDOWN" ? "Разбор" : "Стрим"} · {item.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</small></div><ArrowUpRight size={14} /></button>)}</div>}</section><section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{assignments.length} {assignments.length === 1 ? "задание" : "заданий"}</span><button className="quiet-button" type="button" onClick={() => setShowAssignmentForm((current) => !current)}><Plus size={15} /> {showAssignmentForm ? "Закрыть" : "Добавить ДЗ"}</button></div>{showAssignmentForm && <div className="curator-inline-form"><input value={assignmentTitle} onChange={(event) => setAssignmentTitle(event.target.value)} placeholder="Название домашнего задания" /><textarea value={assignmentDescription} onChange={(event) => setAssignmentDescription(event.target.value)} placeholder="Описание и контекст для ученика" /><input value={assignmentRequirement} onChange={(event) => setAssignmentRequirement(event.target.value)} placeholder="Критерий проверки (необязательно)" /><button className="primary-button" type="button" disabled={saving || !assignmentTitle.trim() || !assignmentDescription.trim()} onClick={() => void createAssignment()}>{saving ? "Создаём…" : "Создать ДЗ в этом уроке"}</button></div>}<ol>{assignments.flatMap((assignment) => assignment.requirements.length > 0 ? assignment.requirements : [assignment.title]).map((item) => <li key={item}>{item}</li>)}</ol></section><section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>Блок урока</span><button className="quiet-button" type="button" onClick={() => openMediaLibrary("QA")}><Plus size={15} /> Добавить Q&A</button></div><ul>{fallback.questions.map((question) => <li key={question}>{question}</li>)}</ul><div className="module-action-feedback">Этот блок будет отображаться у ученика так же, как на этой странице.</div></section></div>{notice && <div className="detail-feedback accepted curator-lesson-notice">{notice}</div>}</div>;
-}
-
-void CuratorLessonPageLegacy;
-
-function CuratorLessonPage({ module, lesson, lessons, onBack, onNavigate, onSwitchLesson }: { module: CourseApiModule; lesson: CourseLesson; lessons: CourseLesson[]; onBack: () => void; onNavigate: (nextNav: CuratorNav) => void; onSwitchLesson: (lessonId: string) => void }) {
-  const studentModule: PracticumModule = { id: module.id, section: ["Welcome", "Education", "Q&A", "Practice"].includes(module.section) ? module.section as PracticumSection : "Education", number: module.number, title: module.title, status: module.status, progress: module.progress, lessons: module.lessons.length, description: module.description ?? "", locked: module.locked };
-  const fallback = modulePageContentFor(studentModule);
-  const lessonMedia = lesson.media ?? [];
-  const [media, setMedia] = useState<CourseLessonMedia[]>(lessonMedia);
-  const [assignments, setAssignments] = useState<CourseLesson["assignments"]>(lesson.assignments ?? []);
-  const [description, setDescription] = useState(lesson.description ?? "");
+  const [media, setMedia] = useState<CourseLessonMedia[]>(module.media ?? []);
+  const [assignments, setAssignments] = useState<CourseAssignmentSummary[]>(module.assignments ?? []);
+  const [description, setDescription] = useState(module.description ?? "");
   const [showAssignmentForm, setShowAssignmentForm] = useState(false);
   const [assignmentTitle, setAssignmentTitle] = useState("");
   const [assignmentDescription, setAssignmentDescription] = useState("");
@@ -2246,27 +2147,26 @@ function CuratorLessonPage({ module, lesson, lessons, onBack, onNavigate, onSwit
   const qaMedia = media.filter((item) => item.kind === "QA");
 
   const openMediaLibrary = (targetKind: "STREAM" | "QA" | "BREAKDOWN") => {
-    window.sessionStorage.setItem("curator-target-lesson", lesson.id);
+    window.sessionStorage.setItem("curator-target-module", module.id);
     window.sessionStorage.setItem("curator-target-kind", targetKind);
     onNavigate("Медиатека");
   };
-  // The lesson editor uses the same canonical assignment form as the curator sidebar.
-  // Keep the lesson context in session storage so the form can preselect this exact lesson.
+  // The assignment creator uses the same canonical form as the curator sidebar. Keep the
+  // module context in session storage so the form can preselect this exact module.
   useEffect(() => {
     if (!showAssignmentForm) return;
     window.sessionStorage.setItem(ASSIGNMENT_TARGET_MODULE_KEY, module.id);
-    window.sessionStorage.setItem(ASSIGNMENT_TARGET_LESSON_KEY, lesson.id);
     onNavigate("Создать задание");
-  }, [lesson.id, module.id, onNavigate, showAssignmentForm]);
+  }, [module.id, onNavigate, showAssignmentForm]);
   const createAssignment = async () => {
     if (!assignmentTitle.trim() || !assignmentDescription.trim()) return;
     setSaving(true); showNotice("");
     try {
       const requirements = assignmentRequirements.map((requirement) => requirement.trim()).filter(Boolean);
-      const response = await fetch(`${API_ORIGIN}/api/assignments`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lessonId: lesson.id, title: assignmentTitle.trim(), description: assignmentDescription.trim(), moduleNumber: module.number, moduleTitle: module.title, requirements, allowedFormats: ["comment", "image"] }) });
-      const payload = await response.json().catch(() => ({})) as { data?: CourseLesson["assignments"][number]; message?: string };
+      const response = await fetch(`${API_ORIGIN}/api/assignments`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ moduleId: module.id, title: assignmentTitle.trim(), description: assignmentDescription.trim(), requirements, allowedFormats: ["comment", "image"] }) });
+      const payload = await response.json().catch(() => ({})) as { data?: CourseAssignmentSummary; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать домашнее задание");
-      const createdAssignment = payload.data as CourseLesson["assignments"][number];
+      const createdAssignment = payload.data;
       setAssignments((current) => [...current, {
         ...createdAssignment,
         title: createdAssignment.title || assignmentTitle.trim(),
@@ -2310,19 +2210,19 @@ function CuratorLessonPage({ module, lesson, lessons, onBack, onNavigate, onSwit
   const save = async () => {
     setSaving(true); showNotice("");
     try {
-      const [lessonResponse, orderResponse] = await Promise.all([
-        fetch(`${API_ORIGIN}/api/course/lessons/${lesson.id}`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: lesson.title, description }) }),
-        fetch(`${API_ORIGIN}/api/course/lessons/${lesson.id}/media/reorder`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaIds: media.map((item) => item.id) }) }),
+      const [moduleResponse, orderResponse] = await Promise.all([
+        fetch(`${API_ORIGIN}/api/course/modules/${module.id}`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: module.title, description }) }),
+        fetch(`${API_ORIGIN}/api/course/modules/${module.id}/media/reorder`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaIds: media.map((item) => item.id) }) }),
       ]);
-      if (!lessonResponse.ok || !orderResponse.ok) throw new Error("Не удалось сохранить изменения урока");
+      if (!moduleResponse.ok || !orderResponse.ok) throw new Error("Не удалось сохранить изменения урока");
       showNotice("Изменения сохранены. Именно так урок увидит ученик.");
     } catch (reason) { showNotice(reason instanceof Error ? reason.message : "Не удалось сохранить изменения урока", true); }
     finally { setSaving(false); }
   };
 
   return <div className="module-page curator-lesson-page">
-    <div className="module-page-toolbar"><button className="secondary-button" type="button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к программе</button><span className="module-page-breadcrumb">{module.section} / {module.title} / {lesson.title}</span><div className="curator-lesson-switcher">{lessons.map((item) => <button className={item.id === lesson.id ? "active" : ""} type="button" key={item.id} onClick={() => onSwitchLesson(item.id)}>{item.title}</button>)}</div><div className="curator-lesson-toolbar-actions"><button className="secondary-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button><button className="primary-button" type="button" disabled={saving} onClick={() => void save()}>{saving ? "Сохраняем…" : "Сохранить урок"}</button></div></div>
-    <div className="curator-lesson-page-header"><span className="section-kicker">МОДУЛЬ {module.number}</span><h2>{module.title}</h2></div>
+    <div className="module-page-toolbar"><button className="secondary-button" type="button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к программе</button><span className="module-page-breadcrumb">{module.section} / {module.title}</span><div className="curator-lesson-toolbar-actions"><button className="secondary-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button><button className="primary-button" type="button" disabled={saving} onClick={() => void save()}>{saving ? "Сохраняем…" : "Сохранить урок"}</button></div></div>
+    <div className="curator-lesson-page-header"><span className="section-kicker">УРОК {module.number}</span><h2>{module.title}</h2></div>
     <div className="curator-lesson-hint"><Settings2 size={16} /><span>Тематические стримы находятся в центральном блоке, а записи Q&A — рядом с вопросами.</span></div>
     <div className="module-resource-grid">
       <section className="module-resource-card module-description-card"><div className="module-resource-heading"><BookOpen size={17} /><h3>Описание</h3><span>Редактируется</span></div><textarea className="curator-lesson-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Добавьте описание урока…" /></section>
@@ -2333,71 +2233,23 @@ function CuratorLessonPage({ module, lesson, lessons, onBack, onNavigate, onSwit
   </div>;
 }
 
-function CuratorLessonBuilder({ lesson, onNavigate, onEdit, onOpenPage }: { lesson: BuilderLesson; onNavigate: (nextNav: CuratorNav) => void; onEdit: () => void; onOpenPage: () => void }) {
-  const [open] = useState(false);
-  const [media, setMedia] = useState<CourseLessonMedia[]>(lesson.media ?? []);
-  const [description, setDescription] = useState(lesson.description ?? "");
-  const [draggedId, setDraggedId] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [notice, setNotice] = useState("");
-
-  const moveMedia = (targetId: string) => {
-    if (!draggedId || draggedId === targetId) return;
-    setMedia((current) => {
-      const from = current.findIndex((item) => item.id === draggedId);
-      const to = current.findIndex((item) => item.id === targetId);
-      if (from < 0 || to < 0) return current;
-      const next = [...current];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
-      return next;
-    });
-  };
-
-  const saveOrder = async () => {
-    setSaving(true); setNotice("");
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/course/lessons/${lesson.id}/media/reorder`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mediaIds: media.map((item) => item.id) }) });
-      if (!response.ok) throw new Error("Не удалось сохранить порядок блоков");
-      setNotice("Порядок блоков сохранён");
-    } catch (reason) {
-      setNotice(reason instanceof Error ? reason.message : "Не удалось сохранить порядок блоков");
-    } finally { setSaving(false); }
-  };
-
-  const saveDescription = async () => {
-    setSaving(true); setNotice("");
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/course/lessons/${lesson.id}`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: lesson.title, description }) });
-      if (!response.ok) throw new Error("Не удалось сохранить текст урока");
-      setNotice("Текст урока сохранён");
-    } catch (reason) {
-      setNotice(reason instanceof Error ? reason.message : "Не удалось сохранить текст урока");
-    } finally { setSaving(false); }
-  };
-
-  return <div className="lesson-builder-shell"><div className="module-lesson-row"><div><strong>{lesson.title}</strong><span>{media.length + (lesson.assignments?.length ?? 0)} блоков · конструктор урока</span></div><div className="lesson-builder-actions"><button className="primary-button" type="button" onClick={onOpenPage}>Открыть урок</button><button className="secondary-button" type="button" onClick={onEdit}>Название и описание</button><button className="secondary-button" type="button" onClick={() => onNavigate("Медиатека")}>Медиатека <ArrowUpRight size={14} /></button></div></div>{open && <div className="lesson-builder"><div className="lesson-builder-canvas"><div className="lesson-builder-toolbar"><div><span className="section-kicker">КОНСТРУКТОР УРОКА</span><strong>Блоки увидит ученик в этом порядке</strong></div><div className="lesson-builder-toolbar-actions"><button className="secondary-button" type="button" disabled={saving} onClick={() => void saveDescription()}>{saving ? "Сохраняем…" : "Сохранить текст"}</button><button className="primary-button" type="button" disabled={saving} onClick={() => void saveOrder()}>{saving ? "Сохраняем…" : "Сохранить порядок"}</button></div></div><div className="lesson-builder-block text-block"><div className="lesson-builder-block-head"><span className="lesson-builder-grip">⋮⋮</span><strong>Текст урока</strong><span className="lesson-builder-type">Описание</span></div><textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Добавьте вводный текст, инструкции или контекст для ученика…" /></div>{media.map((item) => <div className="lesson-builder-block" key={item.id} draggable onDragStart={() => setDraggedId(item.id)} onDragEnd={() => setDraggedId(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => moveMedia(item.id)}><div className="lesson-builder-block-head"><span className="lesson-builder-grip">⋮⋮</span><strong>{item.title || "Материал без названия"}</strong><span className="lesson-builder-type">{item.kind === "QA" ? "Q&A" : item.kind === "BREAKDOWN" ? "Разбор" : "Стрим"}</span></div>{item.embedUrl ? <div className="lesson-builder-video"><iframe src={item.embedUrl} title={item.title || "Видео урока"} allow="autoplay; fullscreen; picture-in-picture" /></div> : <div className="lesson-builder-empty">У материала пока нет предпросмотра</div>}</div>)}{lesson.assignments?.map((assignment) => <div className="lesson-builder-block assignment-block" key={assignment.id}><div className="lesson-builder-block-head"><span className="lesson-builder-grip">⋮⋮</span><strong>{assignment.title}</strong><span className="lesson-builder-type">Домашнее задание</span></div><p>{assignment.description}</p></div>)}{media.length === 0 && (lesson.assignments?.length ?? 0) === 0 && <div className="lesson-builder-empty">Добавьте первый стрим в медиатеке — он появится здесь отдельным блоком.</div>}{notice && <div className="detail-feedback accepted">{notice}</div>}</div><aside className="lesson-builder-preview"><span className="section-kicker">ПРЕДПРОСМОТР</span><strong>Так увидит ученик</strong><div className="student-lesson-preview"><h3>{lesson.title}</h3>{description && <p>{description}</p>}{media.map((item) => <div className="student-preview-media" key={item.id}><span>{item.title || "Материал"}</span>{item.embedUrl && <iframe src={item.embedUrl} title={item.title || "Материал"} allow="autoplay; fullscreen; picture-in-picture" />}</div>)}{lesson.assignments?.map((assignment) => <div className="student-preview-assignment" key={assignment.id}><strong>{assignment.title}</strong><span>Домашнее задание</span></div>)}</div></aside></div>}</div>;
-}
-
 function CuratorModuleAccessView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
   const [modules, setModules] = useState<CourseApiModule[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [expanded, setExpanded] = useState("");
-  const [editingLesson, setEditingLesson] = useState("");
-  const [lessonTitle, setLessonTitle] = useState("");
-  const [lessonDescription, setLessonDescription] = useState("");
-  const [openedLessonId, setOpenedLessonId] = useState("");
+  const [openedModuleId, setOpenedModuleId] = useState("");
   const [showModuleForm, setShowModuleForm] = useState(false);
   const [moduleTitle, setModuleTitle] = useState("");
-  const [moduleSection, setModuleSection] = useState("Education");
   const [moduleDescription, setModuleDescription] = useState("");
-  const [moduleCoverPath, setModuleCoverPath] = useState("");
-  const [moduleCoverFile, setModuleCoverFile] = useState<File | null>(null);
-  const [moduleCoverFileName, setModuleCoverFileName] = useState("");
-  const [moduleLessonTitle, setModuleLessonTitle] = useState("");
   useEffect(() => { void fetch(`${API_ORIGIN}/api/course/manage`, { credentials: "include", cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error("Не удалось загрузить программу"); const payload = await response.json() as { data: { modules: CourseApiModule[] } }; setModules(payload.data.modules); }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Не удалось загрузить программу")); }, []);
+  useEffect(() => {
+    const targetModuleId = window.sessionStorage.getItem(OPEN_MODULE_AFTER_PUBLISH_KEY);
+    if (!targetModuleId || !modules.some((module) => module.id === targetModuleId)) return;
+    window.sessionStorage.removeItem(OPEN_MODULE_AFTER_PUBLISH_KEY);
+    const timer = window.setTimeout(() => setOpenedModuleId(targetModuleId), 0);
+    return () => window.clearTimeout(timer);
+  }, [modules]);
   // A curator always sees full content while editing, so the server hardcodes
   // module.locked to false for this role — it never reflects the real per-cohort state.
   // module.status (backed by Module.defaultAccess) is the real "open to everyone" signal.
@@ -2424,98 +2276,30 @@ function CuratorModuleAccessView({ onNavigate }: { onNavigate: (nextNav: Curator
       setBusy("");
     }
   };
-  const deleteModule = async (module: CourseApiModule) => { if (!window.confirm(`Удалить блок «${module.title}»? Все материалы блока без работ учеников будут удалены.`)) return; setBusy(module.id); setError(""); try { const response = await fetch(`${API_ORIGIN}/api/course/modules/${module.id}`, { method: "DELETE", credentials: "include" }); const payload = await response.json().catch(() => null) as { message?: string } | null; if (!response.ok) throw new Error(payload?.message || "Не удалось удалить блок"); setModules((current) => current.filter((item) => item.id !== module.id)); if (expanded === module.id) setExpanded(""); if (openedLessonId && module.lessons.some((lesson) => lesson.id === openedLessonId)) setOpenedLessonId(""); } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось удалить блок"); } finally { setBusy(""); } };
-  const saveLesson = async (lessonId: string) => { setBusy(lessonId); setError(""); try { const response = await fetch(`${API_ORIGIN}/api/course/lessons/${lessonId}`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: lessonTitle, description: lessonDescription }) }); if (!response.ok) throw new Error("Не удалось сохранить урок"); setModules((current) => current.map((module) => ({ ...module, lessons: module.lessons.map((lesson) => lesson.id === lessonId ? { ...lesson, title: lessonTitle, description: lessonDescription } : lesson) }))); setEditingLesson(""); } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось сохранить урок"); } finally { setBusy(""); } };
+  const deleteModule = async (module: CourseApiModule) => { if (!window.confirm(`Удалить урок «${module.title}»? Все материалы урока без работ учеников будут удалены.`)) return; setBusy(module.id); setError(""); try { const response = await fetch(`${API_ORIGIN}/api/course/modules/${module.id}`, { method: "DELETE", credentials: "include" }); const payload = await response.json().catch(() => null) as { message?: string } | null; if (!response.ok) throw new Error(payload?.message || "Не удалось удалить урок"); setModules((current) => current.filter((item) => item.id !== module.id)); if (openedModuleId === module.id) setOpenedModuleId(""); } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось удалить урок"); } finally { setBusy(""); } };
   const createModule = async () => {
     setBusy("new-module"); setError("");
     try {
-      const response = await fetch(`${API_ORIGIN}/api/course/modules`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: moduleTitle, section: moduleSection, description: moduleDescription, coverPath: moduleCoverPath || undefined, lessonTitle: moduleLessonTitle || undefined }) });
+      const response = await fetch(`${API_ORIGIN}/api/course/modules`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: moduleTitle, description: moduleDescription.trim() || undefined }) });
       const payload = await response.json().catch(() => ({})) as { data?: CourseApiModule; message?: string };
-      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать блок");
-      let createdModule = payload.data;
-      if (moduleCoverFile) {
-        let uploadedFileId = "";
-        try {
-          uploadedFileId = await uploadPrivateFile(moduleCoverFile, "MODULE_COVER");
-          const attachResponse = await fetch(`${API_ORIGIN}/api/files/${uploadedFileId}/module-cover/${createdModule.id}`, { method: "POST", credentials: "include" });
-          const attachPayload = await attachResponse.json().catch(() => ({})) as { data?: { coverPath: string }; message?: string };
-          if (!attachResponse.ok || !attachPayload.data) throw new Error(attachPayload.message ?? "обложку не удалось прикрепить");
-          createdModule = { ...createdModule, coverPath: attachPayload.data.coverPath };
-        } catch (reason) {
-          if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" }).catch(() => undefined);
-          setModules((current) => [...current, createdModule]);
-          setShowModuleForm(false); setModuleTitle(""); setModuleDescription(""); setModuleCoverPath(""); setModuleCoverFile(null); setModuleCoverFileName(""); setModuleLessonTitle("");
-          throw new Error(`Блок создан, но ${reason instanceof Error ? reason.message : "обложку не удалось прикрепить"}.`);
-        }
-      }
-      setModules((current) => [...current, createdModule]);
-      setShowModuleForm(false); setModuleTitle(""); setModuleDescription(""); setModuleCoverPath(""); setModuleCoverFile(null); setModuleCoverFileName(""); setModuleLessonTitle("");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось создать блок"); }
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать урок");
+      setModules((current) => [...current, payload.data as CourseApiModule]);
+      setShowModuleForm(false); setModuleTitle(""); setModuleDescription("");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось создать урок"); }
     finally { setBusy(""); }
   };
-  const openedLesson = modules.flatMap((module) => module.lessons.map((lesson) => ({ module, lesson }))).find((item) => item.lesson.id === openedLessonId);
-  if (openedLesson) return <CuratorLessonPage key={openedLesson.lesson.id} module={openedLesson.module} lesson={openedLesson.lesson} lessons={openedLesson.module.lessons} onBack={() => setOpenedLessonId("")} onNavigate={onNavigate} onSwitchLesson={setOpenedLessonId} />;
+  const openedModule = modules.find((module) => module.id === openedModuleId);
+  if (openedModule) return <CuratorLessonPage key={openedModule.id} module={openedModule} onBack={() => setOpenedModuleId("")} onNavigate={onNavigate} />;
   const unlockedCount = modules.filter((module) => module.status !== "LOCKED").length;
-  return <section className="content-panel module-access-panel"><div className="section-heading"><div><span className="section-kicker">ДОСТУП К ПРОГРАММЕ</span><h2>Блоки практикума</h2><p className="section-heading-note">Откройте блок — и сразу попадёте в страницу его урока, как её видит ученик.</p></div><span className="progress-inline">{unlockedCount} из {modules.length} открыто</span><button className="primary-button module-add-button" type="button" onClick={() => setShowModuleForm((current) => !current)}><Plus size={16} /> {showModuleForm ? "Закрыть форму" : "Добавить блок"}</button></div>{showModuleForm && <div className="module-create-form"><div className="module-create-form-heading"><div><span className="section-kicker">НОВЫЙ БЛОК</span><strong>Добавить модуль в программу</strong><p>Новый блок будет закрыт для учеников. После создания добавьте материалы и откройте доступ.</p></div></div><div className="module-create-fields"><label><span>Название блока</span><input value={moduleTitle} onChange={(event) => setModuleTitle(event.target.value)} placeholder="Например, Управление риском" /></label><label><span>Раздел</span><select value={moduleSection} onChange={(event) => setModuleSection(event.target.value)}><option value="Education">Education</option><option value="Practice">Practice</option><option value="Q&A">Q&A</option><option value="Welcome">Welcome</option></select></label><label className="module-create-wide"><span>Описание</span><textarea value={moduleDescription} onChange={(event) => setModuleDescription(event.target.value)} placeholder="Что ученик изучит в этом блоке" /></label><div className="module-cover-picker module-create-wide"><div className="module-cover-picker-head"><span>Обложка блока</span><small>PNG, JPG или WEBP · до 5 МБ</small></div><label className="module-cover-upload"><Plus size={16} /><span>{moduleCoverFileName || "Выбрать изображение с компьютера"}</span><input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { setError("Обложка должна быть PNG, JPG или WEBP."); return; } if (file.size > 5 * 1024 * 1024) { setError("Размер обложки не должен превышать 5 МБ."); return; } setModuleCoverFile(file); setModuleCoverFileName(file.name); setModuleCoverPath(""); setError(""); }} /></label><label><span>Или путь из public</span><input value={moduleCoverPath} onChange={(event) => { setModuleCoverPath(event.target.value); setModuleCoverFile(null); setModuleCoverFileName(""); }} placeholder="/event-covers/PRE-session.png" /></label></div><label><span>Первый урок</span><input value={moduleLessonTitle} onChange={(event) => setModuleLessonTitle(event.target.value)} placeholder="Вводный урок" /></label></div><div className="module-create-actions"><button className="secondary-button" type="button" onClick={() => setShowModuleForm(false)}>Отмена</button><button className="primary-button" type="button" disabled={busy === "new-module" || !moduleTitle.trim()} onClick={() => void createModule()}>{busy === "new-module" ? "Создаём…" : "Создать блок"}</button></div></div>}{error && <div className="file-error" role="alert">{error}</div>}{notice && <div className="form-action-feedback">{notice}</div>}<div className="module-access-list">{modules.map((module) => { const unlocked = module.status !== "LOCKED"; const isExpanded = expanded === module.id; return <div key={module.id}><div className={`module-access-row ${unlocked ? "is-unlocked" : "is-locked"}`}><div className={`module-access-status ${unlocked ? "open" : "closed"}`}>{unlocked ? "Доступен ученикам" : "Закрыт"}</div><div className="module-access-copy"><strong data-module-number={module.number}>{module.title}</strong><span>{module.section} · {module.lessons.length} {module.lessons.length === 1 ? "урок" : "уроков"}</span></div><div className="module-access-actions"><button className="secondary-button" type="button" onClick={() => module.lessons[0] ? setOpenedLessonId(module.lessons[0].id) : setExpanded(isExpanded ? "" : module.id)}>Открыть урок</button><button className={unlocked ? "secondary-button" : "primary-button"} type="button" disabled={busy === module.id} onClick={() => void toggle(module)}>{busy === module.id ? "Сохраняем…" : unlocked ? "Закрыть блок" : "Разблокировать"}</button><button className="secondary-button" type="button" disabled={busy === module.id} onClick={() => void markCompleted(module)}>Модуль пройден</button><button className="secondary-button danger-button" type="button" disabled={busy === module.id} onClick={() => void deleteModule(module)}>Удалить</button></div></div>{isExpanded && <div className="module-lesson-editor"><div className="module-lesson-editor-head"><strong>Уроки блока</strong><button className="secondary-button" type="button" onClick={() => onNavigate("Медиатека")}><Plus size={15} /> Добавить материал</button></div>{module.lessons.map((lesson) => <div className="module-lesson-row" key={lesson.id}>{editingLesson === lesson.id ? <div className="module-lesson-edit-form"><input value={lessonTitle} onChange={(event) => setLessonTitle(event.target.value)} /><textarea value={lessonDescription} onChange={(event) => setLessonDescription(event.target.value)} placeholder="Описание урока" /><div><button className="primary-button" type="button" disabled={busy === lesson.id} onClick={() => void saveLesson(lesson.id)}>Сохранить</button><button className="secondary-button" type="button" onClick={() => setEditingLesson("")}>Отмена</button></div></div> : <CuratorLessonBuilder lesson={lesson} onNavigate={onNavigate} onEdit={() => { setEditingLesson(lesson.id); setLessonTitle(lesson.title); setLessonDescription(lesson.description ?? ""); }} onOpenPage={() => setOpenedLessonId(lesson.id)} />}</div>)}</div>}</div>; })}</div></section>;
+  return <section className="content-panel module-access-panel"><div className="section-heading"><div><h2>Уроки практикума</h2><p className="section-heading-note">{unlockedCount} из {modules.length} открыто ученикам. Откройте урок — сразу попадёте на страницу, как её видит ученик.</p></div><button className="primary-button module-add-button" type="button" onClick={() => setShowModuleForm((current) => !current)}><Plus size={16} /> {showModuleForm ? "Закрыть форму" : "Добавить урок"}</button></div>{showModuleForm && <div className="module-create-form"><div className="module-create-form-heading"><div><strong>Добавить урок в программу</strong><p>Урок появится в программе сразу — начните добавлять материалы, а открыть доступ ученикам можно одним кликом, когда всё будет готово.</p></div></div><div className="module-create-fields"><label className="module-create-wide"><span>Название урока</span><input value={moduleTitle} onChange={(event) => setModuleTitle(event.target.value)} placeholder="Например, Управление риском" /></label><label className="module-create-wide"><span>Описание</span><textarea value={moduleDescription} onChange={(event) => setModuleDescription(event.target.value)} placeholder="Что ученик изучит в этом уроке" /></label></div><div className="module-create-actions"><button className="secondary-button" type="button" onClick={() => setShowModuleForm(false)}>Отмена</button><button className="primary-button module-add-button" type="button" disabled={busy === "new-module" || !moduleTitle.trim()} onClick={() => void createModule()}><Plus size={16} /> {busy === "new-module" ? "Создаём…" : "Создать урок"}</button></div></div>}{error && <div className="file-error" role="alert">{error}</div>}{notice && <div className="form-action-feedback">{notice}</div>}<div className="module-access-list">{modules.map((module) => { const unlocked = module.status !== "LOCKED"; const contentCount = module.media.length + module.assignments.length; return <div key={module.id}><div className={`module-access-row ${unlocked ? "is-unlocked" : "is-locked"}`}><div className={`module-access-status ${unlocked ? "open" : "closed"}`}>{unlocked ? "Доступен ученикам" : "Закрыт"}</div><div className="module-access-copy"><strong data-module-number={module.number}>{module.title}</strong><span>{module.section} · {pluralizeMaterials(contentCount)}</span></div><div className="module-access-actions"><button className="secondary-button" type="button" onClick={() => setOpenedModuleId(module.id)}>Открыть урок</button><button className={unlocked ? "secondary-button" : "primary-button"} type="button" disabled={busy === module.id} onClick={() => void toggle(module)}>{busy === module.id ? "Сохраняем…" : unlocked ? "Закрыть урок" : "Разблокировать"}</button><button className="secondary-button" type="button" disabled={busy === module.id} onClick={() => void markCompleted(module)}>Урок пройден</button><button className="secondary-button danger-button" type="button" disabled={busy === module.id} onClick={() => void deleteModule(module)}>Удалить</button></div></div></div>; })}</div></section>;
 }
 
 function CuratorPlaceholder({ title }: { title: string }) {
   return <section className="content-panel curator-placeholder"><div className="empty-state"><Target size={24} /><strong>{title} будет следующим рабочим разделом</strong><span>Каркас роли уже отделён от ученического интерфейса. После проверки основного сценария здесь появятся реальные списки и действия куратора.</span></div></section>;
 }
 
-// Kept only as a visual reference for the server-backed media library below.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function LegacyCuratorMediaLibraryView({ onAttachLessonVideo }: { onAttachLessonVideo: (moduleId: string, video: LessonVideo) => void }) {
-  const initialUrl = "https://vimeo.com/1197792122?share=copy&fl=sv&fe=ci";
-  const initialEmbedUrl = normalizeVimeoUrl(initialUrl) ?? "";
-  const [filter, setFilter] = useState("all");
-  const [selectedId, setSelectedId] = useState("market-logic-stream");
-  const [showForm, setShowForm] = useState(false);
-  const [draftTitle, setDraftTitle] = useState("Market Logic · запись стрима");
-  const [draftUrl, setDraftUrl] = useState(initialUrl);
-  const [draftSource, setDraftSource] = useState<LessonVideo["source"]>("vimeo");
-  const [draftFileUrl, setDraftFileUrl] = useState("");
-  const [draftFileName, setDraftFileName] = useState("");
-  const [draftType, setDraftType] = useState<MediaLibraryItem["type"]>("Запись стрима");
-  const [notice, setNotice] = useState("");
-  const [attached, setAttached] = useState(false);
-  const [mediaItems, setMediaItems] = useState<MediaLibraryItem[]>([
-    { id: "market-logic-stream", title: "Market Logic · запись стрима", source: "vimeo", url: initialEmbedUrl, duration: "1:21:16", type: "Запись стрима", kind: "stream", module: "Education / Market Logic", lessonId: "week-1", status: "Опубликовано", cover: "/market-logic-cover.png" },
-    { id: "qa-curator", title: "Q&A с куратором", source: "vimeo", url: "", duration: "42:08", type: "Видеоразбор", kind: "breakdown", module: "Education / Market Logic", lessonId: "week-1", status: "Черновик", cover: "/qa-cover.png" },
-    { id: "backtest-guide", title: "Backtest: что, как, зачем?", source: "upload", url: "", duration: "PDF", type: "Материал урока", kind: "file", module: "Practice / Backtest", lessonId: "backtest", status: "Привязан к уроку", cover: "/backtest-performance.png" },
-  ]);
-  const filteredItems = filter === "all" ? mediaItems : mediaItems.filter((item) => item.kind === filter);
-  const selectedItem = mediaItems.find((item) => item.id === selectedId) ?? mediaItems[0];
-  const canPreview = selectedItem.url.length > 0;
-  const filters = [{ id: "all", label: "Все" }, { id: "stream", label: "Стримы" }, { id: "breakdown", label: "Видеоразборы" }, { id: "file", label: "Материалы" }];
-
-  const createMediaItem = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const url = draftSource === "vimeo" ? normalizeVimeoUrl(draftUrl) : draftFileUrl;
-    if (!url) {
-      setNotice(draftSource === "vimeo" ? "Нужна корректная ссылка Vimeo с номером видео." : "Выбери видеофайл для загрузки.");
-      return;
-    }
-    const kind = draftType === "Видеоразбор" ? "breakdown" : draftType === "Материал урока" ? "file" : "stream";
-    const nextItem: MediaLibraryItem = { id: `media-${Date.now()}`, title: draftTitle.trim() || "Новый материал", source: draftSource, url, duration: draftSource === "upload" ? "Видео" : "1:21:16", type: draftType, kind, module: "Education / Market Logic", lessonId: "week-1", status: "Черновик", cover: "/market-logic-cover.png" };
-    setMediaItems((current) => [nextItem, ...current]);
-    setSelectedId(nextItem.id);
-    setAttached(false);
-    setNotice("Материал добавлен в медиатеку. Проверь предпросмотр и прикрепи его к уроку.");
-  };
-
-  const attachSelected = () => {
-    if (!canPreview) return;
-    onAttachLessonVideo(selectedItem.lessonId, { title: selectedItem.title, source: selectedItem.source, url: selectedItem.url, duration: selectedItem.duration });
-    setAttached(true);
-  };
-
-  return <div className="media-library-page"><div className="media-library-toolbar"><div className="assignment-filter">{filters.map((item) => <button className={`filter-chip ${filter === item.id ? "active" : ""}`} key={item.id} onClick={() => setFilter(item.id)} aria-pressed={filter === item.id}>{item.label} <span>{item.id === "all" ? mediaItems.length : mediaItems.filter((mediaItem) => mediaItem.kind === item.id).length}</span></button>)}</div><button className="primary-button" onClick={() => { setShowForm((current) => !current); setNotice(""); }}><Plus size={16} /> {showForm ? "Закрыть добавление" : "Добавить материал"}</button></div>{showForm && <section className="content-panel media-editor-panel"><div className="section-heading"><div><span className="section-kicker">НОВЫЙ МАТЕРИАЛ</span><h2>Добавить стрим или видео</h2><p className="section-heading-note">Выбери источник, укажи урок и сначала проверь материал в предпросмотре.</p></div></div><form className="media-editor-body" onSubmit={createMediaItem}><div className="media-source-switch" role="group" aria-label="Источник видео"><button type="button" className={draftSource === "vimeo" ? "active" : ""} onClick={() => setDraftSource("vimeo")}>Ссылка Vimeo</button><button type="button" className={draftSource === "upload" ? "active" : ""} onClick={() => setDraftSource("upload")}>Загрузить файл</button></div><div className="media-editor-fields"><label className="form-field"><span>Название материала</span><input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} /></label><label className="form-field"><span>Тип</span><select value={draftType} onChange={(event) => setDraftType(event.target.value as MediaLibraryItem["type"])}><option>Запись стрима</option><option>Видеоразбор</option><option>Материал урока</option></select></label><label className="form-field"><span>Привязать к уроку</span><select defaultValue="week-1"><option value="week-1">Market Logic · базовые принципы</option></select></label>{draftSource === "vimeo" ? <label className="form-field"><span>Ссылка Vimeo</span><input type="url" value={draftUrl} onChange={(event) => { setDraftUrl(event.target.value); setNotice(""); }} placeholder="https://vimeo.com/123456789" /></label> : <label className="form-field"><span>Видео-файл</span><input type="file" accept="video/mp4,video/webm,video/quicktime" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; setDraftFileName(file.name); setDraftFileUrl(URL.createObjectURL(file)); setNotice(""); }} /><small className="file-field-note">{draftFileName || "MP4, WebM или MOV · до 500 МБ"}</small></label>}</div><p className="media-link-note">После прикрепления материал появится внизу страницы выбранного урока. В production файл будет загружаться в S3-compatible storage, а Vimeo останется внешним защищённым источником.</p><div className="media-form-actions"><button className="primary-button" type="submit"><Play size={16} /> Добавить в медиатеку</button>{notice && <span className="form-action-feedback"><Target size={16} /> {notice}</span>}</div></form></section>}<div className="media-library-grid"><section className="media-card-grid">{filteredItems.map((item) => <button className={`media-card ${item.id === selectedId ? "selected" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setAttached(false); }} aria-pressed={item.id === selectedId}><div className="media-card-cover"><Image src={item.cover} alt={`Обложка: ${item.title}`} fill sizes="(max-width: 700px) 100vw, (max-width: 1100px) 50vw, 33vw" /><span className="media-card-kind">{item.type}</span>{item.kind === "stream" && <span className="media-card-play"><Play size={16} fill="currentColor" /></span>}<span className="media-card-duration">{item.duration}</span></div><div className="media-card-copy"><span>{item.module}</span><h3>{item.title}</h3><div><small className={`media-status ${item.status === "Черновик" ? "draft" : ""}`}>{item.status}</small><ChevronRight size={15} /></div></div></button>)}</section><section className="content-panel media-preview-panel"><div className="section-heading"><div><span className="section-kicker">ПРЕДПРОСМОТР</span><h2>{selectedItem.title}</h2></div><span className="media-source-badge"><span className="live-dot" /> {selectedItem.source === "vimeo" ? "Vimeo" : "Файл"}</span></div>{selectedItem.source === "vimeo" && canPreview ? <div className="media-vimeo-stage"><iframe src={selectedItem.url} title={`Предпросмотр: ${selectedItem.title}`} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div> : selectedItem.source === "upload" && canPreview ? <div className="media-vimeo-stage"><video src={selectedItem.url} controls playsInline /></div> : <div className="media-selected-cover"><Image src={selectedItem.cover} alt="" fill sizes="(max-width: 1000px) 100vw, 45vw" /></div>}<div className="media-preview-meta"><div><span className="section-kicker">ПРИВЯЗКА К УРОКУ</span><strong>{selectedItem.module} · Market Logic</strong><small>{attached ? "Материал прикреплён к уроку" : canPreview ? "Готов к привязке к уроку" : "Сначала добавь ссылку или файл"}</small></div><button className="primary-button" type="button" disabled={!canPreview} onClick={attachSelected}>{attached ? "Прикреплено" : "Прикрепить к уроку"} {!attached && <ChevronRight size={16} />}</button></div></section></div></div>;
-}
-
 type CuratorMediaItem = CourseLessonMedia & {
-  lessonId: string | null;
-  lessonTitle: string;
+  moduleId: string | null;
   moduleTitle: string;
   eventTitle?: string;
 };
@@ -2533,7 +2317,7 @@ function mediaKindLabel(kind: CuratorMediaItem["kind"]): string {
 function CuratorMediaLibraryView() {
   const [course, setCourse] = useState<CourseState | null>(null);
   const [selectedId, setSelectedId] = useState("");
-  const [lessonId, setLessonId] = useState("");
+  const [moduleId, setModuleId] = useState("");
   const [scheduleEventId, setScheduleEventId] = useState("");
   const [title, setTitle] = useState("");
   const [vimeoUrl, setVimeoUrl] = useState("");
@@ -2547,7 +2331,7 @@ function CuratorMediaLibraryView() {
   const [viewers, setViewers] = useState<{ id: string; ipAddress: string | null; createdAt: string; viewer: { id: string; role: string; name: string } }[]>([]);
   const [reclassifying, setReclassifying] = useState(false);
   const [reclassifyKind, setReclassifyKind] = useState<CuratorMediaItem["kind"]>("STREAM");
-  const [reclassifyLessonId, setReclassifyLessonId] = useState("");
+  const [reclassifyModuleId, setReclassifyModuleId] = useState("");
   const [reclassifyScheduleEventId, setReclassifyScheduleEventId] = useState("");
   const [showExisting, setShowExisting] = useState(false);
 
@@ -2558,8 +2342,8 @@ function CuratorMediaLibraryView() {
     const nextCourse = normalizeCourse(payload);
     if (!nextCourse) throw new Error("В программе пока нет уроков.");
     setCourse(nextCourse);
-    const firstLessonId = nextCourse.modules.flatMap((module) => nextCourse.lessonsByModule[module.id] ?? []).find(Boolean)?.id ?? "";
-    setLessonId((current) => current || firstLessonId);
+    const firstModuleId = nextCourse.modules[0]?.id ?? "";
+    setModuleId((current) => current || firstModuleId);
   }, []);
 
   useEffect(() => {
@@ -2571,28 +2355,26 @@ function CuratorMediaLibraryView() {
     return () => window.clearTimeout(timer);
   }, [loadCourse]);
 
-  const lessons = useMemo(() => course?.modules.flatMap((module) => (course.lessonsByModule[module.id] ?? []).map((lesson) => ({
-    id: lesson.id,
-    label: `${module.number} · ${module.title} — ${lesson.title}`,
-  }))) ?? [], [course]);
+  const moduleOptions = useMemo(() => course?.modules.map((module) => ({
+    id: module.id,
+    label: `${module.number} · ${module.title}`,
+  })) ?? [], [course]);
   const items = useMemo<CuratorMediaItem[]>(() => {
     if (!course) return [];
     const eventTitles = new Map(course.scheduleEvents.map((event) => [event.id, event.title]));
-    const lessonItems = course.modules.flatMap((module) => (course.lessonsByModule[module.id] ?? []).flatMap((lesson) => lesson.media.map((media) => ({
+    const moduleItems = course.modules.flatMap((module) => (course.contentByModule[module.id]?.media ?? []).map((media) => ({
       ...media,
-      lessonId: lesson.id,
-      lessonTitle: lesson.title,
+      moduleId: module.id,
       moduleTitle: `${module.number} · ${module.title}`,
       eventTitle: media.scheduleEventId ? eventTitles.get(media.scheduleEventId) : undefined,
-    }))));
+    })));
     const globalItems = course.globalMedia.map((media) => ({
       ...media,
-      lessonId: null,
-      lessonTitle: "Без привязки к уроку",
+      moduleId: null,
       moduleTitle: "Общая медиатека",
       eventTitle: media.scheduleEventId ? eventTitles.get(media.scheduleEventId) : undefined,
     }));
-    return [...lessonItems, ...globalItems];
+    return [...moduleItems, ...globalItems];
   }, [course]);
   const selected = items.find((item) => item.id === selectedId) ?? null;
   const isGlobalMedia = kind === "TALKS";
@@ -2601,11 +2383,11 @@ function CuratorMediaLibraryView() {
     ? items.filter((item) => item.kind === "TALKS")
     : scheduleEventId
       ? items.filter((item) => item.scheduleEventId === scheduleEventId && item.kind === kind)
-      : lessonId
-        ? items.filter((item) => item.lessonId === lessonId && item.kind === kind)
+      : moduleId
+        ? items.filter((item) => item.moduleId === moduleId && item.kind === kind)
         : [];
   useEffect(() => {
-    const targetLessonId = window.sessionStorage.getItem("curator-target-lesson");
+    const targetModuleId = window.sessionStorage.getItem("curator-target-module");
     const targetEventId = window.sessionStorage.getItem("curator-target-event");
     const targetKind = window.sessionStorage.getItem("curator-target-kind");
     if (targetKind === "STREAM" || targetKind === "QA" || targetKind === "BREAKDOWN") window.setTimeout(() => setKind(targetKind), 0);
@@ -2614,11 +2396,11 @@ function CuratorMediaLibraryView() {
       window.sessionStorage.removeItem("curator-target-event");
       window.setTimeout(() => setScheduleEventId(targetEventId), 0);
     }
-    if (!targetLessonId || !lessons.some((lesson) => lesson.id === targetLessonId)) return;
-    window.sessionStorage.removeItem("curator-target-lesson");
-    const timer = window.setTimeout(() => { setLessonId(targetLessonId); }, 0);
+    if (!targetModuleId || !moduleOptions.some((module) => module.id === targetModuleId)) return;
+    window.sessionStorage.removeItem("curator-target-module");
+    const timer = window.setTimeout(() => { setModuleId(targetModuleId); }, 0);
     return () => window.clearTimeout(timer);
-  }, [lessons, course?.scheduleEvents]);
+  }, [moduleOptions, course?.scheduleEvents]);
 
   const createMedia = async (event: FormEvent<HTMLFormElement>, publishAfterCreate = false) => {
     event.preventDefault();
@@ -2629,7 +2411,7 @@ function CuratorMediaLibraryView() {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...(isGlobalMedia ? {} : { lessonId: lessonId || undefined, scheduleEventId: scheduleEventId || undefined }), title, kind, vimeoUrl }),
+        body: JSON.stringify({ ...(isGlobalMedia ? {} : { moduleId: moduleId || undefined, scheduleEventId: scheduleEventId || undefined }), title, kind, vimeoUrl }),
       });
       const payload = await response.json().catch(() => ({})) as { data?: { id: string }; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось добавить запись.");
@@ -2658,7 +2440,7 @@ function CuratorMediaLibraryView() {
       const payload = await response.json().catch(() => ({})) as { message?: string };
       if (!response.ok) throw new Error(payload.message ?? "Не удалось опубликовать запись.");
       await loadCourse();
-      setNotice("Запись опубликована. Она появится у учеников с доступом к этому модулю.");
+      setNotice("Запись опубликована. Она появится у учеников с доступом к этому уроку.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Не удалось опубликовать запись.");
     } finally {
@@ -2682,10 +2464,10 @@ function CuratorMediaLibraryView() {
   };
 
   const attachSelected = async () => {
-    if (!selected || !lessonId || !selected.lessonId || selected.kind === "TALKS" || selected.lessonId === lessonId) return;
+    if (!selected || !moduleId || !selected.moduleId || selected.kind === "TALKS" || selected.moduleId === moduleId) return;
     setNotice(""); setSaving(true);
     try {
-      const response = await fetch(`${API_ORIGIN}/api/course/media/${selected.id}/lesson`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lessonId }) });
+      const response = await fetch(`${API_ORIGIN}/api/course/media/${selected.id}/module`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ moduleId }) });
       const payload = await response.json().catch(() => ({})) as { message?: string };
       if (!response.ok) throw new Error(payload.message ?? "Не удалось привязать стрим к уроку");
       await loadCourse();
@@ -2698,7 +2480,7 @@ function CuratorMediaLibraryView() {
   const openReclassify = () => {
     if (!selected) return;
     setReclassifyKind(selected.kind);
-    setReclassifyLessonId(selected.lessonId ?? "");
+    setReclassifyModuleId(selected.moduleId ?? "");
     setReclassifyScheduleEventId(selected.scheduleEventId ?? "");
     setReclassifying(true);
   };
@@ -2714,7 +2496,7 @@ function CuratorMediaLibraryView() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           kind: reclassifyKind,
-          lessonId: isTalks ? undefined : (reclassifyScheduleEventId ? undefined : reclassifyLessonId || undefined),
+          moduleId: isTalks ? undefined : (reclassifyScheduleEventId ? undefined : reclassifyModuleId || undefined),
           scheduleEventId: isTalks ? undefined : (reclassifyScheduleEventId || undefined),
         }),
       });
@@ -2754,23 +2536,23 @@ function CuratorMediaLibraryView() {
        <div className="section-heading"><div><span className="section-kicker">НОВАЯ ЗАПИСЬ</span><h2>Добавить запись в медиатеку</h2><p className="section-heading-note">Тип Q&A попадёт только в блок «Q&A с куратором», тематический стрим — в центральный блок урока, а Talks останется в общей медиатеке.</p></div></div>
       <form className="media-editor-body" onSubmit={(event) => { const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null; void createMedia(event, submitter?.dataset.publish === "true"); }}>
         <div className="media-editor-fields">
-          <label className="form-field"><span>{isGlobalMedia ? "Привязка" : "Привязать к уроку"}</span><select value={isGlobalMedia ? "" : lessonId} onChange={(event) => { setLessonId(event.target.value); if (event.target.value) setScheduleEventId(""); }} disabled={isGlobalMedia || loading || lessons.length === 0}><option value="">{isGlobalMedia ? "Без привязки · общая медиатека" : "Выбери урок"}</option>{lessons.map((lesson) => <option key={lesson.id} value={lesson.id}>{lesson.label}</option>)}</select></label>
-          <label className="form-field"><span>Привязать к событию (необязательно)</span><select value={scheduleEventId} onChange={(event) => { setScheduleEventId(event.target.value); if (event.target.value) setLessonId(""); }} disabled={isGlobalMedia || loading}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label>
-          <label className="form-field"><span>Тип</span><select value={kind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setKind(nextKind); if (nextKind !== "TALKS" && !lessonId) setLessonId(lessons[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>
+          <label className="form-field"><span>{isGlobalMedia ? "Привязка" : "Привязать к уроку"}</span><select value={isGlobalMedia ? "" : moduleId} onChange={(event) => { setModuleId(event.target.value); if (event.target.value) setScheduleEventId(""); }} disabled={isGlobalMedia || loading || moduleOptions.length === 0}><option value="">{isGlobalMedia ? "Без привязки · общая медиатека" : "Выбери урок"}</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label>
+          <label className="form-field"><span>Привязать к событию (необязательно)</span><select value={scheduleEventId} onChange={(event) => { setScheduleEventId(event.target.value); if (event.target.value) setModuleId(""); }} disabled={isGlobalMedia || loading}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label>
+          <label className="form-field"><span>Тип</span><select value={kind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setKind(nextKind); if (nextKind !== "TALKS" && !moduleId) setModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>
           <label className="form-field"><span>Название</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Q&A по Market Logic · 05.06" /></label>
           <label className="form-field"><span>Ссылка Vimeo</span><input type="url" value={vimeoUrl} onChange={(event) => setVimeoUrl(event.target.value)} placeholder="https://vimeo.com/123456789" /></label>{normalizeVimeoUrl(vimeoUrl) && <div className="media-link-live-preview"><span>Предпросмотр новой записи</span><iframe src={normalizeVimeoUrl(vimeoUrl) ?? undefined} title="Предпросмотр Vimeo" allow="autoplay; fullscreen; picture-in-picture" /> </div>}
         </div>
-         <div className="media-form-actions"><button className="secondary-button" type="submit" disabled={saving || (!isGlobalMedia && !lessonId && !scheduleEventId) || !title.trim() || !vimeoUrl.trim()}>Сохранить черновик</button><button className="primary-button" type="submit" data-publish="true" disabled={saving || (!isGlobalMedia && !lessonId && !scheduleEventId) || !title.trim() || !vimeoUrl.trim()}>{isGlobalMedia ? "Опубликовать в медиатеку" : scheduleEventId ? "Опубликовать к событию" : `Опубликовать в ${mediaDestinationLabel}`} <ChevronRight size={16} /></button>{notice && <span className="form-action-feedback"><Target size={16} /> {notice}</span>}</div>
+         <div className="media-form-actions"><button className="secondary-button" type="submit" disabled={saving || (!isGlobalMedia && !moduleId && !scheduleEventId) || !title.trim() || !vimeoUrl.trim()}>Сохранить черновик</button><button className="primary-button" type="submit" data-publish="true" disabled={saving || (!isGlobalMedia && !moduleId && !scheduleEventId) || !title.trim() || !vimeoUrl.trim()}>{isGlobalMedia ? "Опубликовать в медиатеку" : scheduleEventId ? "Опубликовать к событию" : `Опубликовать в ${mediaDestinationLabel}`} <ChevronRight size={16} /></button>{notice && <span className="form-action-feedback"><Target size={16} /> {notice}</span>}</div>
       </form>
     </section>
-    {(isGlobalMedia || lessonId || scheduleEventId) && <section className="content-panel media-existing-toggle">
+    {(isGlobalMedia || moduleId || scheduleEventId) && <section className="content-panel media-existing-toggle">
       <button className="secondary-button" type="button" onClick={() => setShowExisting((current) => { const next = !current; if (!next) { setSelectedId(""); setReclassifying(false); } return next; })}>{showExisting ? "Скрыть существующие записи" : `Показать существующие записи (${existingInScope.length})`}</button>
       {showExisting && (existingInScope.length === 0
         ? <p className="media-link-note">Здесь пока пусто — это будет первая запись такого типа в этом блоке.</p>
         : <div className="module-media-playlist">{existingInScope.map((item, index) => <button className={`module-media-item ${item.id === selectedId ? "selected" : ""}`} type="button" key={item.id} onClick={() => setSelectedId(item.id)}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.title ?? "Без названия"}</strong><small>{mediaKindLabel(item.kind)} · {item.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</small></div><ChevronRight size={14} /></button>)}</div>)}
     </section>}
     {selected && <section className="content-panel media-preview-panel">
-      <div className="section-heading"><div><span className="section-kicker">ЗАПИСЬ</span><h2>{selected.title ?? "Без названия"}</h2></div><span className="media-source-badge">{selected.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</span></div>{selected.embedUrl ? <div className="media-vimeo-stage"><iframe src={selected.embedUrl} title={selected.title ?? "Предпросмотр записи"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div> : <div className="empty-state"><Play size={22} /><strong>Плеер недоступен</strong><span>Проверь ссылку Vimeo.</span></div>}<div className="media-preview-meta"><div><span className="section-kicker">{selected.kind === "TALKS" ? "ОБЩАЯ МЕДИАТЕКА" : "ПРИВЯЗКА"}</span><strong>{selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle}</strong><small>{selected.lessonTitle} · {mediaKindLabel(selected.kind)}</small></div><div className="media-preview-actions">{selected.kind !== "TALKS" && <button className="secondary-button" type="button" disabled={saving || deletingId !== "" || !lessonId || !selected.lessonId || selected.lessonId === lessonId} onClick={() => void attachSelected()}>{selected.lessonId === lessonId ? "Уже привязан" : "Привязать к выбранному уроку"}</button>}<button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => (reclassifying ? setReclassifying(false) : openReclassify())}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>{reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyLessonId && !reclassifyScheduleEventId) setReclassifyLessonId(lessons[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyLessonId} onChange={(event) => { setReclassifyLessonId(event.target.value); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option>{lessons.map((lesson) => <option key={lesson.id} value={lesson.id}>{lesson.label}</option>)}</select></label><label className="form-field"><span>Привязать к событию (необязательно)</span><select value={reclassifyScheduleEventId} onChange={(event) => { setReclassifyScheduleEventId(event.target.value); if (event.target.value) setReclassifyLessonId(""); }}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label></>}</div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || (reclassifyKind !== "TALKS" && !reclassifyLessonId && !reclassifyScheduleEventId)} onClick={() => void saveReclassify()}>Сохранить тип</button></div></div>}{viewersFor === selected.id && <div className="media-viewers-panel">{viewersLoading ? <span className="media-viewers-empty">Загружаем…</span> : viewers.length === 0 ? <span className="media-viewers-empty">Пока никто не открывал эту запись.</span> : viewers.map((event) => <div className="media-viewers-row" key={event.id}><strong>{event.viewer.name}</strong><span>{event.viewer.role === "STUDENT" ? "Ученик" : event.viewer.role === "CURATOR" ? "Куратор" : "Владелец"}</span><span>{event.ipAddress ?? "IP не определён"}</span><span>{new Date(event.createdAt).toLocaleString("ru-RU")}</span></div>)}</div>}</div>
+      <div className="section-heading"><div><span className="section-kicker">ЗАПИСЬ</span><h2>{selected.title ?? "Без названия"}</h2></div><span className="media-source-badge">{selected.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</span></div>{selected.embedUrl ? <div className="media-vimeo-stage"><iframe src={selected.embedUrl} title={selected.title ?? "Предпросмотр записи"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div> : <div className="empty-state"><Play size={22} /><strong>Плеер недоступен</strong><span>Проверь ссылку Vimeo.</span></div>}<div className="media-preview-meta"><div><span className="section-kicker">{selected.kind === "TALKS" ? "ОБЩАЯ МЕДИАТЕКА" : "ПРИВЯЗКА"}</span><strong>{selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle}</strong><small>{mediaKindLabel(selected.kind)}</small></div><div className="media-preview-actions">{selected.kind !== "TALKS" && <button className="secondary-button" type="button" disabled={saving || deletingId !== "" || !moduleId || !selected.moduleId || selected.moduleId === moduleId} onClick={() => void attachSelected()}>{selected.moduleId === moduleId ? "Уже привязан" : "Привязать к выбранному уроку"}</button>}<button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => (reclassifying ? setReclassifying(false) : openReclassify())}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>{reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId) setReclassifyModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyModuleId} onChange={(event) => { setReclassifyModuleId(event.target.value); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label><label className="form-field"><span>Привязать к событию (необязательно)</span><select value={reclassifyScheduleEventId} onChange={(event) => { setReclassifyScheduleEventId(event.target.value); if (event.target.value) setReclassifyModuleId(""); }}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label></>}</div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || (reclassifyKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId)} onClick={() => void saveReclassify()}>Сохранить тип</button></div></div>}{viewersFor === selected.id && <div className="media-viewers-panel">{viewersLoading ? <span className="media-viewers-empty">Загружаем…</span> : viewers.length === 0 ? <span className="media-viewers-empty">Пока никто не открывал эту запись.</span> : viewers.map((event) => <div className="media-viewers-row" key={event.id}><strong>{event.viewer.name}</strong><span>{event.viewer.role === "STUDENT" ? "Ученик" : event.viewer.role === "CURATOR" ? "Куратор" : "Владелец"}</span><span>{event.ipAddress ?? "IP не определён"}</span><span>{new Date(event.createdAt).toLocaleString("ru-RU")}</span></div>)}</div>}</div>
     </section>}
   </div>;
 }
@@ -3305,26 +3087,31 @@ function isReviewQueueItem(value: unknown): value is ReviewQueueItem {
 }
 
 function CreateAssignmentView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
-  const [published, setPublished] = useState<Assignment | null>(null);
+  const [published, setPublished] = useState<(Assignment & { moduleId?: string }) | null>(null);
   const [formKey, setFormKey] = useState(0);
 
   useEffect(() => {
     const handlePublished = (event: Event) => {
       if (!(event instanceof CustomEvent) || !isAssignment(event.detail)) return;
-      setPublished(event.detail);
+      setPublished(event.detail as Assignment & { moduleId?: string });
     };
     window.addEventListener(assignmentPublishedEvent, handlePublished);
     return () => window.removeEventListener(assignmentPublishedEvent, handlePublished);
   }, []);
 
+  const openPublishedLesson = () => {
+    if (published?.moduleId) window.sessionStorage.setItem(OPEN_MODULE_AFTER_PUBLISH_KEY, published.moduleId);
+    onNavigate("Программа");
+  };
+
   if (published) return <section className="assignment-publish-success content-panel">
     <div className="assignment-publish-success-icon"><ShieldCheck size={24} /></div>
     <span className="section-kicker">Статус задания</span>
     <h2>Задание опубликовано</h2>
-    <p><strong>{published.title}</strong> доступно ученикам в разделе «Задания» и связанном модуле.</p>
+    <p><strong>{published.title}</strong> доступно ученикам в разделе «Задания» и связанном уроке.</p>
     <div className="assignment-publish-success-actions">
       <button className="primary-button" onClick={() => { setPublished(null); setFormKey((value) => value + 1); }}><Plus size={16} /> Создать ещё одно</button>
-      <button className="secondary-button" onClick={() => onNavigate("Очередь проверки")}><ArrowUpRight size={16} /> Открыть очередь проверки</button>
+      <button className="secondary-button" onClick={openPublishedLesson}><ArrowUpRight size={16} /> Посмотреть опубликованное ДЗ</button>
     </div>
   </section>;
 
@@ -3455,85 +3242,15 @@ function useObjectUrl(file: File | null): string {
   return url;
 }
 
-// Kept as a compatibility reference while the canonical creator is used by both entry points.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function LegacyCreateAssignmentForm({ materialDraft }: { materialDraft: AssignmentMaterialDraft }) {
-  const [title, setTitle] = useState("");
-  const [moduleId, setModuleId] = useState("zones");
-  const [description, setDescription] = useState("");
-  const [deadline, setDeadline] = useState("2026-07-21");
-  const [attempts, setAttempts] = useState("2");
-  const [requirements, setRequirements] = useState(["", ""]);
-  const [formats, setFormats] = useState<SubmissionFormat[]>(["comment", "image"]);
-  const [published, setPublished] = useState(false);
-  const [publishing, setPublishing] = useState(false);
-  const [publishError, setPublishError] = useState("");
-  const selectedModule = studentDashboard.modules.find((module) => module.id === moduleId) ?? studentDashboard.modules[0];
-  const canPublish = title.trim().length > 3 && description.trim().length > 0 && requirements.some((requirement) => requirement.trim().length > 0) && formats.length > 0;
-
-  const updateRequirement = (index: number, value: string) => {
-    setRequirements((current) => current.map((requirement, requirementIndex) => requirementIndex === index ? value : requirement));
-    setPublished(false);
-  };
-
-  const toggleFormat = (format: SubmissionFormat) => {
-    setFormats((current) => current.includes(format) ? current.filter((item) => item !== format) : [...current, format]);
-    setPublished(false);
-  };
-
-  const publish = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!canPublish || published || publishing) return;
-    setPublishError("");
-    setPublishing(true);
-    let uploadedFileId: string | undefined;
-    try {
-      if (materialDraft.file) uploadedFileId = await uploadPrivateFile(materialDraft.file);
-      const materials = uploadedFileId
-        ? [{ kind: "FILE" as const, title: materialDraft.title.trim() || materialDraft.file?.name || "Материал к заданию", fileId: uploadedFileId }]
-        : materialDraft.url.trim()
-          ? [{ kind: "LINK" as const, title: materialDraft.title.trim() || "Материал к заданию", url: materialDraft.url.trim() }]
-          : [];
-      const response = await fetch(`${API_ORIGIN}/api/assignments`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: title.trim(),
-          description: description.trim(),
-          moduleNumber: selectedModule.number,
-          moduleTitle: selectedModule.title,
-          deadline: deadline || undefined,
-          requirements: requirements.map((requirement) => requirement.trim()).filter(Boolean),
-          allowedFormats: formats,
-          maxAttempts: Number(attempts),
-          materials,
-        }),
-      });
-      const payload = await response.json() as { data?: Assignment; message?: string };
-      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось опубликовать задание.");
-      setPublished(true);
-      window.dispatchEvent(new CustomEvent<Assignment & { materialsHandled: true }>(assignmentPublishedEvent, { detail: { ...payload.data, materialsHandled: true } }));
-    } catch (error) {
-      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
-      setPublishError(error instanceof Error ? error.message : "Не удалось опубликовать задание.");
-    } finally {
-      setPublishing(false);
-    }
-  };
-
-  return <form className="create-assignment-layout" onSubmit={publish}><section className="content-panel create-assignment-form"><div className="section-heading"><div><span className="section-kicker">НОВЫЙ МАТЕРИАЛ</span><h2>Параметры задания</h2></div><span className="draft-status">{published ? "Опубликовано" : "Черновик"}</span></div><div className="form-body"><label className="form-field form-field-wide"><span>Название задания</span><input value={title} onChange={(event) => { setTitle(event.target.value); setPublished(false); }} placeholder="Например, Разметка зон на истории" /></label><div className="form-grid"><label className="form-field"><span>Модуль</span><select value={moduleId} onChange={(event) => { setModuleId(event.target.value); setPublished(false); }}>{studentDashboard.modules.map((module) => <option value={module.id} key={module.id}>{module.number} · {module.title}</option>)}</select></label><label className="form-field"><span>Поток</span><select defaultValue="practicum-04"><option value="practicum-04">Практикум 04 · 18 учеников</option></select></label></div><label className="form-field form-field-wide"><span>Описание и контекст</span><textarea value={description} onChange={(event) => { setDescription(event.target.value); setPublished(false); }} placeholder="Объясни, что ученик должен сделать и зачем это нужно в системе..." rows={5} /></label><div className="form-section"><div className="form-section-heading"><div><span>Критерии выполнения</span><small>По ним куратор будет проверять работу.</small></div><button type="button" className="quiet-button" aria-label="Добавить критерий" onClick={() => setRequirements((current) => [...current, ""])}><Plus size={16} /></button></div><div className="requirement-editor">{requirements.map((requirement, index) => <div className="requirement-input" key={index}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => updateRequirement(index, event.target.value)} placeholder="Добавить критерий проверки" />{requirements.length > 1 && <button type="button" className="icon-button compact" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setRequirements((current) => current.filter((_, requirementIndex) => requirementIndex !== index))}><X size={14} /></button>}</div>)}</div></div><div className="form-grid"><label className="form-field"><span>Срок сдачи</span><input type="date" value={deadline} onChange={(event) => { setDeadline(event.target.value); setPublished(false); }} /></label><label className="form-field"><span>Попытки</span><input type="number" min="1" max="5" value={attempts} onChange={(event) => { setAttempts(event.target.value); setPublished(false); }} /></label></div><div className="form-section"><div className="form-section-heading"><div><span>Формат ответа</span><small>Что ученик сможет приложить к работе.</small></div></div><div className="format-options"><label className={`format-option ${formats.includes("comment") ? "active" : ""}`}><input type="checkbox" checked={formats.includes("comment")} onChange={() => toggleFormat("comment")} /><MessageSquareText size={16} /><span>Комментарий</span></label><label className={`format-option ${formats.includes("image") ? "active" : ""}`}><input type="checkbox" checked={formats.includes("image")} onChange={() => toggleFormat("image")} /><FileCheck2 size={16} /><span>Изображение</span></label><label className={`format-option ${formats.includes("video") ? "active" : ""}`}><input type="checkbox" checked={formats.includes("video")} onChange={() => toggleFormat("video")} /><Play size={16} /><span>Видео</span></label></div></div><div className="create-actions"><button type="button" className="secondary-button" onClick={() => { setTitle(""); setDescription(""); setRequirements(["", ""]); setFormats(["comment", "image"]); setPublished(false); setPublishError(""); }}>Очистить</button><button type="submit" className="primary-button" disabled={!canPublish || published}>{published ? "Задание опубликовано" : "Опубликовать задание"} <ChevronRight size={16} /></button></div>{publishError && <div className="file-error" role="alert">{publishError}</div>}{published && <div className="detail-feedback curator-decision"><Target size={17} /><div><strong>Задание опубликовано в потоке</strong><p>Ученики увидят его в разделе «Задания» и внутри связанного модуля.</p></div></div>}</div></section><aside className="content-panel assignment-preview"><div className="section-heading"><div><span className="section-kicker">ПРЕДПРОСМОТР</span><h2>Так увидит ученик</h2></div><EyeIcon /></div><div className="preview-body"><div className="preview-module">{selectedModule.number} · {selectedModule.title}</div><h3>{title || "Название нового задания"}</h3><p>{description || "Здесь появится описание задания и контекст, который увидит ученик перед началом работы."}</p><div className="preview-meta"><span><Clock3 size={14} /> {deadline || "Срок не выбран"}</span><span><FileCheck2 size={14} /> До {attempts || "0"} попыток</span></div><div className="preview-requirements"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span>{requirements.filter((requirement) => requirement.trim()).length > 0 ? requirements.filter((requirement) => requirement.trim()).map((requirement) => <div key={requirement}><span />{requirement}</div>) : <div className="preview-empty">Критерии появятся после заполнения формы.</div>}</div></div></aside></form>;
-}
-
 function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMaterialDraft }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [deadline, setDeadline] = useState("2026-07-21");
+  const [deadline, setDeadline] = useState(() => toDateKey(new Date()));
   const [requirements, setRequirements] = useState(["", ""]);
+  const [showCriteria, setShowCriteria] = useState(false);
   const [formats, setFormats] = useState<SubmissionFormat[]>(["comment", "image"]);
   const [courseModules, setCourseModules] = useState<CourseApiModule[]>([]);
   const [moduleId, setModuleId] = useState("");
-  const [lessonId, setLessonId] = useState("");
   const [courseLoading, setCourseLoading] = useState(true);
   const [courseError, setCourseError] = useState("");
   const [published, setPublished] = useState(false);
@@ -3548,19 +3265,14 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
         const payload = await response.json() as CourseApiPayload;
         if (!response.ok) throw new Error(response.status === 403 ? "Управление программой доступно только куратору." : "Не удалось загрузить программу.");
         const modules = payload.data?.modules ?? [];
-        if (modules.length === 0) throw new Error("В программе пока нет модулей и уроков.");
+        if (modules.length === 0) throw new Error("В программе пока нет уроков.");
 
         const targetModuleId = window.sessionStorage.getItem(ASSIGNMENT_TARGET_MODULE_KEY);
-        const targetLessonId = window.sessionStorage.getItem(ASSIGNMENT_TARGET_LESSON_KEY);
-        const targetModule = modules.find((module) => module.id === targetModuleId)
-          ?? modules.find((module) => module.lessons.some((lesson) => lesson.id === targetLessonId))
-          ?? modules[0];
-        const targetLesson = targetModule.lessons.find((lesson) => lesson.id === targetLessonId) ?? targetModule.lessons[0];
+        const targetModule = modules.find((module) => module.id === targetModuleId) ?? modules[0];
 
         if (!active) return;
         setCourseModules(modules);
         setModuleId(targetModule.id);
-        setLessonId(targetLesson?.id ?? "");
       } catch (reason) {
         if (active) setCourseError(reason instanceof Error ? reason.message : "Не удалось загрузить программу.");
       } finally {
@@ -3572,12 +3284,10 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
   }, []);
 
   const selectedModule = courseModules.find((module) => module.id === moduleId);
-  const selectedLesson = selectedModule?.lessons.find((lesson) => lesson.id === lessonId);
   const canPublish = !courseLoading
-    && Boolean(selectedModule && selectedLesson)
+    && Boolean(selectedModule)
     && title.trim().length > 3
     && description.trim().length > 0
-    && requirements.some((requirement) => requirement.trim().length > 0)
     && formats.length > 0;
 
   const updateRequirement = (index: number, value: string) => {
@@ -3592,7 +3302,7 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
 
   const publish = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!canPublish || !selectedModule || !selectedLesson || published || publishing) return;
+    if (!canPublish || !selectedModule || published || publishing) return;
     setPublishError("");
     setPublishing(true);
     let uploadedFileId: string | undefined;
@@ -3608,11 +3318,9 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
         credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          lessonId: selectedLesson.id,
+          moduleId: selectedModule.id,
           title: title.trim(),
           description: description.trim(),
-          moduleNumber: selectedModule.number,
-          moduleTitle: selectedModule.title,
           deadline: deadline || undefined,
           requirements: requirements.map((requirement) => requirement.trim()).filter(Boolean),
           allowedFormats: formats,
@@ -3623,8 +3331,7 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось опубликовать задание.");
       setPublished(true);
       window.sessionStorage.removeItem(ASSIGNMENT_TARGET_MODULE_KEY);
-      window.sessionStorage.removeItem(ASSIGNMENT_TARGET_LESSON_KEY);
-      window.dispatchEvent(new CustomEvent<Assignment & { materialsHandled: true }>(assignmentPublishedEvent, { detail: { ...payload.data, materialsHandled: true } }));
+      window.dispatchEvent(new CustomEvent<Assignment & { materialsHandled: true; moduleId: string }>(assignmentPublishedEvent, { detail: { ...payload.data, materialsHandled: true, moduleId: selectedModule.id } }));
     } catch (error) {
       if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
       setPublishError(error instanceof Error ? error.message : "Не удалось опубликовать задание.");
@@ -3644,23 +3351,17 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
 
   return <form className="create-assignment-layout" onSubmit={publish}>
     <section className="content-panel create-assignment-form">
-      <div className="section-heading">
-        <div><span className="section-kicker">НОВЫЙ МАТЕРИАЛ</span><h2>Параметры задания</h2></div>
-        <span className="draft-status">{published ? "Опубликовано" : "Черновик"}</span>
-      </div>
       <div className="form-body">
-        {courseLoading && <div className="module-action-feedback">Загружаем актуальные модули и уроки программы…</div>}
+        {courseLoading && <div className="module-action-feedback">Загружаем актуальные уроки программы…</div>}
         {courseError && <div className="file-error" role="alert">{courseError}</div>}
         <label className="form-field form-field-wide"><span>Название задания</span><input value={title} onChange={(event) => { setTitle(event.target.value); setPublished(false); }} placeholder="Например, Разметка зон на истории" /></label>
         <div className="form-grid">
-          <label className="form-field"><span>Модуль</span><select value={moduleId} disabled={courseLoading || courseModules.length === 0} onChange={(event) => { const nextModule = courseModules.find((module) => module.id === event.target.value); setModuleId(event.target.value); setLessonId(nextModule?.lessons[0]?.id ?? ""); setPublished(false); }}>{courseModules.map((module) => <option value={module.id} key={module.id}>{module.number} · {module.title}</option>)}</select></label>
-          <label className="form-field"><span>Урок</span><select value={lessonId} disabled={courseLoading || !selectedModule} onChange={(event) => { setLessonId(event.target.value); setPublished(false); }}>{selectedModule?.lessons.map((lesson) => <option value={lesson.id} key={lesson.id}>{String(lesson.position + 1).padStart(2, "0")} · {lesson.title}</option>)}</select></label>
+          <label className="form-field form-field-wide"><span>Урок</span><select value={moduleId} disabled={courseLoading || courseModules.length === 0} onChange={(event) => { setModuleId(event.target.value); setPublished(false); }}>{courseModules.map((module) => <option value={module.id} key={module.id}>{module.number} · {module.title}</option>)}</select></label>
         </div>
-        {selectedModule && selectedLesson && <div className="module-action-feedback">Задание будет опубликовано именно в уроке «{selectedLesson.title}» модуля «{selectedModule.title}».</div>}
         <label className="form-field form-field-wide"><span>Описание и контекст</span><textarea value={description} onChange={(event) => { setDescription(event.target.value); setPublished(false); }} placeholder="Объясни, что ученик должен сделать и зачем это нужно в системе…" rows={5} /></label>
         <div className="form-section">
-          <div className="form-section-heading"><div><span>Критерии выполнения</span><small>По ним куратор будет проверять работу.</small></div><button type="button" className="quiet-button" aria-label="Добавить критерий" onClick={() => setRequirements((current) => [...current, ""])}><Plus size={16} /></button></div>
-          <div className="requirement-editor">{requirements.map((requirement, index) => <div className="requirement-input" key={index}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => updateRequirement(index, event.target.value)} placeholder="Добавить критерий проверки" />{requirements.length > 1 && <button type="button" className="icon-button compact" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setRequirements((current) => current.filter((_, requirementIndex) => requirementIndex !== index))}><X size={14} /></button>}</div>)}</div>
+          <div className="form-section-heading"><div><span>Критерии выполнения</span><small>Ученик будет ориентироваться на них при выполнении.</small></div><button type="button" className="secondary-button compact-button" onClick={() => setShowCriteria((current) => !current)}>{showCriteria ? "Скрыть" : "Добавить критерии"}</button></div>
+          {showCriteria && <><div className="requirement-editor">{requirements.map((requirement, index) => <div className="requirement-input" key={index}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => updateRequirement(index, event.target.value)} placeholder="Добавить критерий проверки" />{requirements.length > 1 && <button type="button" className="icon-button compact" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setRequirements((current) => current.filter((_, requirementIndex) => requirementIndex !== index))}><X size={14} /></button>}</div>)}</div><button type="button" className="secondary-button compact-button requirement-add-button" onClick={() => setRequirements((current) => [...current, ""])}><Plus size={14} /> Добавить ещё критерий</button></>}
         </div>
         <label className="form-field"><span>Срок сдачи</span><input type="date" value={deadline} onChange={(event) => { setDeadline(event.target.value); setPublished(false); }} /></label>
         <div className="form-section"><div className="form-section-heading"><div><span>Формат ответа</span><small>Что ученик сможет приложить к работе.</small></div></div><div className="format-options"><label className={`format-option ${formats.includes("comment") ? "active" : ""}`}><input type="checkbox" checked={formats.includes("comment")} onChange={() => toggleFormat("comment")} /><MessageSquareText size={16} /><span>Комментарий</span></label><label className={`format-option ${formats.includes("image") ? "active" : ""}`}><input type="checkbox" checked={formats.includes("image")} onChange={() => toggleFormat("image")} /><FileCheck2 size={16} /><span>Изображение</span></label><label className={`format-option ${formats.includes("video") ? "active" : ""}`}><input type="checkbox" checked={formats.includes("video")} onChange={() => toggleFormat("video")} /><Play size={16} /><span>Видео</span></label></div></div>
@@ -3669,11 +3370,12 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
         {published && <div className="detail-feedback curator-decision"><Target size={17} /><div><strong>Задание опубликовано в выбранный урок</strong><p>Ученики увидят его в разделе «Задания» и внутри связанного урока.</p></div></div>}
       </div>
     </section>
-    <aside className="content-panel assignment-preview"><div className="section-heading"><div><span className="section-kicker">ПРЕДПРОСМОТР</span><h2>Так увидит ученик</h2></div><EyeIcon /></div><div className="preview-body"><div className="preview-module">{selectedModule ? `${selectedModule.number} · ${selectedModule.title}` : "Модуль не выбран"}</div><div className="preview-lesson">{selectedLesson?.title ?? "Урок не выбран"}</div><h3>{title || "Название нового задания"}</h3><p>{description || "Здесь появится описание задания и контекст, который увидит ученик перед началом работы."}</p><div className="preview-meta"><span><Clock3 size={14} /> {deadline || "Срок не выбран"}</span></div><div className="preview-requirements"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span>{requirements.filter((requirement) => requirement.trim()).length > 0 ? requirements.filter((requirement) => requirement.trim()).map((requirement) => <div key={requirement}><span />{requirement}</div>) : <div className="preview-empty">Критерии появятся после заполнения формы.</div>}</div></div></aside>
+    <aside className="content-panel assignment-preview"><div className="section-heading"><div><span className="section-kicker">ПРЕДПРОСМОТР</span><h2>Так увидит ученик</h2></div><EyeIcon /></div><div className="preview-body"><div className="preview-module">{selectedModule ? `${selectedModule.number} · ${selectedModule.title}` : "Урок не выбран"}</div><h3>{title || "Название нового задания"}</h3><p>{description || "Здесь появится описание задания и контекст, который увидит ученик перед началом работы."}</p><div className="preview-meta"><span><Clock3 size={14} /> {deadline || "Срок не выбран"}</span></div><div className="preview-requirements"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span>{requirements.filter((requirement) => requirement.trim()).length > 0 ? requirements.filter((requirement) => requirement.trim()).map((requirement) => <div key={requirement}><span />{requirement}</div>) : <div className="preview-empty">Критерии появятся после заполнения формы.</div>}</div></div></aside>
   </form>;
 }
 
 function CreateAssignmentMaterialPanel() {
+  const [expanded, setExpanded] = useState(false);
   const [title, setTitle] = useState("");
   const [url, setUrl] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -3711,7 +3413,7 @@ function CreateAssignmentMaterialPanel() {
     return () => window.removeEventListener(assignmentPublishedEvent, handlePublished);
   }, [file, title, url]);
 
-  return <section className="content-panel assignment-material-panel"><div className="section-heading"><div><span className="section-kicker">ДОПОЛНИТЕЛЬНЫЕ МАТЕРИАЛЫ</span><h2>Что увидит ученик перед ответом</h2><p className="section-heading-note">Можно добавить одновременно ссылку Vimeo/Notion и несколько файлов к одному заданию.</p></div></div><div className="assignment-material-editor"><div className="form-grid"><label className="form-field"><span>Название материала</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Запись разбора или пример" /></label><label className="form-field"><span>Ссылка Vimeo/Notion</span><input type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://vimeo.com/..." /></label></div><label className={`file-dropzone ${file ? "has-file" : ""}`} htmlFor="curator-assignment-material"><FileCheck2 size={17} /><span>{file?.name || "Прикрепить изображение, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ</small><input id="curator-assignment-material" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { const next = event.target.files?.[0] ?? null; if (next && next.size > 10 * 1024 * 1024) { setStatus("Файл слишком большой. Максимальный размер — 10 МБ."); return; } setStatus(""); setFile(next); }} /></label>{status && <div className="detail-feedback"><Target size={17} /><div><strong>{status}</strong><p>Сначала опубликуй задание основной кнопкой выше. Материалы сохранятся в защищённом хранилище.</p></div></div>}</div></section>;
+  return <section className="content-panel assignment-material-panel"><div className="section-heading"><div><span className="section-kicker">ДОПОЛНИТЕЛЬНЫЕ МАТЕРИАЛЫ</span><h2>Что увидит ученик перед ответом</h2><p className="section-heading-note">Не обязательно — можно добавить ссылку Vimeo/Notion и файлы, если они нужны для этого задания.</p></div><button type="button" className="secondary-button" onClick={() => setExpanded((current) => !current)}>{expanded ? "Скрыть" : "Прикрепить материал"}</button></div>{expanded && <div className="assignment-material-editor"><div className="form-grid"><label className="form-field"><span>Название материала</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Запись разбора или пример" /></label><label className="form-field"><span>Ссылка Vimeo/Notion</span><input type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://vimeo.com/..." /></label></div><label className={`file-dropzone ${file ? "has-file" : ""}`} htmlFor="curator-assignment-material"><FileCheck2 size={17} /><span>{file?.name || "Прикрепить изображение, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ</small><input id="curator-assignment-material" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { const next = event.target.files?.[0] ?? null; if (next && next.size > 10 * 1024 * 1024) { setStatus("Файл слишком большой. Максимальный размер — 10 МБ."); return; } setStatus(""); setFile(next); }} /></label>{status && <div className="detail-feedback"><Target size={17} /><div><strong>{status}</strong><p>Сначала опубликуй задание основной кнопкой выше. Материалы сохранятся в защищённом хранилище.</p></div></div>}</div>}</section>;
 }
 
 function AssignmentMaterialLivePreview({ draft }: { draft: AssignmentMaterialDraft }) {
@@ -3757,21 +3459,17 @@ function EyeIcon() {
 
 type ModuleContentItem = { id: string; kind: "Урок" | "Стрим" | "Задание"; tone: "lesson" | "stream" | "task"; title: string; meta: string };
 
-function moduleContentFor(module: PracticumModule, lessons: readonly CourseLesson[] = []): ModuleContentItem[] {
-  if (lessons.length > 0) {
-    const fallback = moduleContentFor(module);
-    return lessons.flatMap((lesson, index) => {
-      const template = fallback[index] ?? fallback[fallback.length - 1];
-      const safeLessonTitle = /\?{3,}/.test(lesson.title) ? `Урок ${String(index + 1).padStart(2, "0")}` : lesson.title;
-      const lessonItems: ModuleContentItem[] = lesson.type === "STREAM" || lesson.type === "ASSIGNMENT" ? [] : [{ id: lesson.id, kind: template.kind, tone: template.tone, title: safeLessonTitle, meta: "Материал урока" }];
-      const mediaItems: ModuleContentItem[] = lesson.media
-        .filter((media) => media.status === "PUBLISHED")
-        .map((media) => ({ id: media.id, kind: fallback[1]?.kind ?? template.kind, tone: "stream", title: media.title ?? safeLessonTitle, meta: `Запись · ${formatDuration(media.durationSec)}` }));
-      const assignmentItems: ModuleContentItem[] = lesson.assignments
-        .filter((assignment) => !/(тестов|тестов|урок\s*0[789]|\?{3,})/i.test(assignment.title))
-        .map((assignment, assignmentIndex) => ({ id: assignment.id, kind: fallback[2]?.kind ?? template.kind, tone: "task", title: /\?{3,}/.test(assignment.title) ? `Домашнее задание ${assignmentIndex + 1}` : assignment.title, meta: "Отправка работы" }));
-      return [...lessonItems, ...mediaItems, ...assignmentItems];
-    });
+function moduleContentFor(module: PracticumModule, content?: CourseApiModule): ModuleContentItem[] {
+  if (content && (content.media.length > 0 || content.assignments.length > 0)) {
+    const mediaItems: ModuleContentItem[] = content.media
+      .filter((media) => media.status === "PUBLISHED")
+      .map((media) => {
+        const isLessonVideo = media.kind === "LESSON_VIDEO";
+        return { id: media.id, kind: isLessonVideo ? "Урок" : "Стрим", tone: isLessonVideo ? "lesson" : "stream", title: media.title ?? module.title, meta: `Запись · ${formatDuration(media.durationSec)}` };
+      });
+    const assignmentItems: ModuleContentItem[] = content.assignments
+      .map((assignment) => ({ id: assignment.id, kind: "Задание", tone: "task", title: assignment.title, meta: "Отправка работы" }));
+    return [...mediaItems, ...assignmentItems];
   }
 
   return [
@@ -3807,7 +3505,7 @@ function CourseView({ unlockedModuleIds: initialUnlockedModuleIds, onOpenAssignm
   }, []);
 
   const courseModules = liveCourse?.modules ?? defaultCourseModules;
-  const courseLessons = liveCourse?.lessonsByModule ?? {};
+  const courseContent = liveCourse?.contentByModule ?? {};
   // During local visual QA keep every module interactive so the full course
   // composition can be reviewed without changing production access rules.
   const effectiveUnlockedModuleIds = process.env.NODE_ENV === "development"
@@ -3825,14 +3523,9 @@ function CourseView({ unlockedModuleIds: initialUnlockedModuleIds, onOpenAssignm
   const moduleToOpen = continued ? (openedModule ?? selectedModule) : undefined;
   const practicumProgress = calculatePracticumProgress(courseModules);
   const sectionOrder: PracticumSection[] = ["Welcome", "Education", "Q&A", "Practice"];
-  const moduleContents = moduleContentFor(selectedModule, courseLessons[selectedModule.id]);
+  const moduleContents = moduleContentFor(selectedModule, courseContent[selectedModule.id]);
   const selectedContent = moduleContents.find((item) => item.id === selectedContentId) ?? moduleContents[0];
   const moduleUnlocked = effectiveUnlockedModuleIds.has(selectedModule.id);
-
-  useEffect(() => {
-    const moduleCountNode = document.querySelector<HTMLElement>(".learner-course-view .course-map .progress-inline");
-    moduleCountNode?.setAttribute("data-module-count", String(practicumModules.length));
-  }, [practicumModules.length]);
 
   useEffect(() => {
     const moduleRows = document.querySelectorAll<HTMLButtonElement>(".learner-course-view .course-map .module-row");
@@ -3847,12 +3540,12 @@ function CourseView({ unlockedModuleIds: initialUnlockedModuleIds, onOpenAssignm
     });
   }, [practicumModules]);
 
-  if (moduleToOpen) return <ModuleOverviewPage module={moduleToOpen} lessons={courseLessons[moduleToOpen.id]} onOpenAssignment={onOpenAssignment} onOpenDiscussion={onOpenDiscussion} onBack={() => { setOpenedModuleId(null); setContinued(false); }} />;
+  if (moduleToOpen) return <ModuleOverviewPage module={moduleToOpen} content={courseContent[moduleToOpen.id]} onOpenAssignment={onOpenAssignment} onOpenDiscussion={onOpenDiscussion} onBack={() => { setOpenedModuleId(null); setContinued(false); }} />;
 
   const moduleSteps = [
-    { label: "Уроки и материалы", description: `${selectedModule.lessons} уроков в модуле`, icon: <BookOpen size={16} />, complete: selectedModule.progress > 0 },
+    { label: "Материалы урока", description: `${pluralizeMaterials(selectedModule.lessons)} в уроке`, icon: <BookOpen size={16} />, complete: selectedModule.progress > 0 },
     { label: "Практическое задание", description: moduleUnlocked ? "Закрепи материал в своей работе" : "Откроется после предыдущего блока", icon: <Target size={16} />, complete: selectedModule.progress === 100 },
-    { label: "Проверка куратора", description: selectedModule.progress === 100 ? "Модуль завершён" : "После отправки задания", icon: <FileCheck2 size={16} />, complete: selectedModule.progress === 100 },
+    { label: "Проверка куратора", description: selectedModule.progress === 100 ? "Урок завершён" : "После отправки задания", icon: <FileCheck2 size={16} />, complete: selectedModule.progress === 100 },
   ];
 
   return <div className="course-page">
@@ -3863,7 +3556,7 @@ function CourseView({ unlockedModuleIds: initialUnlockedModuleIds, onOpenAssignm
       <div className="course-progress-fact"><span>ДОСТУП</span><div className="course-progress-fact-highlight"><strong>Материалы останутся после завершения</strong><small>Записи, уроки и проверенные работы будут сохранены в профиле.</small></div></div>
     </section>
 
-    <div className="course-workspace"><section className="content-panel course-map"><div className="section-heading"><div><h2>Структура курса</h2></div><span className="progress-inline">{practicumProgress}% пройдено</span></div><div className="module-sections">{sectionOrder.map((section) => { const sectionModules = practicumModules.filter((module) => module.section === section); return <section className="module-section" key={section}><div className="module-section-heading"><strong>{section}</strong><span>{sectionModules.length} {sectionModules.length === 1 ? "блок" : "блока"}</span></div><div className="module-list">{sectionModules.map((module) => { const unlocked = unlockedModuleIds.has(module.id); return <button className={`module-row ${hasUserSelectedModule && selectedModule.id === module.id ? "selected" : ""} ${unlocked ? "" : "locked"}`} key={module.id} onClick={() => { if (unlocked) { setSelectedId(module.id); setSelectedContentId(`${module.id}-lesson`); setOpenedModuleId(module.id); setHasUserSelectedModule(true); } }} aria-pressed={hasUserSelectedModule && selectedModule.id === module.id} disabled={!unlocked}><span className="module-number">{module.number}</span><div className="module-copy"><strong>{module.title}</strong><span>{unlocked ? module.status : "Закрыт"} · {module.lessons} {module.lessons === 1 ? "урок" : "урока"}</span></div><div className="module-progress"><span>{module.progress}%</span><i><b style={{ width: `${module.progress}%` }} /></i></div>{unlocked ? <ChevronRight size={16} /> : <LockKeyhole size={15} />}</button>; })}</div></section>; })}</div><div className="course-map-footer"><span>Закрытые блоки откроются после завершения предыдущего этапа и разблокировки куратором.</span><button className="text-button" onClick={() => { setSelectedId("week-1"); setSelectedContentId("week-1-lesson"); setHasUserSelectedModule(true); }}>Вернуться к текущему <ChevronRight size={15} /></button></div></section><section className="content-panel module-detail"><div className="module-detail-head"><div><span className="section-kicker">УРОК {selectedModule.number}</span><h2>{selectedModule.title}</h2></div>{moduleUnlocked ? <Target size={19} className="heading-icon" /> : <LockKeyhole size={19} className="heading-icon" />}</div><div className="module-detail-body"><div className="module-detail-summary"><div className="module-progress-large"><strong>{selectedModule.progress}%</strong><span>пройдено</span></div><p>{selectedModule.description}</p></div><div className="module-detail-meta"><span><BookOpen size={14} /> {selectedModule.lessons} {selectedModule.lessons === 1 ? "урок" : "урока"}</span><span><FileCheck2 size={14} /> {moduleUnlocked ? "Материалы доступны" : "Доступ ограничен"}</span></div><div className="module-content-block"><div className="module-content-heading"><span>СОДЕРЖАНИЕ УРОКА</span><small>{moduleContents.length} элемента</small></div><div className="module-content-list">{moduleContents.map((item) => <button className={`module-content-item ${item.tone} ${selectedContent.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedContentId(item.id)} disabled={!moduleUnlocked}><span className="module-content-kind">{item.kind}</span><span className="module-content-copy"><strong>{item.title}</strong><small>{item.meta}</small></span><ChevronRight size={16} /></button>)}</div><div className="module-content-preview"><span>ВЫБРАНО</span><strong>{selectedContent.title}</strong><small>{selectedContent.kind} · {selectedContent.meta} · Откроется внутри платформы</small></div></div><div className="module-steps"><span className="detail-label">КАК ПРОХОДИТ МОДУЛЬ</span>{moduleSteps.map((step, index) => <div className={`module-step ${step.complete ? "complete" : ""} ${moduleUnlocked ? "" : "locked"}`} key={step.label}><div className="module-step-icon">{moduleUnlocked ? step.icon : <LockKeyhole size={15} />}</div><div><strong>{String(index + 1).padStart(2, "0")} · {step.label}</strong><span>{step.description}</span></div><small>{moduleUnlocked ? (step.complete ? "Готово" : "Дальше") : "Закрыто"}</small></div>)}</div>{moduleUnlocked ? <><div className="next-lesson"><span className="section-kicker">СЛЕДУЮЩИЙ ШАГ</span><strong>{selectedModule.progress === 100 ? "Повторить ключевые уроки" : "Продолжить с последнего урока"}</strong><span>{continued ? "Шаг отмечен для продолжения" : "Материалы и прогресс сохранятся в профиле"}</span></div><button className="primary-button open-module-button" onClick={() => setContinued(true)}><span>{continued ? "Продолжение открыто" : selectedModule.progress === 100 ? "Открыть урок" : "Продолжить обучение"}</span><span className="open-module-button-arrow" aria-hidden="true"><ChevronRight size={17} /></span></button></> : <div className="locked-note"><LockKeyhole size={17} /><div><strong>Урок пока закрыт</strong><span>Дождись разблокировки блока куратором, чтобы открыть материалы.</span></div></div>}</div></section></div>
+    <div className="course-workspace"><section className="content-panel course-map"><div className="section-heading"><div><h2>Структура курса</h2></div><span className="progress-inline">{pluralizeLessons(practicumModules.length)}</span></div><div className="module-sections">{sectionOrder.map((section) => { const sectionModules = practicumModules.filter((module) => module.section === section); return <section className="module-section" key={section}><div className="module-section-heading"><strong>{section}</strong><span>{pluralizeLessons(sectionModules.length)}</span></div><div className="module-list">{sectionModules.map((module) => { const unlocked = unlockedModuleIds.has(module.id); return <button className={`module-row ${hasUserSelectedModule && selectedModule.id === module.id ? "selected" : ""} ${unlocked ? "" : "locked"}`} key={module.id} onClick={() => { if (unlocked) { setSelectedId(module.id); setSelectedContentId(`${module.id}-lesson`); setOpenedModuleId(module.id); setHasUserSelectedModule(true); } }} aria-pressed={hasUserSelectedModule && selectedModule.id === module.id} disabled={!unlocked}><span className="module-number">{module.number}</span><div className="module-copy"><strong>{module.title}</strong><span>{unlocked ? module.status : "Закрыт"} · {pluralizeMaterials(module.lessons)}</span></div><div className="module-progress"><span>{module.progress}%</span><i><b style={{ width: `${module.progress}%` }} /></i></div>{unlocked ? <ChevronRight size={16} /> : <LockKeyhole size={15} />}</button>; })}</div></section>; })}</div><div className="course-map-footer"><span>Закрытые уроки откроются после завершения предыдущего этапа и разблокировки куратором.</span><button className="text-button" onClick={() => { setSelectedId("week-1"); setSelectedContentId("week-1-lesson"); setHasUserSelectedModule(true); }}>Вернуться к текущему <ChevronRight size={15} /></button></div></section><section className="content-panel module-detail"><div className="module-detail-head"><div><span className="section-kicker">УРОК {selectedModule.number}</span><h2>{selectedModule.title}</h2></div>{moduleUnlocked ? <Target size={19} className="heading-icon" /> : <LockKeyhole size={19} className="heading-icon" />}</div><div className="module-detail-body"><div className="module-detail-summary"><div className="module-progress-large"><strong>{selectedModule.progress}%</strong><span>пройдено</span></div><p>{selectedModule.description}</p></div><div className="module-detail-meta"><span><BookOpen size={14} /> {pluralizeMaterials(selectedModule.lessons)}</span><span><FileCheck2 size={14} /> {moduleUnlocked ? "Материалы доступны" : "Доступ ограничен"}</span></div><div className="module-content-block"><div className="module-content-heading"><span>СОДЕРЖАНИЕ УРОКА</span><small>{moduleContents.length} элемента</small></div><div className="module-content-list">{moduleContents.map((item) => <button className={`module-content-item ${item.tone} ${selectedContent.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedContentId(item.id)} disabled={!moduleUnlocked}><span className="module-content-kind">{item.kind}</span><span className="module-content-copy"><strong>{item.title}</strong><small>{item.meta}</small></span><ChevronRight size={16} /></button>)}</div><div className="module-content-preview"><span>ВЫБРАНО</span><strong>{selectedContent.title}</strong><small>{selectedContent.kind} · {selectedContent.meta} · Откроется внутри платформы</small></div></div><div className="module-steps"><span className="detail-label">КАК ПРОХОДИТ УРОК</span>{moduleSteps.map((step, index) => <div className={`module-step ${step.complete ? "complete" : ""} ${moduleUnlocked ? "" : "locked"}`} key={step.label}><div className="module-step-icon">{moduleUnlocked ? step.icon : <LockKeyhole size={15} />}</div><div><strong>{String(index + 1).padStart(2, "0")} · {step.label}</strong><span>{step.description}</span></div><small>{moduleUnlocked ? (step.complete ? "Готово" : "Дальше") : "Закрыто"}</small></div>)}</div>{moduleUnlocked ? <><div className="next-lesson"><span className="section-kicker">СЛЕДУЮЩИЙ ШАГ</span><strong>{selectedModule.progress === 100 ? "Повторить ключевые уроки" : "Продолжить с последнего урока"}</strong><span>{continued ? "Шаг отмечен для продолжения" : "Материалы и прогресс сохранятся в профиле"}</span></div><button className="primary-button open-module-button" onClick={() => setContinued(true)}><span>{continued ? "Продолжение открыто" : selectedModule.progress === 100 ? "Открыть урок" : "Продолжить обучение"}</span><span className="open-module-button-arrow" aria-hidden="true"><ChevronRight size={17} /></span></button></> : <div className="locked-note"><LockKeyhole size={17} /><div><strong>Урок пока закрыт</strong><span>Дождись разблокировки куратором, чтобы открыть материалы.</span></div></div>}</div></section></div>
   </div>;
 }
 
@@ -3888,111 +3581,20 @@ function modulePageContentFor(module: PracticumModule) {
   };
 }
 
-function ModuleOverviewPageLegacy({ module, lessons = [], onOpenAssignment, onOpenDiscussion, onBack }: { module: PracticumModule; lessons?: readonly CourseLesson[]; onOpenAssignment: (assignmentId: string) => void; onOpenDiscussion: (context: DiscussionContext) => void; onBack: () => void }) {
+function ModuleOverviewPage({ module, content: courseContent, onOpenAssignment, onOpenDiscussion, onBack }: { module: PracticumModule; content?: CourseApiModule; onOpenAssignment: (assignmentId: string) => void; onOpenDiscussion: (context: DiscussionContext) => void; onBack: () => void }) {
   const baseContent = modulePageContentFor(module);
-  const linkedAssignmentData = lessons.flatMap((lesson) => lesson.assignments)[0];
-  const linkedAssignment: Assignment | undefined = linkedAssignmentData ? {
-    ...linkedAssignmentData,
-    module: `${module.number} · ${module.title}`,
-    status: "Не начато",
-    tone: "gray",
-    date: "",
-    deadline: linkedAssignmentData.deadline ? `Срок: ${linkedAssignmentData.deadline}` : "Срок не указан",
-  } : undefined;
-  const content = linkedAssignment && linkedAssignment.requirements.length > 0
-    ? { ...baseContent, homework: linkedAssignment.requirements }
-    : baseContent;
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const modalVideoRef = useRef<HTMLVideoElement>(null);
-  const modalEmbedRef = useRef<HTMLIFrameElement>(null);
-  const [playing, setPlaying] = useState(false);
-  const [playerOpen, setPlayerOpen] = useState(false);
-  const [assignmentOpen, setAssignmentOpen] = useState(false);
-  const [discussionOpened, setDiscussionOpened] = useState(false);
-  const mediaEntries = lessons.flatMap((lesson) => lesson.media
-    .filter((media) => media.status === "PUBLISHED" && media.embedUrl)
-    .map((media) => ({ ...media, lessonTitle: lesson.title })));
-  const [selectedMediaId, setSelectedMediaId] = useState("");
-  const selectedMedia = mediaEntries.find((media) => media.id === selectedMediaId) ?? mediaEntries[0];
-  const lessonVideo: LessonVideo | undefined = selectedMedia?.embedUrl
-    ? { title: selectedMedia.title ?? selectedMedia.lessonTitle, source: "vimeo", url: selectedMedia.embedUrl, duration: formatDuration(selectedMedia.durationSec) }
-    : undefined;
-  const openPlayer = () => {
-    videoRef.current?.pause();
-    setPlayerOpen(true);
-  };
-  const closePlayer = () => {
-    modalVideoRef.current?.pause();
-    setPlayerOpen(false);
-    setPlaying(false);
-  };
-  const requestFullscreen = () => {
-    const player = lessonVideo?.source === "vimeo" ? modalEmbedRef.current : modalVideoRef.current;
-    if (!player) return;
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else void player.requestFullscreen();
-  };
-  useEffect(() => {
-    if (!playerOpen) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closePlayer();
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [playerOpen]);
-  const openAssignment = () => {
-    if (linkedAssignment) setAssignmentOpen(true);
-    else onOpenAssignment("");
-  };
-  useEffect(() => {
-    if (!discussionOpened) return;
-    onOpenDiscussion({ module: `${module.number} · ${module.title}`, lesson: lessons[0]?.title ?? module.title, coverPath: module.coverPath, moduleId: module.id, lessonId: lessons[0]?.id });
-  }, [discussionOpened, lessons, module.coverPath, module.id, module.number, module.title, onOpenDiscussion]);
-
-  const streamTitle = lessonVideo?.title ?? content.streamTitle;
-  const streamDuration = lessonVideo?.duration ?? content.streamMeta.replace("Р—Р°РїСЃСЊ СЃС‚СЂРёРјР° В· ", "");
-  if (mediaEntries.length < 0) {
-  const streamDuration = lessonVideo?.duration ?? content.streamMeta.replace("Запись стрима · ", "");
-
- return <div className="module-page"><div className="module-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к структуре</button><span className="module-page-breadcrumb">{module.section} / {module.title}</span></div><header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> МОДУЛЬ {module.number}</span><h2>{module.title}</h2><p>{module.description}</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header><div className="module-resource-grid"><section className="module-resource-card module-description-card"><div className="module-resource-heading"><BookOpen size={17} /><h3>Описание</h3></div><p>{module.description} Здесь собраны основные идеи, которые нужно понять перед практикой.</p></section><section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Запись стрима</h3><span>{lessonVideo ? "Материал урока" : "Демо-плеер"}</span></div><div className="module-video-stage">{lessonVideo?.source === "vimeo" ? <iframe src={lessonVideo.url} title={streamTitle} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /> : <video ref={videoRef} src={lessonVideo?.url ?? "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"} poster="/market-logic-cover.png" preload="metadata" controls onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} />}<span className="module-video-label">{streamTitle}</span><button className={`play-button ${playing ? "is-playing" : ""}`} aria-label="Открыть плеер" onClick={openPlayer}><Play size={18} fill="currentColor" /></button><span className="stream-duration">{playing ? "ВОСПРОИЗВЕДЕНИЕ" : streamDuration}</span></div></section><section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{content.homework.length} пункта</span></div><ol>{content.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button" onClick={openAssignment}>{assignmentOpen ? "Задание открыто" : "Открыть задание"} <ChevronRight size={16} /></button>{assignmentOpen && <div className="module-action-feedback">Форма задания открыта поверх модуля.</div>}</section><section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>Разобрано на стриме</span></div><ul>{content.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button" onClick={() => setDiscussionOpened((current) => !current)}>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"} <ChevronRight size={16} /></button>{discussionOpened && <div className="module-action-feedback">Здесь появится ветка вопросов и ответов по модулю.</div>}</section></div>{playerOpen && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${streamTitle}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">ЗАПИСЬ СТРИМА</span><strong>{streamTitle}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{lessonVideo?.source === "vimeo" ? <iframe ref={modalEmbedRef} src={lessonVideo.url} title={streamTitle} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /> : <video ref={modalVideoRef} src={lessonVideo?.url ?? "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"} poster="/market-logic-cover.png" controls autoPlay playsInline onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} />}<div className="video-modal-foot"><span>{lessonVideo ? "Запись доступна внутри урока" : "Демо-видео · будущая запись будет открываться здесь"}</span><button className="secondary-button" onClick={requestFullscreen}><Maximize2 size={15} /> На весь экран</button></div></div></div>}{assignmentOpen && linkedAssignment && <div className="assignment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Задание: ${linkedAssignment.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setAssignmentOpen(false); }}><div className="assignment-modal"><div className="assignment-modal-head"><div><span className="section-kicker">ЗАДАНИЕ К МОДУЛЮ</span><strong>{linkedAssignment.title}</strong></div><button className="icon-button" aria-label="Закрыть задание" onClick={() => setAssignmentOpen(false)}><X size={18} /></button></div><AssignmentDetail assignment={linkedAssignment} /></div></div>}</div>;
-  }
-  return <div className="module-page">
-    <div className="module-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к структуре</button><span className="module-page-breadcrumb">{module.section} / {module.title}</span></div>
-    <header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> МОДУЛЬ {module.number}</span><h2>{module.title}</h2><p>{module.description}</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header>
-    <div className="module-resource-grid">
-      <section className="module-resource-card module-description-card"><div className="module-resource-heading"><BookOpen size={17} /><h3>Описание</h3></div><p>{module.description} Здесь собраны основные идеи, которые нужно понять перед практикой.</p></section>
-      <section className="module-resource-card module-stream-card">
-        <div className="module-resource-heading"><Play size={17} /><h3>Записи блока</h3><span>{mediaEntries.length} {mediaEntries.length === 1 ? "запись" : "записи"}</span></div>
-        {lessonVideo ? <div className="module-video-stage"><iframe src={lessonVideo!.url} title={streamTitle} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /><span className="module-video-label">{streamTitle}</span><button className={`play-button ${playing ? "is-playing" : ""}`} aria-label="Открыть плеер" onClick={openPlayer}><Play size={18} fill="currentColor" /></button><span className="stream-duration">{playing ? "ВОСПРОИЗВЕДЕНИЕ" : streamDuration}</span></div> : <div className="module-media-empty"><Play size={20} /><strong>Записей пока нет</strong><span>Куратор опубликует их по ходу этого блока.</span></div>}
-        {mediaEntries.length > 0 && <div className="module-media-playlist">{mediaEntries.map((media, index) => <button className={`module-media-item ${media.id === selectedMedia?.id ? "selected" : ""}`} key={media.id} onClick={() => { setSelectedMediaId(media.id); setPlaying(false); }}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{media.title ?? media.lessonTitle}</strong><small>{mediaKindLabel(media.kind)} · {media.lessonTitle} · {formatDuration(media.durationSec)}</small></div><Play size={15} /></button>)}</div>}
-      </section>
-      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{content.homework.length} пункта</span></div><ol>{content.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button" onClick={openAssignment}>{assignmentOpen ? "Задание открыто" : "Открыть задание"} <ChevronRight size={16} /></button>{assignmentOpen && <div className="module-action-feedback">Форма задания открыта поверх модуля.</div>}</section>
-      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>Разобрано на стриме</span></div><ul>{content.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button" onClick={() => setDiscussionOpened((current) => !current)}>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"} <ChevronRight size={16} /></button>{discussionOpened && <div className="module-action-feedback">Здесь появится ветка вопросов и ответов по модулю.</div>}</section>
-    </div>
-    {playerOpen && lessonVideo && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${streamTitle}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">ЗАПИСЬ БЛОКА</span><strong>{streamTitle}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div><iframe ref={modalEmbedRef} src={lessonVideo!.url} title={streamTitle} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /><div className="video-modal-foot"><span>Запись доступна внутри урока</span><button className="secondary-button" onClick={requestFullscreen}><Maximize2 size={15} /> На весь экран</button></div></div></div>}
-  </div>;
-}
-
-void ModuleOverviewPageLegacy;
-
-function ModuleOverviewPage({ module, lessons = [], onOpenAssignment, onOpenDiscussion, onBack }: { module: PracticumModule; lessons?: readonly CourseLesson[]; onOpenAssignment: (assignmentId: string) => void; onOpenDiscussion: (context: DiscussionContext) => void; onBack: () => void }) {
-  const baseContent = modulePageContentFor(module);
-  const linkedAssignmentData = lessons.flatMap((lesson) => lesson.assignments)[0];
-  const linkedAssignment: Assignment | undefined = linkedAssignmentData ? { ...linkedAssignmentData, module: `${module.number} · ${module.title}`, status: "Не начато", tone: "gray", date: "", deadline: linkedAssignmentData.deadline ? `Срок: ${linkedAssignmentData.deadline}` : "Срок не указан" } : undefined;
-  const content = linkedAssignment && linkedAssignment.requirements.length > 0 ? { ...baseContent, homework: linkedAssignment.requirements } : baseContent;
+  const assignments = courseContent?.assignments ?? [];
+  const hasRealAssignments = assignments.length > 0;
   const modalEmbedRef = useRef<HTMLDivElement>(null);
   const [fullscreenMediaId, setFullscreenMediaId] = useState("");
   const [discussionOpened, setDiscussionOpened] = useState(false);
-  const mediaEntries = lessons.flatMap((lesson) => lesson.media.filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({ ...media, lessonTitle: lesson.title })));
+  const mediaEntries = (courseContent?.media ?? []).filter((media) => media.status === "PUBLISHED" && media.embedUrl);
   const thematicMediaEntries = mediaEntries.filter((media) => media.kind !== "QA");
   const qaMediaEntries = mediaEntries.filter((media) => media.kind === "QA");
   const fullscreenMedia = [...thematicMediaEntries, ...qaMediaEntries].find((media) => media.id === fullscreenMediaId);
   const openPlayer = (mediaId: string) => setFullscreenMediaId(mediaId);
   const closePlayer = () => setFullscreenMediaId("");
   const requestFullscreen = () => { const player = modalEmbedRef.current; if (!player) return; if (document.fullscreenElement) void document.exitFullscreen(); else void player.requestFullscreen(); };
-  // Keep assignment work on the dedicated page instead of opening a modal over the lesson.
-  // Passing the id lets the assignments inbox select the exact assignment the student clicked.
-  const openAssignment = () => onOpenAssignment(linkedAssignment?.id ?? "");
   useEffect(() => {
     if (!fullscreenMediaId) return;
     const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") closePlayer(); };
@@ -4000,18 +3602,18 @@ function ModuleOverviewPage({ module, lessons = [], onOpenAssignment, onOpenDisc
   }, [fullscreenMediaId]);
   useEffect(() => {
     if (!discussionOpened) return;
-    onOpenDiscussion({ module: `${module.number} · ${module.title}`, lesson: lessons[0]?.title ?? module.title, coverPath: module.coverPath, moduleId: module.id, lessonId: lessons[0]?.id });
-  }, [discussionOpened, lessons, module.coverPath, module.id, module.number, module.title, onOpenDiscussion]);
+    onOpenDiscussion({ module: `${module.number} · ${module.title}`, coverPath: module.coverPath, moduleId: module.id });
+  }, [discussionOpened, module.coverPath, module.id, module.number, module.title, onOpenDiscussion]);
 
   return <div className="module-page">
     <div className="module-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к структуре</button><span className="module-page-breadcrumb">{module.section} / {module.title}</span></div>
-    <header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> МОДУЛЬ {module.number}</span><h2>{module.title}</h2><p>{module.description}</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header>
+    <header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> УРОК {module.number}</span><h2>{module.title}</h2><p>{module.description}</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header>
     <div className="module-resource-grid">
-      <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMediaEntries.length} {thematicMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{thematicMediaEntries.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических записей пока нет</strong><span>Куратор опубликует их по ходу этого блока.</span></div> : <div className="module-video-stack">{thematicMediaEntries.map((media) => <div className="module-video-stage" key={media.id}>{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? media.lessonTitle} />}<span className="module-video-label">{media.title ?? media.lessonTitle}</span><button className="play-button" aria-label="Открыть на весь экран" onClick={() => openPlayer(media.id)}><Play size={18} fill="currentColor" /></button><span className="stream-duration">{formatDuration(media.durationSec)}</span></div>)}</div>}</section>
-      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{content.homework.length} пункта</span></div><ol>{content.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button resource-action-button" onClick={openAssignment}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></section>
-      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMediaEntries.length} {qaMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{qaMediaEntries.length > 0 && <div className="module-video-stack">{qaMediaEntries.map((media) => <div className="module-qa-video-stage" key={media.id}>{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? "Q&A с куратором"} />}<span>{media.title ?? "Q&A с куратором"}</span></div>)}</div>}<ul>{content.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button resource-action-button" onClick={() => setDiscussionOpened((current) => !current)}><span>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"}</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button>{qaMediaEntries.length === 0 && <div className="module-action-feedback">Здесь появится Q&A-запись, когда куратор добавит её к этому уроку.</div>}</section>
+      <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMediaEntries.length} {thematicMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{thematicMediaEntries.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических записей пока нет</strong><span>Куратор опубликует их по ходу этого урока.</span></div> : <div className="module-video-stack">{thematicMediaEntries.map((media) => <div className="module-video-stage" key={media.id}>{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? module.title} />}<span className="module-video-label">{media.title ?? module.title}</span><button className="play-button" aria-label="Открыть на весь экран" onClick={() => openPlayer(media.id)}><Play size={18} fill="currentColor" /></button><span className="stream-duration">{formatDuration(media.durationSec)}</span></div>)}</div>}</section>
+      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{hasRealAssignments ? (assignments.length === 1 ? "1 задание" : `${assignments.length} задания`) : `${baseContent.homework.length} пункта`}</span></div>{hasRealAssignments ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}<button className="primary-button resource-action-button" onClick={() => onOpenAssignment(assignment.id)}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></article>)}</div> : <><ol>{baseContent.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button resource-action-button" onClick={() => onOpenAssignment("")}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></>}</section>
+      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMediaEntries.length} {qaMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{qaMediaEntries.length > 0 && <div className="module-video-stack">{qaMediaEntries.map((media) => <div className="module-qa-video-stage" key={media.id}>{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? "Q&A с куратором"} />}<span>{media.title ?? "Q&A с куратором"}</span></div>)}</div>}<ul>{baseContent.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button resource-action-button" onClick={() => setDiscussionOpened((current) => !current)}><span>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"}</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button>{qaMediaEntries.length === 0 && <div className="module-action-feedback">Здесь появится Q&A-запись, когда куратор добавит её к этому уроку.</div>}</section>
     </div>
-    {fullscreenMedia?.embedUrl && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${fullscreenMedia.title ?? fullscreenMedia.lessonTitle}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">ЗАПИСЬ БЛОКА</span><strong>{fullscreenMedia.title ?? fullscreenMedia.lessonTitle}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div><TrackedVideo ref={modalEmbedRef} mediaId={fullscreenMedia.id} src={fullscreenMedia.embedUrl} title={fullscreenMedia.title ?? fullscreenMedia.lessonTitle} /><div className="video-modal-foot"><span>Запись доступна внутри урока</span><button className="secondary-button" onClick={requestFullscreen}><Maximize2 size={15} /> На весь экран</button></div></div></div>}
+    {fullscreenMedia?.embedUrl && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${fullscreenMedia.title ?? module.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">ЗАПИСЬ</span><strong>{fullscreenMedia.title ?? module.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div><TrackedVideo ref={modalEmbedRef} mediaId={fullscreenMedia.id} src={fullscreenMedia.embedUrl} title={fullscreenMedia.title ?? module.title} /><div className="video-modal-foot"><span>Запись доступна внутри урока</span><button className="secondary-button" onClick={requestFullscreen}><Maximize2 size={15} /> На весь экран</button></div></div></div>}
   </div>;
 }
 
@@ -4373,26 +3975,24 @@ function StreamsView() {
       if (cancelled) return;
       if (!response.ok) { setStreamsLoadError("Не удалось загрузить записи. Показаны демонстрационные данные."); return; }
        const payload = await response.json() as { data?: { modules?: CourseApiModule[]; media?: CourseLessonMedia[]; scheduleEvents?: CourseScheduleEvent[] } };
-       const lessonStreams: StreamItem[] = (payload.data?.modules ?? []).flatMap((module) => module.lessons.flatMap((lesson) => lesson.media.filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
+       const lessonStreams: StreamItem[] = (payload.data?.modules ?? []).flatMap((module) => module.media.filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
          id: media.id,
-         title: media.title ?? lesson.title,
+         title: media.title ?? module.title,
          kind: (media.kind === "BREAKDOWN" ? "Разбор" : media.kind === "TALKS" ? "Talks" : "Стрим") as StreamKind,
         module: `${String(module.position).padStart(2, "0")} · ${module.title}`,
-        lesson: lesson.title,
         date: media.publishedAt ? new Date(media.publishedAt).toLocaleDateString("ru-RU") : "Опубликовано",
         duration: formatDuration(media.durationSec),
         progress: 0,
-        description: media.description ?? `Запись урока «${lesson.title}».`,
+        description: media.description ?? `Запись урока «${module.title}».`,
         cover: media.thumbnailUrl,
         isNew: Boolean(media.publishedAt && Date.now() - new Date(media.publishedAt).getTime() < 7 * 24 * 60 * 60 * 1000),
         embedUrl: media.embedUrl,
-       }))));
+       })));
        const globalStreams: StreamItem[] = (payload.data?.media ?? []).filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
          id: media.id,
          title: media.title ?? "Talks",
          kind: "Talks",
          module: "Общая медиатека",
-         lesson: "Общение",
          date: media.publishedAt ? new Date(media.publishedAt).toLocaleDateString("ru-RU") : "Опубликовано",
          duration: formatDuration(media.durationSec),
          progress: 0,
@@ -4406,7 +4006,6 @@ function StreamsView() {
          title: recording.title ?? event.title,
          kind: (event.type === "BREAKDOWN" ? "Разбор" : "Стрим") as StreamKind,
          module: "Расписание",
-         lesson: event.title,
          date: new Date(`${event.date}T12:00:00`).toLocaleDateString("ru-RU"),
          duration: "Видео",
          progress: 0,
@@ -4445,11 +4044,11 @@ function StreamsView() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [playerOpen]);
 
-  return <div className="stream-library">{streamsLoadError && <div className="file-error" role="alert">{streamsLoadError}</div>}<div className="stream-library-toolbar"><div className="assignment-filter"><button className={`filter-chip ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>Все <span>{allStreams.length}</span></button><button className={`filter-chip ${filter === "Разбор" ? "active" : ""}`} onClick={() => setFilter("Разбор")}>Разборы <span>{allStreams.filter((stream) => stream.kind === "Разбор").length}</span></button><button className={`filter-chip ${filter === "Стрим" ? "active" : ""}`} onClick={() => setFilter("Стрим")}>Стримы <span>{allStreams.filter((stream) => stream.kind === "Стрим").length}</span></button><button className={`filter-chip ${filter === "Talks" ? "active" : ""}`} onClick={() => setFilter("Talks")}>Talks <span>{allStreams.filter((stream) => stream.kind === "Talks").length}</span></button></div><label className="stream-module-filter"><span>Модуль</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все модули</option>{moduleOptions.map((module) => <option value={module} key={module}>{module}</option>)}</select></label><span className="stream-count">{streams.length} записи</span></div><section className="stream-grid">{streams.length > 0 ? streams.map((stream) => <StreamCard stream={stream} selected={stream.id === selectedStream?.id} key={stream.id} onOpen={() => openStream(stream.id)} />) : <div className="empty-state"><Play size={22} /><strong>В этом модуле пока нет записей</strong><span>Выбери другой модуль или сбрось фильтр.</span></div>}</section>{playerOpen && selectedStream && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${selectedStream.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">{selectedStream.kind.toUpperCase()} · {selectedStream.module}</span><strong>{selectedStream.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{selectedStream.embedUrl ? <TrackedVideo mediaId={selectedStream.id} src={selectedStream.embedUrl} title={selectedStream.title} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}<div className="video-modal-foot"><span>{selectedStream.description}</span></div></div></div>}</div>;
+  return <div className="stream-library">{streamsLoadError && <div className="file-error" role="alert">{streamsLoadError}</div>}<div className="stream-library-toolbar"><div className="assignment-filter"><button className={`filter-chip ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>Все <span>{allStreams.length}</span></button><button className={`filter-chip ${filter === "Разбор" ? "active" : ""}`} onClick={() => setFilter("Разбор")}>Разборы <span>{allStreams.filter((stream) => stream.kind === "Разбор").length}</span></button><button className={`filter-chip ${filter === "Стрим" ? "active" : ""}`} onClick={() => setFilter("Стрим")}>Стримы <span>{allStreams.filter((stream) => stream.kind === "Стрим").length}</span></button><button className={`filter-chip ${filter === "Talks" ? "active" : ""}`} onClick={() => setFilter("Talks")}>Talks <span>{allStreams.filter((stream) => stream.kind === "Talks").length}</span></button></div><label className="stream-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map((module) => <option value={module} key={module}>{module}</option>)}</select></label><span className="stream-count">{streams.length} записи</span></div><section className="stream-grid">{streams.length > 0 ? streams.map((stream) => <StreamCard stream={stream} selected={stream.id === selectedStream?.id} key={stream.id} onOpen={() => openStream(stream.id)} />) : <div className="empty-state"><Play size={22} /><strong>В этом уроке пока нет записей</strong><span>Выбери другой урок или сбрось фильтр.</span></div>}</section>{playerOpen && selectedStream && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${selectedStream.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">{selectedStream.kind.toUpperCase()} · {selectedStream.module}</span><strong>{selectedStream.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{selectedStream.embedUrl ? <TrackedVideo mediaId={selectedStream.id} src={selectedStream.embedUrl} title={selectedStream.title} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}<div className="video-modal-foot"><span>{selectedStream.description}</span></div></div></div>}</div>;
 }
 
 function StreamCard({ stream, selected, onOpen }: { stream: StreamItem; selected: boolean; onOpen: () => void }) {
-  return <article className={`stream-card ${selected ? "selected" : ""}`}><button className="stream-card-button" onClick={onOpen} aria-pressed={selected}><div className={`stream-preview ${stream.cover ? "has-cover" : ""}`}>{stream.cover ? <div className="stream-cover" role="img" aria-label={`Обложка: ${stream.title}`} style={{ backgroundImage: `url("${stream.cover}")` }} /> : <div className="mini-candles"><i /><i /><i /><i /><i /></div>}<div className="stream-preview-label">{stream.isNew ? "НОВАЯ ЗАПИСЬ" : stream.kind.toUpperCase()}</div><span className="play-button" aria-hidden="true"><Play size={17} fill="currentColor" /></span><span className="stream-duration">{stream.duration}</span></div><div className="stream-card-copy"><span>{stream.module} · {stream.date}</span><h3>{stream.title}</h3><p className="stream-lesson-label">Урок: {stream.lesson}</p><p>{stream.description}</p><div className="stream-progress"><i><b style={{ width: `${stream.progress}%` }} /></i><small>{stream.progress > 0 ? `${stream.progress}% просмотрено` : "Не начато"}</small></div></div></button></article>;
+  return <article className={`stream-card ${selected ? "selected" : ""}`}><button className="stream-card-button" onClick={onOpen} aria-pressed={selected}><div className={`stream-preview ${stream.cover ? "has-cover" : ""}`}>{stream.cover ? <div className="stream-cover" role="img" aria-label={`Обложка: ${stream.title}`} style={{ backgroundImage: `url("${stream.cover}")` }} /> : <div className="mini-candles"><i /><i /><i /><i /><i /></div>}<div className="stream-preview-label">{stream.isNew ? "НОВАЯ ЗАПИСЬ" : stream.kind.toUpperCase()}</div><span className="play-button" aria-hidden="true"><Play size={17} fill="currentColor" /></span><span className="stream-duration">{stream.duration}</span></div><div className="stream-card-copy"><span>{stream.module} · {stream.date}</span><h3>{stream.title}</h3><p>{stream.description}</p><div className="stream-progress"><i><b style={{ width: `${stream.progress}%` }} /></i><small>{stream.progress > 0 ? `${stream.progress}% просмотрено` : "Не начато"}</small></div></div></button></article>;
 }
 
 function discussionCoverForModule(position?: number, coverPath?: string | null): string {
@@ -4480,7 +4079,7 @@ function DiscussionCreatedState({ thread, context, onOpenHistory }: { thread: Di
   const attachment = firstMessage?.attachments[0];
   const attachmentUrl = attachment?.contentUrl ? `${API_ORIGIN}${attachment.contentUrl}` : "";
   const statusLabel = thread.status === "ANSWERED" ? "Ответ куратора" : thread.status === "CLOSED" ? "Тема закрыта" : "Ожидает ответа куратора";
-  return <section className="content-panel discussion-created-state"><div className="discussion-created-heading"><div className="section-kicker">ВОПРОС СОЗДАН</div><h2>Вопрос отправлен куратору</h2></div><button className={`discussion-created-card ${detailsOpen ? "expanded" : ""}`} type="button" onClick={() => setDetailsOpen((current) => !current)}><span className="discussion-created-cover" role="img" aria-label={`Обложка ${context.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(7,14,23,.9), rgba(7,14,23,.25)), url("${discussionCoverForContext(context)}")` }} /><span className="discussion-created-copy"><small>{context.module} · {context.lesson}</small><strong>{thread.title}</strong><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{statusLabel}</span></span><ChevronDown size={20} className="discussion-created-chevron" /></button>{detailsOpen && <div className="discussion-created-details"><div className="discussion-created-status"><Clock3 size={16} /><strong>{statusLabel}</strong><span>Куратор увидит вопрос в очереди обсуждений.</span></div><div className="discussion-created-message"><span className="detail-label">ТЕКСТ ВОПРОСА</span><p>{firstMessage?.body}</p>{attachmentUrl && attachment?.mimeType.startsWith("image/") && <div className="discussion-created-attachment-image" role="img" aria-label={attachment.originalName} style={{ backgroundImage: `url("${attachmentUrl}")` }} />}{attachment && <a href={attachment.sourceUrl ? attachment.sourceUrl : (attachmentUrl || undefined)} target="_blank" rel="noreferrer"><FileCheck2 size={15} /> {attachment.originalName} <ArrowUpRight size={14} /></a>}</div></div>}<div className="discussion-created-actions"><button className="secondary-button" type="button" onClick={onOpenHistory}>Задать ещё вопрос</button></div></section>;
+  return <section className="content-panel discussion-created-state"><div className="discussion-created-heading"><div className="section-kicker">ВОПРОС СОЗДАН</div><h2>Вопрос отправлен куратору</h2></div><button className={`discussion-created-card ${detailsOpen ? "expanded" : ""}`} type="button" onClick={() => setDetailsOpen((current) => !current)}><span className="discussion-created-cover" role="img" aria-label={`Обложка ${context.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(7,14,23,.9), rgba(7,14,23,.25)), url("${discussionCoverForContext(context)}")` }} /><span className="discussion-created-copy"><small>{context.module}</small><strong>{thread.title}</strong><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{statusLabel}</span></span><ChevronDown size={20} className="discussion-created-chevron" /></button>{detailsOpen && <div className="discussion-created-details"><div className="discussion-created-status"><Clock3 size={16} /><strong>{statusLabel}</strong><span>Куратор увидит вопрос в очереди обсуждений.</span></div><div className="discussion-created-message"><span className="detail-label">ТЕКСТ ВОПРОСА</span><p>{firstMessage?.body}</p>{attachmentUrl && attachment?.mimeType.startsWith("image/") && <div className="discussion-created-attachment-image" role="img" aria-label={attachment.originalName} style={{ backgroundImage: `url("${attachmentUrl}")` }} />}{attachment && <a href={attachment.sourceUrl ? attachment.sourceUrl : (attachmentUrl || undefined)} target="_blank" rel="noreferrer"><FileCheck2 size={15} /> {attachment.originalName} <ArrowUpRight size={14} /></a>}</div></div>}<div className="discussion-created-actions"><button className="secondary-button" type="button" onClick={onOpenHistory}>Задать ещё вопрос</button></div></section>;
 }
 
 function DiscussionContextBanner({ context, onOpenHistory }: { context: DiscussionContext; onOpenHistory: () => void }) {
@@ -4516,7 +4115,7 @@ function DiscussionContextBanner({ context, onOpenHistory }: { context: Discussi
         const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": selectedFile.type }, body: selectedFile });
         if (!uploadResponse.ok) throw new Error("Не удалось загрузить файл.");
       }
-      const response = await fetch(`${API_ORIGIN}/api/discussions`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, body, moduleId: context.moduleId, lessonId: context.lessonId, assignmentId: context.assignmentId, attachments: selectedFile && uploadedFileId ? [{ fileId: uploadedFileId, originalName: selectedFile.name, mimeType: selectedFile.type, byteSize: selectedFile.size }] : [] }) });
+      const response = await fetch(`${API_ORIGIN}/api/discussions`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, body, moduleId: context.moduleId, assignmentId: context.assignmentId, attachments: selectedFile && uploadedFileId ? [{ fileId: uploadedFileId, originalName: selectedFile.name, mimeType: selectedFile.type, byteSize: selectedFile.size }] : [] }) });
       const payload = await response.json().catch(() => ({})) as { message?: string; data?: DiscussionApiThread };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать тему.");
       setCreatedThread(payload.data);
@@ -4554,7 +4153,7 @@ function DiscussionContextBanner({ context, onOpenHistory }: { context: Discussi
 
   if (createdThread) return <DiscussionCreatedState thread={createdThread} context={context} onOpenHistory={onOpenHistory} />;
 
-  return <section className="content-panel discussion-context-banner"><div className="discussion-context-heading"><h2>Задать вопрос куратору</h2></div><div className="discussion-context-chips"><span><BookOpen size={14} /> {context.module}</span>{context.lesson && <span><Play size={14} /> {context.lesson}</span>}</div><form className="discussion-composer" onSubmit={submit}><label className="form-field"><span>Тема вопроса</span><input value={title} onChange={(event) => { setTitle(event.target.value); setSubmitted(false); }} placeholder="Например: Как определить точку входа в этом сценарии?" /></label><label className="form-field"><span>Вопрос и описание</span><textarea value={body} onChange={(event) => { setBody(event.target.value); setSubmitted(false); }} onPaste={handleBodyPaste} rows={6} placeholder="Опиши, что именно непонятно. Можно добавить уровни, таймфрейм и свои наблюдения… Скриншот можно вставить сюда через Ctrl+V" /></label><label className={`discussion-attachment-picker ${attachmentName ? "has-file" : ""}`} htmlFor="discussion-attachment"><FileCheck2 size={17} /><span>{attachmentName || "Прикрепить скриншот, график, PDF или видео"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле вопроса</small><input id="discussion-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectAttachment(event.target.files?.[0])} /></label>{attachmentError && <div className="file-error" role="alert">{attachmentError}</div>}{attachmentPreviewUrl && <div className="discussion-selected-preview">{attachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${attachmentName}`} style={{ backgroundImage: `url("${attachmentPreviewUrl}")` }} />}{attachmentType === "video" && <video src={attachmentPreviewUrl} controls playsInline preload="metadata" />}{attachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{attachmentName}</span></div>}</div>}<div className="discussion-composer-actions"><button className="support-card" type="submit" disabled={!canSubmit || submitted || saving}><span className="support-card-label">{saving ? "Сохраняем…" : submitted ? "Вопрос отправлен" : "Задать вопрос"}</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button></div>{submitError && <div className="file-error" role="alert">{submitError}</div>}{submitted && <div className="detail-feedback accepted"><Target size={16} /><div><strong>Тема сохранена</strong><p>Вопрос записан в базу и появится у куратора.</p></div></div>}</form></section>;
+  return <section className="content-panel discussion-context-banner"><div className="discussion-context-heading"><h2>Задать вопрос куратору</h2></div><div className="discussion-context-chips"><span><BookOpen size={14} /> {context.module}</span></div><form className="discussion-composer" onSubmit={submit}><label className="form-field"><span>Тема вопроса</span><input value={title} onChange={(event) => { setTitle(event.target.value); setSubmitted(false); }} placeholder="Например: Как определить точку входа в этом сценарии?" /></label><label className="form-field"><span>Вопрос и описание</span><textarea value={body} onChange={(event) => { setBody(event.target.value); setSubmitted(false); }} onPaste={handleBodyPaste} rows={6} placeholder="Опиши, что именно непонятно. Можно добавить уровни, таймфрейм и свои наблюдения… Скриншот можно вставить сюда через Ctrl+V" /></label><label className={`discussion-attachment-picker ${attachmentName ? "has-file" : ""}`} htmlFor="discussion-attachment"><FileCheck2 size={17} /><span>{attachmentName || "Прикрепить скриншот, график, PDF или видео"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле вопроса</small><input id="discussion-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectAttachment(event.target.files?.[0])} /></label>{attachmentError && <div className="file-error" role="alert">{attachmentError}</div>}{attachmentPreviewUrl && <div className="discussion-selected-preview">{attachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${attachmentName}`} style={{ backgroundImage: `url("${attachmentPreviewUrl}")` }} />}{attachmentType === "video" && <video src={attachmentPreviewUrl} controls playsInline preload="metadata" />}{attachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{attachmentName}</span></div>}</div>}<div className="discussion-composer-actions"><button className="support-card" type="submit" disabled={!canSubmit || submitted || saving}><span className="support-card-label">{saving ? "Сохраняем…" : submitted ? "Вопрос отправлен" : "Задать вопрос"}</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button></div>{submitError && <div className="file-error" role="alert">{submitError}</div>}{submitted && <div className="detail-feedback accepted"><Target size={16} /><div><strong>Тема сохранена</strong><p>Вопрос записан в базу и появится у куратора.</p></div></div>}</form></section>;
 }
 
 function DiscussionViewDb({ onOpenDiscussion }: { onOpenDiscussion: (context: DiscussionContext) => void }) {
@@ -4575,12 +4174,12 @@ function DiscussionViewDb({ onOpenDiscussion }: { onOpenDiscussion: (context: Di
     return () => { cancelled = true; };
   }, []);
 
-  // The picker asks "which lesson/block", meaning the top-level module (Welcome,
+  // The picker asks "which урок", meaning the top-level module (Welcome,
   // Контекст и структура рынка…) — not the VIDEO sub-record living inside it.
   const startPicked = () => {
     const courseModule = courseModules.find((item) => item.id === pickerModuleId);
     if (!courseModule) return;
-    onOpenDiscussion({ module: `${courseModule.number} · ${courseModule.title}`, lesson: "", coverPath: courseModule.coverPath, moduleId: courseModule.id });
+    onOpenDiscussion({ module: `${courseModule.number} · ${courseModule.title}`, coverPath: courseModule.coverPath, moduleId: courseModule.id });
   };
 
   useEffect(() => {
@@ -4611,7 +4210,7 @@ function DiscussionViewDb({ onOpenDiscussion }: { onOpenDiscussion: (context: Di
     <div className="student-discussion-layout">
       <section className="content-panel student-discussion-list-panel">
         <div className="section-heading"><div><span className="section-kicker">ПОТОК 04</span><h2>Мои обсуждения</h2></div><span className="progress-inline">{threads.length} тем</span></div>
-        {loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем обсуждения…</strong><span>Проверяем сохранённые вопросы.</span></div> : error ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить обсуждения</strong><span>{error}</span></div> : threads.length === 0 ? <div className="empty-state"><MessageSquareText size={22} /><strong>Обсуждений пока нет</strong><span>Выбери урок выше и задай первый вопрос куратору.</span></div> : <div className="discussion-list">{threads.map((thread) => <button className={`discussion-row student-discussion-row ${thread.id === selectedId ? "selected" : ""}`} type="button" key={thread.id} onClick={() => setSelectedId(thread.id)}><div className="discussion-row-cover" role="img" aria-label={`Обложка ${thread.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.4), rgba(8,17,27,.82)), url("${thread.coverPath ?? discussionCoverForContext({ module: thread.module, lesson: thread.lesson })}")` }} /><div><strong>{thread.title}</strong><span>{thread.module}{thread.lesson ? ` · ${thread.lesson}` : ""}</span><small>{thread.updatedAt} · {thread.messages.length} сообщений</small></div><b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b><ChevronRight size={16} /></button>)}</div>}
+        {loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем обсуждения…</strong><span>Проверяем сохранённые вопросы.</span></div> : error ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить обсуждения</strong><span>{error}</span></div> : threads.length === 0 ? <div className="empty-state"><MessageSquareText size={22} /><strong>Обсуждений пока нет</strong><span>Выбери урок выше и задай первый вопрос куратору.</span></div> : <div className="discussion-list">{threads.map((thread) => <button className={`discussion-row student-discussion-row ${thread.id === selectedId ? "selected" : ""}`} type="button" key={thread.id} onClick={() => setSelectedId(thread.id)}><div className="discussion-row-cover" role="img" aria-label={`Обложка ${thread.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.4), rgba(8,17,27,.82)), url("${thread.coverPath ?? discussionCoverForContext({ module: thread.module })}")` }} /><div><strong>{thread.title}</strong><span>{thread.module}</span><small>{thread.updatedAt} · {thread.messages.length} сообщений</small></div><b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b><ChevronRight size={16} /></button>)}</div>}
       </section>
       {selectedThread ? <StudentDiscussionDetail thread={selectedThread} onClose={() => setSelectedId("")} onUpdate={(nextThread) => setThreads((current) => current.map((item) => item.id === nextThread.id ? nextThread : item))} /> : <section className="content-panel discussion-note"><div className="section-heading"><div><span className="section-kicker">ИСТОРИЯ ВОПРОСА</span><h2>Выбери тему</h2></div><MessageSquareText size={18} className="heading-icon" /></div><p>Нажми на вопрос слева, чтобы открыть всю переписку с куратором, вложения и контекст урока.</p></section>}
     </div>
@@ -4647,8 +4246,8 @@ function CohortDiscussionFeed() {
           const isOpen = thread.id === openId;
           return <div className="cohort-discussion-item" key={thread.id}>
             <button className="discussion-row student-discussion-row" type="button" onClick={() => setOpenId((current) => current === thread.id ? "" : thread.id)} aria-expanded={isOpen}>
-              <div className="discussion-row-cover" role="img" aria-label={`Обложка ${thread.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.4), rgba(8,17,27,.82)), url("${thread.coverPath ?? discussionCoverForContext({ module: thread.module, lesson: thread.lesson })}")` }} />
-              <div><strong>{thread.title}</strong><span>{thread.module}{thread.lesson ? ` · ${thread.lesson}` : ""}</span><small>{thread.messages.length} {thread.messages.length === 1 ? "сообщение" : "сообщений"}</small></div>
+              <div className="discussion-row-cover" role="img" aria-label={`Обложка ${thread.module}`} style={{ backgroundImage: `linear-gradient(135deg, rgba(8,17,27,.4), rgba(8,17,27,.82)), url("${thread.coverPath ?? discussionCoverForContext({ module: thread.module })}")` }} />
+              <div><strong>{thread.title}</strong><span>{thread.module}</span><small>{thread.messages.length} {thread.messages.length === 1 ? "сообщение" : "сообщений"}</small></div>
               <ChevronRight size={16} className={isOpen ? "rotate-down" : ""} />
             </button>
             {isOpen && <div className="cohort-discussion-thread">{thread.messages.map((message) => <article className={`student-discussion-message ${message.author}`} key={message.id}><div className="student-discussion-message-meta"><strong>{message.name}</strong></div><p>{message.body}</p><DiscussionMessageAttachments message={message} /></article>)}</div>}
@@ -4698,7 +4297,7 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
     }
   };
   return <section className="content-panel student-discussion-detail">
-    <div className="student-discussion-detail-head"><div><span className="section-kicker">{thread.module}</span><h2>{thread.title}</h2><p>{thread.lesson ? `${thread.lesson} · ` : ""}{thread.updatedAt}</p></div><button className="icon-button compact" type="button" aria-label="Закрыть историю вопроса" onClick={onClose}><X size={17} /></button></div>
+    <div className="student-discussion-detail-head"><div><span className="section-kicker">{thread.module}</span><h2>{thread.title}</h2><p>{thread.updatedAt}</p></div><button className="icon-button compact" type="button" aria-label="Закрыть историю вопроса" onClick={onClose}><X size={17} /></button></div>
     <div className="student-discussion-messages">{thread.messages.map((message) => <article className={`student-discussion-message ${message.author}`} key={message.id}><div className="student-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{message.body}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
     <div className="student-discussion-status-note"><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</span><span>{thread.status === "CLOSED" ? "Вопрос закрыт. Для нового обращения создай отдельную тему." : "История сохраняется, а диалог можно продолжить или закрыть."}</span></div>
     {thread.status !== "CLOSED" && <div className="student-discussion-actions"><button className="secondary-button danger-button" type="button" onClick={() => void closeThread()} disabled={closing || saving}>{closing ? "Закрываем…" : "Закрыть вопрос"}</button><button className="primary-button" type="button" onClick={() => setReplyOpen((current) => !current)}>{replyOpen ? "Скрыть ответ" : "Ответить ещё"}</button></div>}
@@ -4711,7 +4310,7 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function DiscussionView({ hideDemo = false }: { hideDemo?: boolean }) {
   if (hideDemo) return null;
-  return <div className="section-grid"><section className="content-panel"><div className="section-heading"><div><span className="section-kicker">ПОТОК 04</span><h2>Последние обсуждения</h2></div><button className="primary-button compact-button"><Plus size={15} /> Новая тема</button></div><div className="discussion-list"><div className="discussion-row"><div className="profile-avatar">АК</div><div><strong>Как отличить возврат в зону от ложного пробоя?</strong><span>Алексей К. · 4 ответа · 18 минут назад</span></div><ChevronRight size={16} /></div><div className="discussion-row"><div className="profile-avatar curator">МК</div><div><strong>Дополнительное ДЗ по модулю 03</strong><span>Мария, куратор · 9 ответов · вчера</span></div><ChevronRight size={16} /></div><div className="discussion-row"><div className="profile-avatar">ЕС</div><div><strong>Поделитесь разметкой перед завтрашним стримом</strong><span>Елена С. · 6 ответов · вчера</span></div><ChevronRight size={16} /></div></div></section><section className="content-panel discussion-note"><div className="section-heading"><div><span className="section-kicker">ПРАВИЛА ОБЩЕНИЯ</span><h2>Рабочее пространство</h2></div><MessageSquareText size={18} className="heading-icon" /></div><p>Здесь удобно задавать вопросы по урокам и ДЗ. Для быстрых обсуждений и стримов пока используется Discord.</p><button className="secondary-button">Открыть Discord <ArrowUpRight size={15} /></button></section></div>;
+  return <div className="section-grid"><section className="content-panel"><div className="section-heading"><div><span className="section-kicker">ПОТОК 04</span><h2>Последние обсуждения</h2></div><button className="primary-button compact-button"><Plus size={15} /> Новая тема</button></div><div className="discussion-list"><div className="discussion-row"><div className="profile-avatar">АК</div><div><strong>Как отличить возврат в зону от ложного пробоя?</strong><span>Алексей К. · 4 ответа · 18 минут назад</span></div><ChevronRight size={16} /></div><div className="discussion-row"><div className="profile-avatar curator">МК</div><div><strong>Дополнительное ДЗ по уроку 03</strong><span>Мария, куратор · 9 ответов · вчера</span></div><ChevronRight size={16} /></div><div className="discussion-row"><div className="profile-avatar">ЕС</div><div><strong>Поделитесь разметкой перед завтрашним стримом</strong><span>Елена С. · 6 ответов · вчера</span></div><ChevronRight size={16} /></div></div></section><section className="content-panel discussion-note"><div className="section-heading"><div><span className="section-kicker">ПРАВИЛА ОБЩЕНИЯ</span><h2>Рабочее пространство</h2></div><MessageSquareText size={18} className="heading-icon" /></div><p>Здесь удобно задавать вопросы по урокам и ДЗ. Для быстрых обсуждений и стримов пока используется Discord.</p><button className="secondary-button">Открыть Discord <ArrowUpRight size={15} /></button></section></div>;
 }
 
 function ChartScene() {
@@ -4831,7 +4430,7 @@ function LegacyAssignmentDetail({ assignment }: { assignment: Assignment }) {
     return <section className="content-panel assignment-detail directory-empty"><div className="empty-state"><FileCheck2 size={24} /><strong>Выбери опубликованное задание</strong><span>Когда куратор опубликует ДЗ, оно появится в этом списке.</span></div></section>;
   }
 
-  return <section className="content-panel assignment-detail"><div className="detail-header"><div><span className="section-kicker">{assignment.module}</span><h2>{assignment.title}</h2></div><div className={`assignment-badge ${assignment.status === "Принято" ? "green" : assignment.tone}`}>{submitted ? "На проверке" : assignment.status}</div></div><div className="detail-meta"><span><Clock3 size={14} /> {assignment.deadline}</span><span><FileCheck2 size={14} /> {isAccepted ? "Проверено куратором" : "Можно отправлять заново после доработки"}</span></div><div className="detail-body"><p className="detail-description">{assignment.description}</p><div className="detail-section"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span><ul className="detail-checklist">{assignment.requirements.map((requirement) => <li key={requirement}><span />{requirement}</li>)}</ul></div>{isAccepted ? <div className="detail-feedback accepted"><CheckCircle2 size={17} /><div><strong>Задание принято</strong><p>Куратор подтвердил работу. Материал сохранён в истории практикума.</p></div></div> : assignment.blockedByModuleTitle ? <div className="detail-feedback locked"><LockKeyhole size={17} /><div><strong>Пока недоступно</strong><p>Сначала сдайте ДЗ модуля «{assignment.blockedByModuleTitle}» — вернитесь туда и отправьте работу, тогда это задание откроется.</p></div></div> : <><div className="detail-section"><label className="detail-label" htmlFor="assignment-answer">ТВОЙ КОММЕНТАРИЙ</label><textarea id="assignment-answer" value={draft} onChange={(event) => { setDraft(event.target.value); setSaved(false); setSubmitted(false); }} onPaste={handleAnswerPaste} placeholder="Опиши логику решения или добавь контекст к файлу... Скриншот можно вставить сюда через Ctrl+V" rows={5} /></div><label className={`file-dropzone ${fileName ? "has-file" : ""}`} htmlFor="assignment-file"><FileCheck2 size={19} /><span>{fileName || "Прикрепить разметку, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле комментария</small><input id="assignment-file" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => handleFileChange(event.target.files?.[0])} /></label>{fileError && <div className="file-error" role="alert">{fileError}</div>}{filePreviewUrl && <div className="assignment-preview"><div className="assignment-preview-heading"><span>ПРЕДПРОСМОТР</span><strong>{fileName}</strong></div>{fileType.startsWith("image/") && <div className="assignment-preview-image-wrap"><Image src={filePreviewUrl} alt={`Предпросмотр файла ${fileName}`} fill sizes="(max-width: 700px) 100vw, 420px" unoptimized className="assignment-preview-image" /></div>}{fileType === "application/pdf" && <iframe src={filePreviewUrl} title={`Предпросмотр PDF ${fileName}`} />}{fileType.startsWith("video/") && <video src={filePreviewUrl} controls preload="metadata" />}</div>}{(saved || submitted) && <div className="detail-feedback"><Target size={17} /><div><strong>{submitted ? "Работа отправлена куратору" : "Черновик сохранён в этой сессии"}</strong><p>{submitted ? "Ответ и вложение сохранены. Куратор увидит их в очереди проверки." : "Можно вернуться к заданию и продолжить подготовку ответа."}</p></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={() => setSaved(true)} disabled={!draft.trim() && !fileName}>Сохранить черновик</button><button className="primary-button" onClick={() => setSubmitted(true)} disabled={!draft.trim() && !fileName}>Отправить на проверку <ChevronRight size={16} /></button></div></>}</div></section>;
+  return <section className="content-panel assignment-detail"><div className="detail-header"><div><span className="section-kicker">{assignment.module}</span><h2>{assignment.title}</h2></div><div className={`assignment-badge ${assignment.status === "Принято" ? "green" : assignment.tone}`}>{submitted ? "На проверке" : assignment.status}</div></div><div className="detail-meta"><span><Clock3 size={14} /> {assignment.deadline}</span><span><FileCheck2 size={14} /> {isAccepted ? "Проверено куратором" : "Можно отправлять заново после доработки"}</span></div><div className="detail-body"><p className="detail-description">{assignment.description}</p><div className="detail-section"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span><ul className="detail-checklist">{assignment.requirements.map((requirement) => <li key={requirement}><span />{requirement}</li>)}</ul></div>{isAccepted ? <div className="detail-feedback accepted"><CheckCircle2 size={17} /><div><strong>Задание принято</strong><p>Куратор подтвердил работу. Материал сохранён в истории практикума.</p></div></div> : assignment.blockedByModuleTitle ? <div className="detail-feedback locked"><LockKeyhole size={17} /><div><strong>Пока недоступно</strong><p>Сначала сдайте ДЗ урока «{assignment.blockedByModuleTitle}» — вернитесь туда и отправьте работу, тогда это задание откроется.</p></div></div> : <><div className="detail-section"><label className="detail-label" htmlFor="assignment-answer">ТВОЙ КОММЕНТАРИЙ</label><textarea id="assignment-answer" value={draft} onChange={(event) => { setDraft(event.target.value); setSaved(false); setSubmitted(false); }} onPaste={handleAnswerPaste} placeholder="Опиши логику решения или добавь контекст к файлу... Скриншот можно вставить сюда через Ctrl+V" rows={5} /></div><label className={`file-dropzone ${fileName ? "has-file" : ""}`} htmlFor="assignment-file"><FileCheck2 size={19} /><span>{fileName || "Прикрепить разметку, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле комментария</small><input id="assignment-file" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => handleFileChange(event.target.files?.[0])} /></label>{fileError && <div className="file-error" role="alert">{fileError}</div>}{filePreviewUrl && <div className="assignment-preview"><div className="assignment-preview-heading"><span>ПРЕДПРОСМОТР</span><strong>{fileName}</strong></div>{fileType.startsWith("image/") && <div className="assignment-preview-image-wrap"><Image src={filePreviewUrl} alt={`Предпросмотр файла ${fileName}`} fill sizes="(max-width: 700px) 100vw, 420px" unoptimized className="assignment-preview-image" /></div>}{fileType === "application/pdf" && <iframe src={filePreviewUrl} title={`Предпросмотр PDF ${fileName}`} />}{fileType.startsWith("video/") && <video src={filePreviewUrl} controls preload="metadata" />}</div>}{(saved || submitted) && <div className="detail-feedback"><Target size={17} /><div><strong>{submitted ? "Работа отправлена куратору" : "Черновик сохранён в этой сессии"}</strong><p>{submitted ? "Ответ и вложение сохранены. Куратор увидит их в очереди проверки." : "Можно вернуться к заданию и продолжить подготовку ответа."}</p></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={() => setSaved(true)} disabled={!draft.trim() && !fileName}>Сохранить черновик</button><button className="primary-button" onClick={() => setSubmitted(true)} disabled={!draft.trim() && !fileName}>Отправить на проверку <ChevronRight size={16} /></button></div></>}</div></section>;
 }
 
 function assignmentMaterialEmbed(url: string): string | null {
@@ -4858,7 +4457,7 @@ function AssignmentMaterials({ materials }: { materials: Assignment["materials"]
 function AssignmentModuleCover({ assignment }: { assignment: Assignment }) {
   const modulePosition = Number.parseInt(assignment.module.slice(0, 2), 10);
   const coverPath = assignment.coverPath ?? discussionCoverForModule(Number.isNaN(modulePosition) ? undefined : modulePosition);
-  return <section className="content-panel assignment-module-cover-panel"><div className="assignment-module-cover" role="img" aria-label={`Обложка ${assignment.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(7,14,23,.94), rgba(7,14,23,.42)), url("${coverPath}")` }}><strong>{assignment.module}</strong><span>{assignment.lessonTitle ?? "Материал урока"}</span></div></section>;
+  return <section className="content-panel assignment-module-cover-panel"><div className="assignment-module-cover" role="img" aria-label={`Обложка ${assignment.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(7,14,23,.94), rgba(7,14,23,.42)), url("${coverPath}")` }}><strong>{assignment.module}</strong></div></section>;
 }
 
 function AssignmentDetail({ assignment }: { assignment: Assignment }) {

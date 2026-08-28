@@ -159,7 +159,7 @@ export class StreamService {
       return;
     }
 
-    const lastMedia = await prisma.mediaAsset.findFirst({ where: { practicumId: practicum.id, lessonId: null, scheduleEventId: null }, orderBy: { position: "desc" }, select: { position: true } });
+    const lastMedia = await prisma.mediaAsset.findFirst({ where: { practicumId: practicum.id, moduleId: null, scheduleEventId: null }, orderBy: { position: "desc" }, select: { position: true } });
     await prisma.mediaAsset.create({
       data: {
         practicumId: practicum.id,

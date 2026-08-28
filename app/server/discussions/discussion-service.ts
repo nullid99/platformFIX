@@ -17,7 +17,6 @@ export type CreateDiscussionInput = {
   title: string;
   body: string;
   moduleId?: string;
-  lessonId?: string;
   assignmentId?: string;
   curatorId?: string;
   visibility?: "PRIVATE" | "COHORT";
@@ -72,7 +71,6 @@ function threadInclude() {
     student: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true, avatarUrl: true, provider: true }, orderBy: { createdAt: "asc" as const } } } },
     curator: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true }, orderBy: { createdAt: "asc" as const }, take: 1 } } },
     module: { select: { id: true, title: true, position: true, coverPath: true } },
-    lesson: { select: { id: true, title: true } },
     assignment: { select: { id: true, title: true } },
     messages: {
       orderBy: { createdAt: "asc" as const },
@@ -106,7 +104,7 @@ export class DiscussionService {
     const body = requiredText(input.body, "body", MAX_BODY_LENGTH);
     const attachments = normalizeAttachments(input.attachments);
     const sourceUrl = optionalUrl(input.sourceUrl);
-    const context = await this.validateContext(studentId, input.moduleId, input.lessonId, input.assignmentId);
+    const context = await this.validateContext(studentId, input.moduleId, input.assignmentId);
     const curatorId = await this.resolveCurator(studentId, input.curatorId);
     await this.assertFilesOwned(studentId, attachments);
 
@@ -116,7 +114,6 @@ export class DiscussionService {
           studentId,
           curatorId,
           moduleId: context.moduleId,
-          lessonId: context.lessonId,
           assignmentId: context.assignmentId,
           title,
           status: DiscussionStatus.NEW,
@@ -228,24 +225,21 @@ export class DiscussionService {
     return data;
   }
 
-  private async validateContext(studentId: string, moduleId?: string, lessonId?: string, assignmentId?: string) {
+  private async validateContext(studentId: string, moduleId?: string, assignmentId?: string) {
     const assignment = assignmentId ? await prisma.assignment.findUnique({
       where: { id: assignmentId },
-      select: { id: true, lessonId: true, lesson: { select: { moduleId: true, module: { select: { practicumId: true } } } } },
+      select: { id: true, moduleId: true, module: { select: { practicumId: true } } },
     }) : null;
-    const lesson = lessonId ? await prisma.lesson.findUnique({ where: { id: lessonId }, select: { id: true, moduleId: true, module: { select: { practicumId: true } } } }) : null;
     const courseModule = moduleId ? await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true } }) : null;
-    const practicumId = assignment?.lesson.module.practicumId ?? lesson?.module.practicumId ?? courseModule?.practicumId;
+    const practicumId = assignment?.module.practicumId ?? courseModule?.practicumId;
     if (assignmentId && !assignment) throw new AuthServiceError("INVALID_INPUT", "assignmentId is invalid");
-    if (lessonId && !lesson) throw new AuthServiceError("INVALID_INPUT", "lessonId is invalid");
     if (moduleId && !courseModule) throw new AuthServiceError("INVALID_INPUT", "moduleId is invalid");
-    if (assignment && lessonId && assignment.lessonId !== lessonId) throw new AuthServiceError("INVALID_INPUT", "Discussion context is inconsistent");
-    if (lesson && moduleId && lesson.moduleId !== moduleId) throw new AuthServiceError("INVALID_INPUT", "Discussion context is inconsistent");
+    if (assignment && moduleId && assignment.moduleId !== moduleId) throw new AuthServiceError("INVALID_INPUT", "Discussion context is inconsistent");
     if (practicumId) {
       const enrollment = await prisma.enrollment.findFirst({ where: { studentId, practicumId, status: "ACTIVE", OR: [{ accessUntil: null }, { accessUntil: { gt: new Date() } }] }, select: { id: true } });
       if (!enrollment) throw new AuthServiceError("FORBIDDEN", "Active enrollment is required");
     }
-    return { moduleId: assignment?.lesson.moduleId ?? lesson?.moduleId ?? courseModule?.id, lessonId: assignment?.lessonId ?? lesson?.id, assignmentId: assignment?.id };
+    return { moduleId: assignment?.moduleId ?? courseModule?.id, assignmentId: assignment?.id };
   }
 
   private async validateCurator(studentId: string, curatorId?: string): Promise<string | undefined> {
@@ -309,7 +303,6 @@ export class DiscussionService {
       updatedAt: thread.updatedAt,
       lastMessageAt: thread.lastMessageAt,
       module: thread.module ? { id: thread.module.id, title: thread.module.title, position: thread.module.position, coverPath: thread.module.coverPath } : null,
-      lesson: thread.lesson ? { id: thread.lesson.id, title: thread.lesson.title } : null,
       assignment: thread.assignment ? { id: thread.assignment.id, title: thread.assignment.title } : null,
       student: anonymizeStudent
         ? { id: null, name: "Ученик потока", email: null, avatarUrl: null }

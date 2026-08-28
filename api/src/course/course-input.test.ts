@@ -3,14 +3,12 @@ import { MediaAssetKind } from "../../../app/generated/prisma/enums";
 import { parseCreateModuleBody, parseCreateVimeoMediaBody } from "./course-input";
 
 describe("parseCreateModuleBody", () => {
-  it("accepts a module with a local cover and first lesson", () => {
-    expect(parseCreateModuleBody({ title: "Новый блок", section: "Practice", coverPath: "/event-covers/PRE.png", lessonTitle: "Введение" })).toEqual({
+  it("accepts a module with a local cover", () => {
+    expect(parseCreateModuleBody({ title: "Новый блок", section: "Practice", coverPath: "/event-covers/PRE.png" })).toEqual({
       title: "Новый блок",
       description: undefined,
       section: "Practice",
       coverPath: "/event-covers/PRE.png",
-      lessonTitle: "Введение",
-      lessonDescription: undefined,
     });
   });
 
@@ -20,14 +18,14 @@ describe("parseCreateModuleBody", () => {
 });
 
 describe("parseCreateVimeoMediaBody", () => {
-  it("accepts a Vimeo media draft attached to a lesson", () => {
+  it("accepts a Vimeo media draft attached to a module", () => {
     expect(parseCreateVimeoMediaBody({
-      lessonId: "lesson_1",
+      moduleId: "module_1",
       title: "Q&A по Market Logic",
       kind: MediaAssetKind.QA,
       vimeoUrl: "https://vimeo.com/123456789?h=privatehash",
     })).toEqual({
-      lessonId: "lesson_1",
+      moduleId: "module_1",
       title: "Q&A по Market Logic",
       kind: MediaAssetKind.QA,
       vimeoUrl: "https://vimeo.com/123456789?h=privatehash",
@@ -36,12 +34,12 @@ describe("parseCreateVimeoMediaBody", () => {
   });
 
   it("rejects an unknown media kind", () => {
-    expect(() => parseCreateVimeoMediaBody({ lessonId: "lesson_1", title: "Запись", kind: "FILE", vimeoUrl: "https://vimeo.com/123" })).toThrow("kind is invalid");
+    expect(() => parseCreateVimeoMediaBody({ moduleId: "module_1", title: "Запись", kind: "FILE", vimeoUrl: "https://vimeo.com/123" })).toThrow("kind is invalid");
   });
 
-  it("allows a Talks record without a lesson", () => {
+  it("allows a Talks record without a module", () => {
     expect(parseCreateVimeoMediaBody({ title: "Talks: знакомство", kind: MediaAssetKind.TALKS, vimeoUrl: "https://vimeo.com/123" })).toEqual({
-      lessonId: undefined,
+      moduleId: undefined,
       title: "Talks: знакомство",
       kind: MediaAssetKind.TALKS,
       vimeoUrl: "https://vimeo.com/123",
@@ -49,7 +47,7 @@ describe("parseCreateVimeoMediaBody", () => {
     });
   });
 
-  it("requires a lesson for lesson-bound media", () => {
-    expect(() => parseCreateVimeoMediaBody({ title: "Стрим", kind: MediaAssetKind.STREAM, vimeoUrl: "https://vimeo.com/123" })).toThrow("lessonId is required");
+  it("requires a module for module-bound media", () => {
+    expect(() => parseCreateVimeoMediaBody({ title: "Стрим", kind: MediaAssetKind.STREAM, vimeoUrl: "https://vimeo.com/123" })).toThrow("moduleId is required");
   });
 });

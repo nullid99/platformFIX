@@ -41,7 +41,6 @@ function createInput(body: JsonBody): CreateDiscussionInput {
     title: body.title,
     body: body.body,
     moduleId: optionalString(body.moduleId, "moduleId"),
-    lessonId: optionalString(body.lessonId, "lessonId"),
     assignmentId: optionalString(body.assignmentId, "assignmentId"),
     curatorId: optionalString(body.curatorId, "curatorId"),
     visibility: body.visibility === "COHORT" ? "COHORT" : "PRIVATE",

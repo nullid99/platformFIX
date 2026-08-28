@@ -72,24 +72,8 @@ export class CourseController {
     }
   }
 
-  @Put("lessons/:lessonId")
-  public async updateLesson(@Req() request: RequestWithCookies, @Param("lessonId") lessonId: string, @Body() body: unknown) {
-    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
-    if (!token) throw new UnauthorizedException("Session is required");
-    if (!body || typeof body !== "object" || typeof (body as { title?: unknown }).title !== "string") throw new BadRequestException("title is required");
-    try {
-      const session = await authService.validateSession(token);
-      const input = body as { title: string; description?: string };
-      return { data: await courseService.updateLesson(session.userId, lessonId, input) };
-    } catch (error) {
-      if (error instanceof AuthServiceError) mapError(error);
-      if (error instanceof BadRequestException) throw error;
-      throw new InternalServerErrorException("Lesson update failed");
-    }
-  }
-
-  @Put("lessons/:lessonId/media/reorder")
-  public async reorderLessonMedia(@Req() request: RequestWithCookies, @Param("lessonId") lessonId: string, @Body() body: unknown) {
+  @Put("modules/:moduleId/media/reorder")
+  public async reorderModuleMedia(@Req() request: RequestWithCookies, @Param("moduleId") moduleId: string, @Body() body: unknown) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
     if (!token) throw new UnauthorizedException("Session is required");
     if (!body || typeof body !== "object" || !Array.isArray((body as { mediaIds?: unknown }).mediaIds) || !(body as { mediaIds: unknown[] }).mediaIds.every((id) => typeof id === "string")) {
@@ -97,11 +81,11 @@ export class CourseController {
     }
     try {
       const session = await authService.validateSession(token);
-      return { data: await courseService.reorderLessonMedia(session.userId, lessonId, (body as { mediaIds: string[] }).mediaIds) };
+      return { data: await courseService.reorderModuleMedia(session.userId, moduleId, (body as { mediaIds: string[] }).mediaIds) };
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       if (error instanceof BadRequestException) throw error;
-      throw new InternalServerErrorException("Lesson media reorder failed");
+      throw new InternalServerErrorException("Module media reorder failed");
     }
   }
 
@@ -162,14 +146,14 @@ export class CourseController {
     }
   }
 
-  @Put("media/:mediaId/lesson")
-  public async attachMediaToLesson(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Body() body: unknown) {
+  @Put("media/:mediaId/module")
+  public async attachMediaToModule(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Body() body: unknown) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
     if (!token) throw new UnauthorizedException("Session is required");
-    if (!body || typeof body !== "object" || typeof (body as { lessonId?: unknown }).lessonId !== "string") throw new BadRequestException("lessonId is required");
+    if (!body || typeof body !== "object" || typeof (body as { moduleId?: unknown }).moduleId !== "string") throw new BadRequestException("moduleId is required");
     try {
       const session = await authService.validateSession(token);
-      return { data: await courseService.attachMediaToLesson(session.userId, mediaId, (body as { lessonId: string }).lessonId) };
+      return { data: await courseService.attachMediaToModule(session.userId, mediaId, (body as { moduleId: string }).moduleId) };
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       throw new InternalServerErrorException("Course media operation failed");

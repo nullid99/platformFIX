@@ -21,7 +21,7 @@ type CourseAccess = {
 };
 
 export type CreateVimeoMediaInput = {
-  lessonId?: string;
+  moduleId?: string;
   scheduleEventId?: string;
   title: string;
   description?: string;
@@ -34,13 +34,10 @@ export type CreateModuleInput = {
   description?: string;
   section?: string;
   coverPath?: string;
-  lessonTitle?: string;
-  lessonDescription?: string;
 };
 
-export type UpdateLessonInput = { title: string; description?: string };
 export type UpdateModuleInput = { title: string; description?: string };
-export type UpdateMediaClassificationInput = { kind: MediaAssetKind; lessonId?: string; scheduleEventId?: string };
+export type UpdateMediaClassificationInput = { kind: MediaAssetKind; moduleId?: string; scheduleEventId?: string };
 
 function jsonStrings(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -126,8 +123,6 @@ export class CourseService {
     if (coverPath && (!coverPath.startsWith("/") || coverPath.length > 500)) {
       throw new AuthServiceError("INVALID_INPUT", "coverPath is invalid");
     }
-    const lessonTitle = input.lessonTitle?.trim().slice(0, 180) || `${title}: вводный урок`;
-    const lessonDescription = input.lessonDescription?.trim().slice(0, 5_000) || null;
     const practicum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
     if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
 
@@ -136,7 +131,6 @@ export class CourseService {
         const lastModule = await tx.module.findFirst({ where: { practicumId: practicum.id }, orderBy: { position: "desc" }, select: { position: true } });
         const position = (lastModule?.position ?? -1) + 1;
         const courseModule = await tx.module.create({ data: { practicumId: practicum.id, title, description, section, coverPath, position } });
-        const lesson = await tx.lesson.create({ data: { moduleId: courseModule.id, title: lessonTitle, type: "TEXT", description: lessonDescription, position: 1 } });
         return {
           id: courseModule.id,
           number: String(position).padStart(2, "0"),
@@ -148,7 +142,8 @@ export class CourseService {
           locked: false,
           progress: 0,
           status: courseModule.defaultAccess,
-          lessons: [{ id: lesson.id, position: lesson.position, title: lesson.title, type: lesson.type, description: lesson.description, media: [], assignments: [] }],
+          media: [],
+          assignments: [],
         };
       });
     } catch (error: unknown) {
@@ -371,8 +366,8 @@ export class CourseService {
       include: {
         mediaAssets: {
           where: user.role === UserRole.STUDENT
-            ? { status: MediaAssetStatus.PUBLISHED, lessonId: null }
-            : { status: { not: MediaAssetStatus.ARCHIVED }, lessonId: null },
+            ? { status: MediaAssetStatus.PUBLISHED, moduleId: null }
+            : { status: { not: MediaAssetStatus.ARCHIVED }, moduleId: null },
           orderBy: [{ position: "asc" }, { createdAt: "asc" }],
         },
         scheduleEvents: {
@@ -389,22 +384,17 @@ export class CourseService {
         modules: {
           orderBy: { position: "asc" },
           include: {
-            lessons: {
-              orderBy: { position: "asc" },
-              include: {
-                mediaAssets: {
-                  where: user.role === UserRole.STUDENT
-                    ? { status: MediaAssetStatus.PUBLISHED }
-                    : { status: { not: MediaAssetStatus.ARCHIVED } },
-                  orderBy: [{ position: "asc" }, { createdAt: "asc" }],
-                },
-                assignments: {
-                  where: user.role === UserRole.STUDENT
-                    ? { status: AssignmentStatus.PUBLISHED }
-                    : { status: { not: AssignmentStatus.ARCHIVED } },
-                  orderBy: { createdAt: "asc" },
-                },
-              },
+            mediaAssets: {
+              where: user.role === UserRole.STUDENT
+                ? { status: MediaAssetStatus.PUBLISHED }
+                : { status: { not: MediaAssetStatus.ARCHIVED } },
+              orderBy: [{ position: "asc" }, { createdAt: "asc" }],
+            },
+            assignments: {
+              where: user.role === UserRole.STUDENT
+                ? { status: AssignmentStatus.PUBLISHED }
+                : { status: { not: AssignmentStatus.ARCHIVED } },
+              orderBy: { createdAt: "asc" },
             },
             // Only the current student's own row is ever needed — a curator/owner has no
             // enrollment of their own, so this resolves to zero rows for them; their view
@@ -457,36 +447,31 @@ export class CourseService {
       })),
       modules: practicum.modules.map((module) => {
         const access = this.getModuleAccess(module.accessRecords[0], user.role, module.defaultAccess);
-        const lessons = access.locked
+        const media = access.locked
           ? []
-          : module.lessons.map((lesson) => ({
-            id: lesson.id,
-            position: lesson.position,
-            title: lesson.title,
-            type: lesson.type,
-            description: lesson.description,
-            media: lesson.mediaAssets.map((asset) => ({
-              id: asset.id,
-              scheduleEventId: asset.scheduleEventId,
-              provider: asset.provider,
-              kind: asset.kind,
-              status: asset.status,
-              title: asset.title,
-              description: asset.description,
-              durationSec: asset.durationSec,
-              position: asset.position,
-              publishedAt: asset.publishedAt,
-              embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey),
-              thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey),
-            })),
-            assignments: lesson.assignments.map((assignment) => ({
-              id: assignment.id,
-              title: assignment.title,
-              description: assignment.description,
-              requirements: jsonStrings(assignment.requirements),
-              allowedFormats: jsonStrings(assignment.allowedFormats),
-              deadline: assignment.deadline,
-            })),
+          : module.mediaAssets.map((asset) => ({
+            id: asset.id,
+            scheduleEventId: asset.scheduleEventId,
+            provider: asset.provider,
+            kind: asset.kind,
+            status: asset.status,
+            title: asset.title,
+            description: asset.description,
+            durationSec: asset.durationSec,
+            position: asset.position,
+            publishedAt: asset.publishedAt,
+            embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey),
+            thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey),
+          }));
+        const assignments = access.locked
+          ? []
+          : module.assignments.map((assignment) => ({
+            id: assignment.id,
+            title: assignment.title,
+            description: assignment.description,
+            requirements: jsonStrings(assignment.requirements),
+            allowedFormats: jsonStrings(assignment.allowedFormats),
+            deadline: assignment.deadline,
           }));
 
         return {
@@ -500,7 +485,8 @@ export class CourseService {
           locked: access.locked,
           progress: access.progress,
           status: access.status,
-          lessons,
+          media,
+          assignments,
         };
       }),
     };
@@ -508,26 +494,26 @@ export class CourseService {
 
   public async createVimeoMedia(actorId: string, input: CreateVimeoMediaInput) {
     await this.assertCurator(actorId);
-    const lessonId = input.lessonId ? requiredText(input.lessonId, "lessonId", 100) : undefined;
+    const moduleId = input.moduleId ? requiredText(input.moduleId, "moduleId", 100) : undefined;
     const scheduleEventId = input.scheduleEventId ? requiredText(input.scheduleEventId, "scheduleEventId", 100) : undefined;
-    if (input.kind !== MediaAssetKind.TALKS && !lessonId && !scheduleEventId) throw new AuthServiceError("INVALID_INPUT", "lessonId or scheduleEventId is required for this media type");
+    if (input.kind !== MediaAssetKind.TALKS && !moduleId && !scheduleEventId) throw new AuthServiceError("INVALID_INPUT", "moduleId or scheduleEventId is required for this media type");
     const title = requiredText(input.title, "title", 180);
     const description = input.description?.trim().slice(0, 2_000) || undefined;
     const providerKey = normalizeVimeoKey(input.vimeoUrl);
-    const lesson = lessonId
-      ? await prisma.lesson.findUnique({ where: { id: lessonId }, select: { id: true, module: { select: { practicumId: true } } } })
+    const courseModule = moduleId
+      ? await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true } })
       : null;
-    if (lessonId && !lesson) throw new AuthServiceError("INVALID_INPUT", "Lesson does not exist");
+    if (moduleId && !courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
     const scheduleEvent = scheduleEventId ? await prisma.scheduleEvent.findUnique({ where: { id: scheduleEventId }, select: { id: true, practicumId: true } }) : null;
     if (scheduleEventId && !scheduleEvent) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
-    if (lesson && scheduleEvent && lesson.module.practicumId !== scheduleEvent.practicumId) throw new AuthServiceError("INVALID_INPUT", "Lesson and event belong to different practicums");
-    const practicumId = lesson?.module.practicumId ?? scheduleEvent?.practicumId ?? (await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } }))?.id;
+    if (courseModule && scheduleEvent && courseModule.practicumId !== scheduleEvent.practicumId) throw new AuthServiceError("INVALID_INPUT", "Module and event belong to different practicums");
+    const practicumId = courseModule?.practicumId ?? scheduleEvent?.practicumId ?? (await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } }))?.id;
     if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
     const actorPracticum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
     if (scheduleEvent && actorPracticum && scheduleEvent.practicumId !== actorPracticum.id) throw new AuthServiceError("FORBIDDEN", "Event belongs to another practicum");
 
     const lastMedia = await prisma.mediaAsset.findFirst({
-      where: scheduleEventId ? { scheduleEventId } : lessonId ? { lessonId } : { practicumId, lessonId: null, scheduleEventId: null },
+      where: scheduleEventId ? { scheduleEventId } : moduleId ? { moduleId } : { practicumId, moduleId: null, scheduleEventId: null },
       orderBy: { position: "desc" },
       select: { position: true },
     });
@@ -535,7 +521,7 @@ export class CourseService {
     const media = await prisma.mediaAsset.create({
       data: {
         practicumId,
-        lessonId,
+        moduleId,
         scheduleEventId,
         provider: "VIMEO",
         providerKey,
@@ -553,15 +539,6 @@ export class CourseService {
     });
 
     return this.toMediaDto(media);
-  }
-
-  public async updateLesson(actorId: string, lessonId: string, input: UpdateLessonInput) {
-    await this.assertCurator(actorId);
-    const title = requiredText(input.title, "title", 180);
-    const description = input.description?.trim().slice(0, 5_000) || null;
-    return prisma.lesson.update({ where: { id: lessonId }, data: { title, description }, select: { id: true, title: true, description: true, moduleId: true } }).catch(() => {
-      throw new AuthServiceError("INVALID_INPUT", "Lesson does not exist");
-    });
   }
 
   public async updateModule(actorId: string, moduleId: string, input: UpdateModuleInput) {
@@ -585,7 +562,7 @@ export class CourseService {
     // A hard delete must never remove student work. Draft/published assignments
     // without submissions are safe to remove together with their module.
     const submissionCount = await prisma.submission.count({
-      where: { assignment: { lesson: { moduleId: normalizedModuleId } } },
+      where: { assignment: { moduleId: normalizedModuleId } },
     });
     if (submissionCount > 0) {
       throw new AuthServiceError("INVALID_INPUT", "Нельзя удалить блок: в его заданиях уже есть работы учеников");
@@ -609,21 +586,21 @@ export class CourseService {
     return { id: normalizedModuleId, title: courseModule.title };
   }
 
-  public async reorderLessonMedia(actorId: string, lessonId: string, mediaIds: string[]) {
+  public async reorderModuleMedia(actorId: string, moduleId: string, mediaIds: string[]) {
     await this.assertCurator(actorId);
-    const normalizedLessonId = requiredText(lessonId, "lessonId", 100);
+    const normalizedModuleId = requiredText(moduleId, "moduleId", 100);
     if (mediaIds.length > 100 || new Set(mediaIds).size !== mediaIds.length || mediaIds.some((id) => !id.trim() || id.length > 100)) {
       throw new AuthServiceError("INVALID_INPUT", "mediaIds is invalid");
     }
 
-    const existing = await prisma.mediaAsset.findMany({ where: { lessonId: normalizedLessonId }, select: { id: true } });
+    const existing = await prisma.mediaAsset.findMany({ where: { moduleId: normalizedModuleId }, select: { id: true } });
     const existingIds = new Set(existing.map((media) => media.id));
     if (existingIds.size !== mediaIds.length || mediaIds.some((id) => !existingIds.has(id))) {
-      throw new AuthServiceError("INVALID_INPUT", "Media does not belong to this lesson");
+      throw new AuthServiceError("INVALID_INPUT", "Media does not belong to this module");
     }
 
     await prisma.$transaction(mediaIds.map((id, position) => prisma.mediaAsset.update({ where: { id }, data: { position } })));
-    return { lessonId: normalizedLessonId, mediaIds };
+    return { moduleId: normalizedModuleId, mediaIds };
   }
 
   public async publishMedia(actorId: string, mediaId: string) {
@@ -634,13 +611,13 @@ export class CourseService {
       where: { id: mediaId },
       data: { status: MediaAssetStatus.PUBLISHED, publishedAt: new Date() },
       include: {
-        lesson: { select: { module: { select: { practicumId: true } } } },
+        module: { select: { practicumId: true } },
         scheduleEvent: { select: { practicumId: true } },
       },
     }).catch(() => null);
     if (!media) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     if (existing.status !== MediaAssetStatus.PUBLISHED) {
-      const practicumId = media.lesson?.module.practicumId ?? media.scheduleEvent?.practicumId ?? media.practicumId;
+      const practicumId = media.module?.practicumId ?? media.scheduleEvent?.practicumId ?? media.practicumId;
       void activeStudentEmails(practicumId)
         .then((emails) => Promise.all(emails.map((to) => sendNewMediaNotification({ to, mediaTitle: media.title ?? "Новая запись", kind: media.kind, mediaId: media.id }))))
         .catch((error: unknown) => console.error("Media recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
@@ -672,7 +649,7 @@ export class CourseService {
         durationSec: true,
         position: true,
         publishedAt: true,
-        lessonId: true,
+        moduleId: true,
       },
     });
     if (!existing) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
@@ -706,7 +683,7 @@ export class CourseService {
           metadata: {
             title: existing.title,
             kind: existing.kind,
-            lessonId: existing.lessonId,
+            moduleId: existing.moduleId,
             scheduleEventId: existing.scheduleEventId,
           },
         },
@@ -717,43 +694,43 @@ export class CourseService {
     return this.toMediaDto(archived);
   }
 
-  public async attachMediaToLesson(actorId: string, mediaId: string, lessonId: string) {
+  public async attachMediaToModule(actorId: string, mediaId: string, moduleId: string) {
     await this.assertCurator(actorId);
     const normalizedMediaId = requiredText(mediaId, "mediaId", 100);
-    const normalizedLessonId = requiredText(lessonId, "lessonId", 100);
-    const lesson = await prisma.lesson.findUnique({ where: { id: normalizedLessonId }, select: { id: true, module: { select: { practicumId: true } } } });
-    if (!lesson) throw new AuthServiceError("INVALID_INPUT", "Lesson does not exist");
-    const lastMedia = await prisma.mediaAsset.findFirst({ where: { lessonId: normalizedLessonId }, orderBy: { position: "desc" }, select: { position: true } });
+    const normalizedModuleId = requiredText(moduleId, "moduleId", 100);
+    const courseModule = await prisma.module.findUnique({ where: { id: normalizedModuleId }, select: { id: true, practicumId: true } });
+    if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
+    const lastMedia = await prisma.mediaAsset.findFirst({ where: { moduleId: normalizedModuleId }, orderBy: { position: "desc" }, select: { position: true } });
     const source = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, publishedAt: true } });
     if (!source) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     if (source.kind === MediaAssetKind.TALKS) throw new AuthServiceError("INVALID_INPUT", "Talks-запись нельзя привязать к уроку");
-    const media = await prisma.mediaAsset.create({ data: { practicumId: lesson.module.practicumId, lessonId: normalizedLessonId, provider: source.provider, providerKey: source.providerKey, kind: source.kind, status: source.status, title: source.title, description: source.description, durationSec: source.durationSec, publishedAt: source.publishedAt, position: (lastMedia?.position ?? -1) + 1 }, select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, position: true, publishedAt: true } }).catch(() => null);
+    const media = await prisma.mediaAsset.create({ data: { practicumId: courseModule.practicumId, moduleId: normalizedModuleId, provider: source.provider, providerKey: source.providerKey, kind: source.kind, status: source.status, title: source.title, description: source.description, durationSec: source.durationSec, publishedAt: source.publishedAt, position: (lastMedia?.position ?? -1) + 1 }, select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, position: true, publishedAt: true } }).catch(() => null);
     if (!media) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     return this.toMediaDto(media);
   }
 
   /**
-   * Reclassifies an existing media record in place (kind and/or lesson/event binding) —
-   * unlike attachMediaToLesson, this does not create a copy, so a stream mis-typed as
+   * Reclassifies an existing media record in place (kind and/or module/event binding) —
+   * unlike attachMediaToModule, this does not create a copy, so a stream mis-typed as
    * STREAM can be turned into QA without leaving a duplicate behind.
    */
   public async updateMediaClassification(actorId: string, mediaId: string, input: UpdateMediaClassificationInput) {
     await this.assertCurator(actorId);
     const normalizedMediaId = requiredText(mediaId, "mediaId", 100);
-    const lessonId = input.lessonId ? requiredText(input.lessonId, "lessonId", 100) : undefined;
+    const moduleId = input.moduleId ? requiredText(input.moduleId, "moduleId", 100) : undefined;
     const scheduleEventId = input.scheduleEventId ? requiredText(input.scheduleEventId, "scheduleEventId", 100) : undefined;
-    if (input.kind !== MediaAssetKind.TALKS && !lessonId && !scheduleEventId) {
-      throw new AuthServiceError("INVALID_INPUT", "lessonId or scheduleEventId is required for this media type");
+    if (input.kind !== MediaAssetKind.TALKS && !moduleId && !scheduleEventId) {
+      throw new AuthServiceError("INVALID_INPUT", "moduleId or scheduleEventId is required for this media type");
     }
 
     const existing = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { id: true, practicumId: true } });
     if (!existing) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
 
     let practicumId = existing.practicumId;
-    if (lessonId) {
-      const lesson = await prisma.lesson.findUnique({ where: { id: lessonId }, select: { id: true, module: { select: { practicumId: true } } } });
-      if (!lesson) throw new AuthServiceError("INVALID_INPUT", "Lesson does not exist");
-      practicumId = lesson.module.practicumId;
+    if (moduleId) {
+      const courseModule = await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true } });
+      if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
+      practicumId = courseModule.practicumId;
     }
     if (scheduleEventId) {
       const scheduleEvent = await prisma.scheduleEvent.findUnique({ where: { id: scheduleEventId }, select: { id: true, practicumId: true } });
@@ -762,7 +739,7 @@ export class CourseService {
     }
 
     const lastMedia = await prisma.mediaAsset.findFirst({
-      where: scheduleEventId ? { scheduleEventId } : lessonId ? { lessonId } : { practicumId, lessonId: null, scheduleEventId: null },
+      where: scheduleEventId ? { scheduleEventId } : moduleId ? { moduleId } : { practicumId, moduleId: null, scheduleEventId: null },
       orderBy: { position: "desc" },
       select: { position: true },
     });
@@ -771,7 +748,7 @@ export class CourseService {
       where: { id: normalizedMediaId },
       data: {
         kind: input.kind,
-        lessonId: lessonId ?? null,
+        moduleId: moduleId ?? null,
         scheduleEventId: scheduleEventId ?? null,
         practicumId,
         position: (lastMedia?.position ?? -1) + 1,
