@@ -97,7 +97,7 @@ export type StreamItem = {
   embedUrl?: string | null;
 };
 
-export type ScheduleEventKind = "Практическая часть" | "Q&A" | "Разбор ДЗ" | "Бэктест";
+export type ScheduleEventKind = "Практическая часть" | "Q&A" | "Разбор ДЗ" | "Бэктест" | "Лекция" | "Пресессия";
 
 export type ScheduleEvent = {
   id: string;
@@ -113,10 +113,12 @@ export type ScheduleEvent = {
   recordingAvailable: boolean;
   recordingIds?: readonly string[];
   coverPath?: string;
-  /** Only meaningful for type "Бэктест" — an individual slot claimed by at most one student. */
+  /** Only meaningful for type "Бэктест"/"Пресессия" — an individual slot claimed by at most one student. */
   bookedByStudentId?: string | null;
   bookedByStudentName?: string | null;
   isBookedByActor?: boolean;
+  /** Per-student booking limit for this event's type, curator-configurable; null for non-bookable types. */
+  slotLimit?: number | null;
 };
 
 export const studentDashboard = {

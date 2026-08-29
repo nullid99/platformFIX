@@ -15,6 +15,7 @@ import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { UserRole } from "@/app/generated/prisma/enums";
 import { assignmentService } from "@/app/server/assignments";
+import { scheduleService } from "@/app/server/schedule";
 
 type RequestWithCookies = Request & {
   cookies?: Record<string, string | undefined>;
@@ -123,6 +124,16 @@ export class SecurityController {
     const session = await this.requireSession(request);
     try {
       return { data: await assignmentService.listStudentHistory(session.userId, studentId) };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  @Get(":studentId/bookings")
+  public async getStudentBookings(@Req() request: RequestWithCookies, @Param("studentId") studentId: string) {
+    const session = await this.requireSession(request);
+    try {
+      return { data: await scheduleService.getStudentBookingHistory(session.userId, studentId) };
     } catch (error) {
       mapSecurityError(error);
     }

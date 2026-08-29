@@ -2,7 +2,7 @@ import { BadRequestException, Body, ConflictException, Controller, Delete, Get, 
 import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { scheduleService } from "@/app/server/schedule";
-import { parseScheduleEventBody } from "./schedule-input";
+import { parseBookingSettingsBody, parseScheduleEventBody } from "./schedule-input";
 
 type RequestWithCookies = Request & { cookies?: Record<string, string | undefined> };
 
@@ -30,6 +30,16 @@ export class ScheduleController {
   @Post()
   public async create(@Req() request: RequestWithCookies, @Body() body: unknown) {
     try { return { data: await scheduleService.create(await sessionUser(request), parseScheduleEventBody(body)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); if (error instanceof BadRequestException) throw error; throw error; }
+  }
+
+  @Get("settings")
+  public async getSettings(@Req() request: RequestWithCookies) {
+    try { return { data: await scheduleService.getBookingSettings(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  @Put("settings")
+  public async updateSettings(@Req() request: RequestWithCookies, @Body() body: unknown) {
+    try { return { data: await scheduleService.updateBookingSettings(await sessionUser(request), parseBookingSettingsBody(body)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); if (error instanceof BadRequestException) throw error; throw error; }
   }
 
   @Put(":eventId")

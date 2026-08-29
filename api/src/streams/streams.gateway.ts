@@ -63,6 +63,20 @@ export class StreamsGateway implements OnGatewayConnection {
     }
   }
 
+  @SubscribeMessage("chat:delete")
+  public async handleDelete(@ConnectedSocket() client: Socket, @MessageBody() payload: { messageId?: unknown }): Promise<void> {
+    const userId = client.data.userId as string | undefined;
+    if (!userId) return;
+    const messageId = typeof payload?.messageId === "string" ? payload.messageId : "";
+    if (!messageId) return;
+    try {
+      const result = await streamChatService.deleteMessage(userId, messageId);
+      this.server.emit("chat:delete", result);
+    } catch (error) {
+      client.emit("chat:error", error instanceof AuthServiceError ? error.message : "Не удалось удалить сообщение");
+    }
+  }
+
   @SubscribeMessage("chat:react")
   public async handleReact(@ConnectedSocket() client: Socket, @MessageBody() payload: { messageId?: unknown; emoji?: unknown }): Promise<void> {
     const userId = client.data.userId as string | undefined;

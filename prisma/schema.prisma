@@ -72,6 +72,13 @@ enum ScheduleEventType {
   QA
   BREAKDOWN
   BACKTEST
+  LECTURE
+  PRE_SESSION
+}
+
+enum ScheduleBookingAction {
+  BOOKED
+  CANCELLED
 }
 
 enum ModuleAccessStatus {
@@ -159,6 +166,8 @@ model User {
   mediaPlaybackEvents MediaPlaybackEvent[]
   notifications      Notification[]
   backtestBookings   ScheduleEvent[]      @relation("ScheduleEventBooking")
+  scheduleBookingsAsStudent ScheduleBooking[] @relation("ScheduleBookingStudent")
+  scheduleBookingsAsActor   ScheduleBooking[] @relation("ScheduleBookingActor")
 
   @@index([role, status])
 }
@@ -285,6 +294,8 @@ model Practicum {
   accessUntil  DateTime?
   streamLiveInputUid String?
   currentStreamSessionStartedAt DateTime?
+  backtestSlotLimit   Int @default(1)
+  preSessionSlotLimit Int @default(1)
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
   enrollments  Enrollment[]
@@ -293,6 +304,7 @@ model Practicum {
   mediaAssets  MediaAsset[]
   scheduleEvents ScheduleEvent[]
   streamMessages StreamMessage[]
+  scheduleBookings ScheduleBooking[]
 }
 
 model StreamMessage {
@@ -302,6 +314,8 @@ model StreamMessage {
   body        String
   fileId      String?
   replyToId   String?
+  /** { title, imageUrl, siteName, sourceUrl } — populated at send time for a recognized TradingView chart-snapshot link in the body. */
+  linkPreview Json?
   createdAt   DateTime   @default(now())
   practicum   Practicum  @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   author      User       @relation(fields: [authorId], references: [id], onDelete: Restrict)
@@ -483,11 +497,10 @@ model ScheduleEvent {
   updatedAt   DateTime          @updatedAt
   practicum   Practicum         @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   mediaAssets MediaAsset[]
-  // Individual BACKTEST slots: one event = one bookable time, claimed by at most one
-  // student. ScheduleService.book() additionally enforces one BACKTEST booking per
-  // student across the whole practicum — the personal review call is one-time, not a
-  // recurring resource, so the check is "does this student hold ANY booking" rather
-  // than a per-event capacity counter.
+  // Individual BACKTEST/PRE_SESSION slots: one event = one bookable time, claimed by at
+  // most one student. ScheduleService.book() enforces a per-student, per-type limit read
+  // from Practicum.backtestSlotLimit/preSessionSlotLimit (default 1) — a count against the
+  // configured limit, not a hardcoded one-time check.
   bookedByStudentId String?
   bookedAt          DateTime?
   bookedBy          User?             @relation("ScheduleEventBooking", fields: [bookedByStudentId], references: [id], onDelete: SetNull)
@@ -495,6 +508,30 @@ model ScheduleEvent {
   @@index([practicumId, date])
   @@index([practicumId, type, date])
   @@index([bookedByStudentId])
+}
+
+/** Append-only log of book/cancel actions — ScheduleEvent.bookedByStudentId only holds the
+  * CURRENT booking (nulled out on cancel), so this is the only place booking history lives.
+  * Stores a snapshot of the event's title/date/time so history stays readable even if the
+  * original event is later edited or deleted; eventId is a plain reference, not an FK. */
+model ScheduleBooking {
+  id          String                @id @default(cuid())
+  practicumId String
+  eventId     String
+  eventType   ScheduleEventType
+  eventTitle  String
+  eventDate   DateTime              @db.Date
+  eventTime   String
+  studentId   String
+  action      ScheduleBookingAction
+  actorId     String
+  createdAt   DateTime              @default(now())
+  practicum   Practicum             @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  student     User                  @relation("ScheduleBookingStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  actor       User                  @relation("ScheduleBookingActor", fields: [actorId], references: [id], onDelete: Cascade)
+
+  @@index([studentId, createdAt])
+  @@index([practicumId, eventType, createdAt])
 }
 
 model Assignment {

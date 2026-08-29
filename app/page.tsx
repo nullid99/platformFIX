@@ -33,10 +33,10 @@ import {
   Pencil,
   Radio,
   RotateCcw,
+  Save,
   Trash2,
   UserPlus,
   ShieldCheck,
-  SmilePlus,
   MonitorSmartphone,
   Settings2,
   Sparkles,
@@ -230,7 +230,7 @@ type CourseApiModule = {
 
 type CourseModule = PracticumModule & { position: number; coverPath: string | null };
 
-type CourseScheduleEvent = { id: string; type: "PRACTICE" | "QA" | "BREAKDOWN" | "BACKTEST"; title: string; date: string; time: string; description: string; live: boolean; coverPath: string | null; recordingAvailable: boolean; recordings: Array<{ id: string; title: string | null; status: "DRAFT" | "PUBLISHED" | "ARCHIVED"; embedUrl: string | null; thumbnailUrl: string | null }>; bookedByStudentId: string | null; bookedByStudentName: string | null; isBookedByActor: boolean };
+type CourseScheduleEvent = { id: string; type: "PRACTICE" | "QA" | "BREAKDOWN" | "BACKTEST" | "LECTURE" | "PRE_SESSION"; title: string; date: string; time: string; description: string; live: boolean; coverPath: string | null; recordingAvailable: boolean; recordings: Array<{ id: string; title: string | null; status: "DRAFT" | "PUBLISHED" | "ARCHIVED"; embedUrl: string | null; thumbnailUrl: string | null }>; bookedByStudentId: string | null; bookedByStudentName: string | null; isBookedByActor: boolean; slotLimit: number | null };
 type CourseApiPayload = { data?: { modules?: CourseApiModule[]; media?: CourseLessonMedia[]; scheduleEvents?: CourseScheduleEvent[] } };
 
 type CourseState = {
@@ -1297,7 +1297,13 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
   const currentAttemptNumber = Number.parseInt(item.attempt.replace(/\D/g, ""), 10) || 1;
   const attemptHistory = item.attemptHistory?.length ? item.attemptHistory : [{ attempt: currentAttemptNumber, status: item.status, submittedAt: item.submittedAt }];
 
-  const canDecide = Boolean(item.reviewerId) && item.isReviewerSelf !== false;
+  // NEEDS_REVISION/ACCEPTED submissions carry a reviewerId too (the curator who last decided
+  // them), but there's nothing to decide right now — NEEDS_REVISION is waiting on the student
+  // to resubmit, and the backend's nextSubmissionStatus() only accepts a decision from
+  // SUBMITTED/IN_REVIEW ("На проверке"). Gating on status here keeps the buttons disabled
+  // instead of letting a click reach the server and bounce back as a raw error.
+  const canDecide = Boolean(item.reviewerId) && item.isReviewerSelf !== false && item.status === "На проверке";
+  const awaitingResubmission = item.status === "Нужна доработка" && item.isReviewerSelf !== false;
 
   useEffect(() => () => {
     if (feedbackAttachmentPreviewUrl) URL.revokeObjectURL(feedbackAttachmentPreviewUrl);
@@ -1420,7 +1426,7 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
         </div>) : <div className="submission-legacy-file"><FileCheck2 size={16} /><div><strong>{[...new Set(item.attachments)].join(", ")}</strong><span>Это вложение сохранено до подключения защищённого хранилища. Попросите ученика отправить работу повторно.</span></div></div>}
       </div><p className="attachment-preview-note">Предпросмотр открыт внутри платформы и доступен только участникам этой проверки.</p></div>}
         <div className="submission-section review-history-section"><div className="review-section-heading"><span className="detail-label">ИСТОРИЯ ПОПЫТОК</span></div><div className="attempt-history">{attemptHistory.map((attempt) => { const isCurrent = attempt.attempt === currentAttemptNumber; const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted"; const statusLabel = attempt.status === "На проверке" ? "Отправлено на проверку" : attempt.status; return <div key={attempt.attempt}><span className={`attempt-dot ${dotTone}`} /><div><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><small>{attempt.submittedAt} · {statusLabel}</small></div></div>; })}</div></div>
-      <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ВАШ ОТВЕТ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} onPaste={handleFeedbackPaste} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : "Напиши, что получилось и что нужно поправить… Скриншот можно вставить через Ctrl+V"} rows={4} disabled={item.status === "Принято" || !canDecide} />{item.status !== "Принято" && canDecide && <label className={`discussion-attachment-picker ${feedbackAttachmentName ? "has-file" : ""}`} htmlFor="curator-feedback-attachment"><FileCheck2 size={17} /><span>{feedbackAttachmentName || "Прикрепить скриншот или файл"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V</small><input id="curator-feedback-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectFeedbackAttachment(event.target.files?.[0])} /></label>}{feedbackAttachmentError && <div className="file-error" role="alert">{feedbackAttachmentError}</div>}{feedbackAttachmentPreviewUrl && <div className="discussion-selected-preview">{feedbackAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${feedbackAttachmentName}`} style={{ backgroundImage: `url("${feedbackAttachmentPreviewUrl}")` }} />}{feedbackAttachmentType === "video" && <video src={feedbackAttachmentPreviewUrl} controls playsInline preload="metadata" />}{feedbackAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{feedbackAttachmentName}</span></div>}</div>}{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
+      <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ВАШ ОТВЕТ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} onPaste={handleFeedbackPaste} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : awaitingResubmission ? "Ждём доработку от ученика — как только он отправит новую попытку, здесь снова будет можно оставить ответ." : "Напиши, что получилось и что нужно поправить… Скриншот можно вставить через Ctrl+V"} rows={4} disabled={item.status === "Принято" || !canDecide} />{item.status !== "Принято" && canDecide && <label className={`discussion-attachment-picker ${feedbackAttachmentName ? "has-file" : ""}`} htmlFor="curator-feedback-attachment"><FileCheck2 size={17} /><span>{feedbackAttachmentName || "Прикрепить скриншот или файл"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V</small><input id="curator-feedback-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectFeedbackAttachment(event.target.files?.[0])} /></label>}{feedbackAttachmentError && <div className="file-error" role="alert">{feedbackAttachmentError}</div>}{feedbackAttachmentPreviewUrl && <div className="discussion-selected-preview">{feedbackAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${feedbackAttachmentName}`} style={{ backgroundImage: `url("${feedbackAttachmentPreviewUrl}")` }} />}{feedbackAttachmentType === "video" && <video src={feedbackAttachmentPreviewUrl} controls playsInline preload="metadata" />}{feedbackAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{feedbackAttachmentName}</span></div>}</div>}{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}{awaitingResubmission && <div className="detail-feedback curator-decision"><Clock3 size={17} /><div><strong>Ждём доработку от ученика</strong><p>Вы уже отправили эту попытку на доработку. Как только ученик пришлёт новую, работа снова появится здесь для проверки.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
     </div>
     {previewFile && <div className="attachment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Просмотр файла ${previewFile.name}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewFile(null); }}><div className="attachment-modal"><div className="video-modal-head"><strong>{previewFile.name}</strong><button className="icon-button" aria-label="Закрыть просмотр" onClick={() => setPreviewFile(null)}><X size={18} /></button></div>{previewFile.type.startsWith("image/") && <div className="attachment-modal-image" style={{ backgroundImage: `url("${API_ORIGIN}${previewFile.url}")` }} />}{previewFile.type.startsWith("video/") && <video src={`${API_ORIGIN}${previewFile.url}`} controls autoPlay playsInline />}{previewFile.type === "application/pdf" && <iframe src={`${API_ORIGIN}${previewFile.url}`} title={previewFile.name} />}</div></div>}
   </section>;
@@ -1544,7 +1550,7 @@ function CuratorStudentsView({ onInvite }: { onInvite: () => void }) {
   if (error) return <section className="content-panel directory-empty"><div className="empty-state"><ShieldCheck size={24} /><strong>{error}</strong><span>Список доступен владельцу и куратору только в рамках их прав.</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Открыть приглашения</button></div></section>;
   if (students.length === 0) return <section className="content-panel directory-empty"><div className="empty-state"><UsersRoundIcon /><strong>Пока нет учеников</strong><span>Создай первое приглашение, чтобы участник появился в этом списке.</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Создать приглашение</button></div></section>;
 
-  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<UsersRoundIcon />} label="Учеников в доступе" value={String(students.length)} detail="Активные участники потока" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /><StatCard icon={<FileCheck2 size={18} />} label="Отправлено работ" value={String(submissions)} detail="Всего в базе" accent="amber" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><span className="section-kicker">ПРОФИЛИ ПОТОКА</span><h2>Ученики</h2></div><div className="section-heading-actions"><span className="progress-inline">{students.length} профилей</span><button className="primary-button compact-button curator-create-assignment-button" onClick={onInvite}><UserPlus size={15} /> Создать приглашение</button></div></div><div className="directory-rows">{students.map((student) => { const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0]; return <button className={`directory-row ${student.id === selectedStudent.id ? "selected" : ""}`} key={student.id} onClick={() => setSelectedId(student.id)}>{identity?.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={31} height={31} unoptimized /> : <div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}<div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</span></div><div className="directory-row-meta"><strong>{student.submissionCount}</strong><span>ДЗ</span></div><ChevronRight size={16} /></button>; })}</div></section><StudentDirectoryDetail student={selectedStudent} onClaim={claimStudent} onTransfer={transferStudent} claiming={claimingStudentId === selectedStudent?.id} /></div></div>;
+  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<UsersRoundIcon />} label="Учеников в потоке" value={String(students.length)} detail="Активные участники практикума" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /><StatCard icon={<FileCheck2 size={18} />} label="Отправлено работ" value={String(submissions)} detail="Всего в базе" accent="amber" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><h2>Ученики</h2></div><div className="section-heading-actions"><button className="primary-button compact-button curator-create-assignment-button" onClick={onInvite}><UserPlus size={15} /> Создать приглашение</button></div></div><div className="directory-rows">{students.map((student) => { const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0]; return <button className={`directory-row ${student.id === selectedStudent.id ? "selected" : ""}`} key={student.id} onClick={() => setSelectedId(student.id)}>{identity?.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={31} height={31} unoptimized /> : <div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}<div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</span></div><div className="directory-row-meta"><strong>{student.submissionCount}</strong><span>ДЗ</span></div><ChevronRight size={16} /></button>; })}</div></section><StudentDirectoryDetail student={selectedStudent} onClaim={claimStudent} onTransfer={transferStudent} claiming={claimingStudentId === selectedStudent?.id} /></div></div>;
 }
 
 function StudentDirectoryFullPage({ student, onBack, onClaim, onTransfer, claiming }: { student: StudentDirectoryRecord; onBack: () => void; onClaim: (studentId: string) => Promise<void>; onTransfer?: (studentId: string, curatorId: string) => Promise<void>; claiming: boolean }) {
@@ -1590,7 +1596,59 @@ function StudentDirectoryFullPage({ student, onBack, onClaim, onTransfer, claimi
 }
 
 function StudentDirectoryDetail({ student, onClaim, onTransfer, claiming }: { student: StudentDirectoryRecord; onClaim?: (studentId: string) => Promise<void>; onTransfer?: (studentId: string, curatorId: string) => Promise<void>; claiming?: boolean }) {
-  return <div className="student-detail-stack directory-detail"><StudentDirectoryDetailContent student={student} onClaim={onClaim} onTransfer={onTransfer} claiming={claiming} /><StudentModuleAccessPanel student={student} /><StudentTransferControls student={student} onTransfer={onTransfer} /></div>;
+  return <div className="student-detail-stack directory-detail"><StudentDirectoryDetailContent student={student} onClaim={onClaim} onTransfer={onTransfer} claiming={claiming} /><StudentBookingPanel student={student} /><StudentModuleAccessPanel student={student} /><StudentTransferControls student={student} onTransfer={onTransfer} /></div>;
+}
+
+type StudentBookingCurrent = { id: string; type: string; typeLabel: string; title: string; date: string; time: string };
+type StudentBookingHistoryEntry = { id: string; eventType: string; typeLabel: string; eventTitle: string; eventDate: string; eventTime: string; action: "BOOKED" | "CANCELLED"; createdAt: string };
+
+/** Бэктест/пресессия — curator can't see this from anywhere but this student's own card today. */
+function StudentBookingPanel({ student }: { student: StudentDirectoryRecord }) {
+  const [data, setData] = useState<{ current: StudentBookingCurrent[]; history: StudentBookingHistoryEntry[] } | null>(null);
+  const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/security/students/${student.id}/bookings`, { credentials: "include", cache: "no-store" });
+      const payload = await response.json().catch(() => ({})) as { data?: { current: StudentBookingCurrent[]; history: StudentBookingHistoryEntry[] }; message?: string };
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось загрузить записи");
+      setData(payload.data);
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось загрузить записи");
+    }
+  }, [student.id]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
+
+  if (!student.canViewDetails) return null;
+  if (!data) return null;
+
+  return <section className="student-module-access-panel">
+    <button className="student-module-access-toggle" type="button" onClick={() => setExpanded((current) => !current)} aria-expanded={expanded}>
+      <div className="student-module-access-head"><span className="section-kicker">БЭКТЕСТ / ПРЕСЕССИЯ</span><strong>Индивидуальные слоты</strong><span>{data.current.length > 0 ? `Занято слотов: ${data.current.length}` : "Слотов не занято"}</span></div>
+      <ChevronDown size={16} className={`student-module-access-chevron ${expanded ? "is-open" : ""}`} aria-hidden="true" />
+    </button>
+    {expanded && <>
+      {error && <div className="file-error" role="alert">{error}</div>}
+      <span className="form-section-label">Текущие записи</span>
+      <div className="student-module-access-list">
+        {data.current.length === 0
+          ? <div className="student-module-access-row"><div className="student-module-access-copy"><strong>Слотов не занято</strong></div></div>
+          : data.current.map((booking) => <div className="student-module-access-row is-unlocked" key={booking.id}><div className="student-module-access-copy"><strong>{booking.typeLabel}</strong><small>Записан на {formatEventDate(booking.date)}, {booking.time}</small></div></div>)}
+      </div>
+      <span className="form-section-label">История</span>
+      <div className="student-module-access-list">
+        {data.history.length === 0
+          ? <div className="student-module-access-row"><div className="student-module-access-copy"><strong>Записей ещё не было</strong></div></div>
+          : data.history.map((entry) => <div className="student-module-access-row" key={entry.id}><div className="student-module-access-copy"><strong>{entry.action === "BOOKED" ? "Забронировал(а)" : "Отменил(а)"} · {entry.typeLabel}</strong><small>{formatEventDate(entry.eventDate)}, {entry.eventTime} · {relativeTimeFromNow(entry.createdAt)}</small></div></div>)}
+      </div>
+    </>}
+  </section>;
 }
 
 type StudentModuleAccessRow = { moduleId: string; title: string; number: string; defaultAccess: string; status: string; isOverride: boolean };
@@ -2140,6 +2198,7 @@ function CuratorLessonPage({ module, onBack, onNavigate }: { module: CourseApiMo
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [deletingMediaId, setDeletingMediaId] = useState("");
+  const [deletingAssignmentId, setDeletingAssignmentId] = useState("");
   const [notice, setNotice] = useState("");
   const [noticeError, setNoticeError] = useState(false);
   const showNotice = (message: string, error = false) => { setNoticeError(error); setNotice(message); };
@@ -2207,6 +2266,27 @@ function CuratorLessonPage({ module, onBack, onNavigate }: { module: CourseApiMo
       setDeletingMediaId("");
     }
   };
+
+  const archiveAssignment = async (assignment: CourseAssignmentSummary) => {
+    if (deletingAssignmentId) return;
+    const title = assignment.title?.trim() || "Без названия";
+    if (!window.confirm(`Удалить ДЗ «${title}» из этого урока? Уже отправленные учениками работы по нему сохранятся в истории.`)) return;
+    setDeletingAssignmentId(assignment.id);
+    setSaving(true);
+    showNotice("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/assignments/${assignment.id}`, { method: "DELETE", credentials: "include" });
+      const payload = await response.json().catch(() => ({})) as { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось удалить домашнее задание.");
+      setAssignments((current) => current.filter((item) => item.id !== assignment.id));
+      showNotice("Домашнее задание удалено из урока.");
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Не удалось удалить домашнее задание.", true);
+    } finally {
+      setSaving(false);
+      setDeletingAssignmentId("");
+    }
+  };
   const save = async () => {
     setSaving(true); showNotice("");
     try {
@@ -2226,9 +2306,9 @@ function CuratorLessonPage({ module, onBack, onNavigate }: { module: CourseApiMo
     <div className="curator-lesson-hint"><Settings2 size={16} /><span>Тематические стримы находятся в центральном блоке, а записи Q&A — рядом с вопросами.</span></div>
     <div className="module-resource-grid">
       <section className="module-resource-card module-description-card"><div className="module-resource-heading"><BookOpen size={17} /><h3>Описание</h3><span>Редактируется</span></div><textarea className="curator-lesson-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Добавьте описание урока…" /></section>
-      <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMedia.length} {thematicMedia.length === 1 ? "материал" : "материалов"}</span><button className="quiet-button add-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button></div>{thematicMedia.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических стримов пока нет</strong><span>Q&A-записи не смешиваются с тематическими материалами.</span></div> : <div className="module-video-stack">{thematicMedia.map((item) => <div className={`module-video-stage ${draggedId === item.id ? "is-dragging" : ""}`} key={item.id} draggable onDragStart={() => setDraggedId(item.id)} onDragEnd={() => setDraggedId(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => moveMedia(item.id)}>{item.embedUrl && <iframe src={item.embedUrl} title={item.title ?? "Запись стрима"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}<span className="module-video-label">{item.title ?? "Материал без названия"}</span><span className="stream-duration">{item.status === "PUBLISHED" ? "ОПУБЛИКОВАНО" : "ЧЕРНОВИК"}</span><div className="module-video-card-controls"><span className="curator-drag-handle" title="Перетащите, чтобы изменить порядок">⋮⋮</span><span className="module-video-kind-badge">{mediaKindLabel(item.kind)}</span><button className="quiet-button danger-button" type="button" disabled={saving || deletingMediaId === item.id} onClick={() => void archiveLessonMedia(item)}>{deletingMediaId === item.id ? "Удаляем…" : "Удалить"}</button></div></div>)}</div>}</section>
-      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{assignments.length} {assignments.length === 1 ? "задание" : "заданий"}</span><button className="quiet-button add-button" type="button" onClick={() => setShowAssignmentForm((current) => !current)}><Plus size={15} /> {showAssignmentForm ? "Закрыть" : "Добавить ДЗ"}</button></div>{showAssignmentForm && <div className="curator-inline-form"><input value={assignmentTitle} onChange={(event) => setAssignmentTitle(event.target.value)} placeholder="Название домашнего задания" /><textarea value={assignmentDescription} onChange={(event) => setAssignmentDescription(event.target.value)} placeholder="Описание и контекст для ученика" /><div className="assignment-criteria-editor"><div className="assignment-criteria-heading"><span>Критерии проверки</span><button className="quiet-button" type="button" onClick={() => setAssignmentRequirements((current) => [...current, ""])}><Plus size={14} /> Добавить критерий</button></div>{assignmentRequirements.map((requirement, index) => <div className="assignment-criterion-row" key={`new-criterion-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => setAssignmentRequirements((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} placeholder="Например: разобрать график и описать выводы" />{assignmentRequirements.length > 1 && <button className="icon-button compact" type="button" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setAssignmentRequirements((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>}</div>)}</div><button className="primary-button" type="button" disabled={saving || !assignmentTitle.trim() || !assignmentDescription.trim()} onClick={() => void createAssignment()}>{saving ? "Создаём…" : "Создать ДЗ в этом уроке"}</button></div>}{assignments.length > 0 ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}</article>)}</div> : <div className="module-empty-copy">В этом уроке пока нет домашних заданий.</div>}</section>
-      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMedia.length} {qaMedia.length === 1 ? "запись" : "записей"}</span><button className="quiet-button add-button" type="button" onClick={() => openMediaLibrary("QA")}><Plus size={15} /> Добавить Q&A</button></div>{qaMedia.length > 0 && <div className="module-video-stack">{qaMedia.map((item) => <div className="module-qa-video-stage" key={item.id}>{item.embedUrl && <TrackedVideo mediaId={item.id} src={item.embedUrl} title={item.title ?? "Q&A с куратором"} />}<span>{item.title ?? "Q&A-запись"}</span><div className="module-video-card-controls"><span className="module-video-kind-badge">{item.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</span><button className="quiet-button danger-button" type="button" disabled={saving || deletingMediaId === item.id} onClick={() => void archiveLessonMedia(item)}>{deletingMediaId === item.id ? "Удаляем…" : "Удалить"}</button></div></div>)}</div>}<ul>{fallback.questions.map((question) => <li key={question}>{question}</li>)}</ul>{qaMedia.length === 0 && <div className="module-action-feedback">Добавьте Q&A-запись — она будет показана ученику именно в этом блоке.</div>}</section>
+      <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMedia.length} {thematicMedia.length === 1 ? "материал" : "материалов"}</span><button className="quiet-button add-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button></div>{thematicMedia.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических стримов пока нет</strong><span>Q&A-записи не смешиваются с тематическими материалами.</span></div> : <div className="module-video-stack">{thematicMedia.map((item) => <div className={`module-video-card ${draggedId === item.id ? "is-dragging" : ""}`} key={item.id} draggable onDragStart={() => setDraggedId(item.id)} onDragEnd={() => setDraggedId(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => moveMedia(item.id)}><div className="module-video-stage">{item.embedUrl && <iframe src={item.embedUrl} title={item.title ?? "Запись стрима"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}<span className="module-video-label">{item.title ?? "Материал без названия"}</span><span className="stream-duration">{item.status === "PUBLISHED" ? "ОПУБЛИКОВАНО" : "ЧЕРНОВИК"}</span><span className="curator-drag-handle" title="Перетащите, чтобы изменить порядок">⋮⋮</span></div><div className="module-video-footer"><span className="module-video-kind-badge">{mediaKindLabel(item.kind)}</span><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingMediaId === item.id} onClick={() => void archiveLessonMedia(item)}>{deletingMediaId === item.id ? "Удаляем…" : "Удалить"}</button></div></div>)}</div>}</section>
+      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{assignments.length} {assignments.length === 1 ? "задание" : "заданий"}</span><button className="quiet-button add-button" type="button" onClick={() => setShowAssignmentForm((current) => !current)}><Plus size={15} /> {showAssignmentForm ? "Закрыть" : "Добавить ДЗ"}</button></div>{showAssignmentForm && <div className="curator-inline-form"><input value={assignmentTitle} onChange={(event) => setAssignmentTitle(event.target.value)} placeholder="Название домашнего задания" /><textarea value={assignmentDescription} onChange={(event) => setAssignmentDescription(event.target.value)} placeholder="Описание и контекст для ученика" /><div className="assignment-criteria-editor"><div className="assignment-criteria-heading"><span>Критерии проверки</span><button className="quiet-button" type="button" onClick={() => setAssignmentRequirements((current) => [...current, ""])}><Plus size={14} /> Добавить критерий</button></div>{assignmentRequirements.map((requirement, index) => <div className="assignment-criterion-row" key={`new-criterion-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => setAssignmentRequirements((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} placeholder="Например: разобрать график и описать выводы" />{assignmentRequirements.length > 1 && <button className="icon-button compact" type="button" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setAssignmentRequirements((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>}</div>)}</div><button className="primary-button" type="button" disabled={saving || !assignmentTitle.trim() || !assignmentDescription.trim()} onClick={() => void createAssignment()}>{saving ? "Создаём…" : "Создать ДЗ в этом уроке"}</button></div>}{assignments.length > 0 ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div className="curator-assignment-card-head"><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingAssignmentId === assignment.id} onClick={() => void archiveAssignment(assignment)}>{deletingAssignmentId === assignment.id ? "Удаляем…" : "Удалить"}</button></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}</article>)}</div> : <div className="module-empty-copy">В этом уроке пока нет домашних заданий.</div>}</section>
+      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMedia.length} {qaMedia.length === 1 ? "запись" : "записей"}</span><button className="quiet-button add-button" type="button" onClick={() => openMediaLibrary("QA")}><Plus size={15} /> Добавить Q&A</button></div>{qaMedia.length > 0 && <div className="module-video-stack">{qaMedia.map((item) => <div className="module-qa-video-card" key={item.id}><div className="module-qa-video-stage">{item.embedUrl && <TrackedVideo mediaId={item.id} src={item.embedUrl} title={item.title ?? "Q&A с куратором"} />}<span>{item.title ?? "Q&A-запись"}</span></div><div className="module-video-footer"><span className="module-video-kind-badge">{item.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</span><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingMediaId === item.id} onClick={() => void archiveLessonMedia(item)}>{deletingMediaId === item.id ? "Удаляем…" : "Удалить"}</button></div></div>)}</div>}<ul>{fallback.questions.map((question) => <li key={question}>{question}</li>)}</ul>{qaMedia.length === 0 && <div className="module-action-feedback">Добавьте Q&A-запись — она будет показана ученику именно в этом блоке.</div>}</section>
     </div>{notice && <div className={`detail-feedback ${noticeError ? "error" : "accepted"} curator-lesson-notice`} role={noticeError ? "alert" : undefined}>{notice}</div>}
   </div>;
 }
@@ -2570,6 +2650,59 @@ function normalizeVimeoUrl(rawUrl: string) {
   }
 }
 
+function ScheduleBookingSettingsPanel() {
+  const [backtestSlotLimit, setBacktestSlotLimit] = useState(1);
+  const [preSessionSlotLimit, setPreSessionSlotLimit] = useState(1);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    void fetch(`${API_ORIGIN}/api/schedule/settings`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload: { data?: { backtestSlotLimit: number; preSessionSlotLimit: number } } | null) => {
+        if (payload?.data) { setBacktestSlotLimit(payload.data.backtestSlotLimit); setPreSessionSlotLimit(payload.data.preSessionSlotLimit); }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true); setNotice("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/schedule/settings`, {
+        method: "PUT", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backtestSlotLimit, preSessionSlotLimit }),
+      });
+      const payload = await response.json().catch(() => ({})) as { data?: { backtestSlotLimit: number; preSessionSlotLimit: number }; message?: string };
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось сохранить настройки");
+      setBacktestSlotLimit(payload.data.backtestSlotLimit);
+      setPreSessionSlotLimit(payload.data.preSessionSlotLimit);
+      setNotice("Лимиты сохранены.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Не удалось сохранить настройки");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <section className="student-module-access-panel schedule-slot-settings">
+    <button className="student-module-access-toggle" type="button" onClick={() => setExpanded((current) => !current)} aria-expanded={expanded}>
+      <div className="student-module-access-head"><span className="section-kicker">ЛИМИТЫ ЗАПИСИ</span><strong>Слотов на ученика</strong><span>Бэктест — {backtestSlotLimit}, Пресессия — {preSessionSlotLimit}</span></div>
+      <ChevronDown size={16} className={`student-module-access-chevron ${expanded ? "is-open" : ""}`} aria-hidden="true" />
+    </button>
+    {expanded && <form className="schedule-slot-settings-body" onSubmit={(event) => void save(event)}>
+      <div className="form-grid">
+        <label className="form-field"><span>Бэктест</span><input type="number" min={0} max={20} value={backtestSlotLimit} onChange={(event) => setBacktestSlotLimit(Number(event.target.value))} /></label>
+        <label className="form-field"><span>Пресессия</span><input type="number" min={0} max={20} value={preSessionSlotLimit} onChange={(event) => setPreSessionSlotLimit(Number(event.target.value))} /></label>
+      </div>
+      <div className="create-actions"><button type="submit" className="primary-button" disabled={saving}><Save size={15} /> {saving ? "Сохраняем…" : "Сохранить"}</button></div>
+      {notice && <div className="form-action-feedback">{notice}</div>}
+    </form>}
+  </section>;
+}
+
 function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
   const [events, setEvents] = useState<ScheduleEvent[]>([]);
   const [selectedId, setSelectedId] = useState(events[0]?.id ?? "");
@@ -2623,13 +2756,13 @@ function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav)
     setEvents((current) => current.map((item) => item.id === updated.id ? updated : item));
   };
 
-  return <div className="curator-schedule">{scheduleLoadError && <div className="file-error" role="alert">{scheduleLoadError}</div>}<div className="curator-schedule-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><strong>{events.length} событий опубликовано</strong><span>События видят ученики этого потока после публикации.</span></div><div className="schedule-toolbar-actions"><button className="primary-button" onClick={() => { setEditingEvent(null); setPendingDate(null); setDetailsId(null); setFormDate(toDateKey(new Date())); setShowForm((current) => !current); }}><Plus size={16} /> {showForm ? "Закрыть форму" : "Создать событие"}</button><span className="schedule-toolbar-divider" aria-hidden="true" /><button className="secondary-button" disabled={!selectedEvent} onClick={() => selectedEvent && openEdit(selectedEvent)}><Pencil size={15} /> Редактировать</button><button className="secondary-button danger-button" disabled={!selectedEvent} onClick={removeEvent}><Trash2 size={15} /> Удалить</button></div></div>{pendingDate && <div className="schedule-date-confirm"><div><strong>Добавить событие на {formatEventDate(pendingDate)}?</strong><span>Дата уже выбрана. Подтверди действие, и откроется форма с деталями.</span></div><div><button className="secondary-button" type="button" onClick={() => setPendingDate(null)}>Нет</button><button className="primary-button" type="button" onClick={confirmCreateForDate}>Да, добавить</button></div></div>}{showForm && <ScheduleEventForm initialDate={formDate} initialEvent={editingEvent} onCancel={() => { setShowForm(false); setEditingEvent(null); }} onCreate={(event) => { void saveEvent(event).catch(() => undefined); }} />}<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedEvent?.id ?? ""} onSelect={(eventId) => { const event = events.find((item) => item.id === eventId); if (event) openEvent(event); }} onDateSelect={openCreateForDate} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">ПЛАН ПОТОКА</span><h2>События и записи</h2></div><CalendarDays size={18} className="heading-icon" /></div>{events.length === 0 ? <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Кликни по дате в календаре или нажми «Создать событие».</span></div> : events.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} mode="curator" onOpen={() => openEvent(event)} key={event.id} />)}</section></div>{detailsEvent && <CuratorScheduleEventDetails event={detailsEvent} onEdit={() => openEdit(detailsEvent)} onDelete={removeEvent} onClose={() => setDetailsId(null)} onAddRecording={() => { window.sessionStorage.setItem("curator-target-event", detailsEvent.id); onNavigate("Медиатека"); }} onReleaseBooking={() => void releaseBooking(detailsEvent.id)} />}</div>;
+  return <div className="curator-schedule">{scheduleLoadError && <div className="file-error" role="alert">{scheduleLoadError}</div>}<div className="curator-schedule-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><strong>{events.length} событий опубликовано</strong><span>События видят ученики этого потока после публикации.</span></div><div className="schedule-toolbar-actions"><button className="primary-button" onClick={() => { setEditingEvent(null); setPendingDate(null); setDetailsId(null); setFormDate(toDateKey(new Date())); setShowForm((current) => !current); }}><Plus size={16} /> {showForm ? "Закрыть форму" : "Создать событие"}</button><span className="schedule-toolbar-divider" aria-hidden="true" /><button className="secondary-button" disabled={!selectedEvent} onClick={() => selectedEvent && openEdit(selectedEvent)}><Pencil size={15} /> Редактировать</button><button className="secondary-button danger-button" disabled={!selectedEvent} onClick={removeEvent}><Trash2 size={15} /> Удалить</button></div></div><ScheduleBookingSettingsPanel />{pendingDate && <div className="schedule-date-confirm"><div><strong>Добавить событие на {formatEventDate(pendingDate)}?</strong><span>Дата уже выбрана. Подтверди действие, и откроется форма с деталями.</span></div><div><button className="secondary-button" type="button" onClick={() => setPendingDate(null)}>Нет</button><button className="primary-button" type="button" onClick={confirmCreateForDate}>Да, добавить</button></div></div>}{showForm && <ScheduleEventForm initialDate={formDate} initialEvent={editingEvent} onCancel={() => { setShowForm(false); setEditingEvent(null); }} onCreate={(event) => { void saveEvent(event).catch(() => undefined); }} />}<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedEvent?.id ?? ""} onSelect={(eventId) => { const event = events.find((item) => item.id === eventId); if (event) openEvent(event); }} onDateSelect={openCreateForDate} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">ПЛАН ПОТОКА</span><h2>События и записи</h2></div><CalendarDays size={18} className="heading-icon" /></div>{events.length === 0 ? <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Кликни по дате в календаре или нажми «Создать событие».</span></div> : events.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} mode="curator" onOpen={() => openEvent(event)} key={event.id} />)}</section></div>{detailsEvent && <CuratorScheduleEventDetails event={detailsEvent} onEdit={() => openEdit(detailsEvent)} onDelete={removeEvent} onClose={() => setDetailsId(null)} onAddRecording={() => { window.sessionStorage.setItem("curator-target-event", detailsEvent.id); onNavigate("Медиатека"); }} onReleaseBooking={() => void releaseBooking(detailsEvent.id)} />}</div>;
 }
 
 function CuratorScheduleEventDetails({ event, onEdit, onDelete, onClose, onAddRecording, onReleaseBooking }: { event: ScheduleEvent; onEdit: () => void; onDelete: () => void; onClose: () => void; onAddRecording: () => void; onReleaseBooking: () => void }) {
   const coverPath = eventCoverPath(event);
-  const isBacktest = event.type === "Бэктест";
-  return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal curator-event-details" role="dialog" aria-modal="true" aria-labelledby="curator-schedule-event-title"><div className="rich-event-topbar"><h2 id="curator-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>{event.type}</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong></div><h3>{event.title}</h3><div className="rich-event-line"><CalendarDays size={16} /><span>{formatEventDate(event.date)}</span></div><div className="rich-event-description">{event.description}</div>{isBacktest && <div className="event-recording-note"><Target size={16} /><div><strong>{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот пока свободен"}</strong><span>{event.bookedByStudentName ? "Индивидуальный слот занят этим учеником." : "Ученик сможет записаться на этот слот из своего расписания."}</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Ученики увидят её в разделе «Стримы».</span></div></div>}</div><div className="rich-event-footer"><button className="secondary-button danger-button" onClick={onDelete}>Удалить</button><button className="secondary-button" onClick={onEdit}>Редактировать</button>{isBacktest && event.bookedByStudentName && <button className="secondary-button" onClick={onReleaseBooking}>Освободить слот</button>}{!event.recordingAvailable && <button className="secondary-button" onClick={onAddRecording}><Plus size={15} /> Добавить запись Vimeo</button>}<button className="primary-button" onClick={onClose}>Закрыть</button></div></section></div>;
+  const isBookable = isBookableSlotType(event.type);
+  return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal curator-event-details" role="dialog" aria-modal="true" aria-labelledby="curator-schedule-event-title"><div className="rich-event-topbar"><h2 id="curator-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>{event.type}</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong></div><h3>{event.title}</h3><div className="rich-event-line"><CalendarDays size={16} /><span>{formatEventDate(event.date)}</span></div><div className="rich-event-description">{event.description}</div>{isBookable && <div className="event-recording-note"><Target size={16} /><div><strong>{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот пока свободен"}</strong><span>{event.bookedByStudentName ? "Индивидуальный слот занят этим учеником." : "Ученик сможет записаться на этот слот из своего расписания."}</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Ученики увидят её в разделе «Стримы».</span></div></div>}</div><div className="rich-event-footer"><button className="secondary-button danger-button" onClick={onDelete}>Удалить</button><button className="secondary-button" onClick={onEdit}>Редактировать</button>{isBookable && event.bookedByStudentName && <button className="secondary-button" onClick={onReleaseBooking}>Освободить слот</button>}{!event.recordingAvailable && <button className="secondary-button" onClick={onAddRecording}><Plus size={15} /> Добавить запись Vimeo</button>}<button className="primary-button" onClick={onClose}>Закрыть</button></div></section></div>;
 }
 
 function eventStartDate(event: ScheduleEvent): Date {
@@ -2652,7 +2785,8 @@ type LiveInputDto = { uid: string; rtmpsUrl: string | null; rtmpsStreamKey: stri
 const REACTION_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"] as const;
 
 type StreamChatReaction = { emoji: string; userIds: string[] };
-type StreamChatMessage = { id: string; body: string; createdAt: string; authorId: string; authorName: string; authorRole: "STUDENT" | "CURATOR" | "OWNER"; attachment: { fileId: string; url: string } | null; replyTo: { id: string; authorName: string; authorRole: "STUDENT" | "CURATOR" | "OWNER"; body: string } | null; reactions: StreamChatReaction[] };
+type StreamChatLinkPreview = { title: string; imageUrl: string; siteName: string; sourceUrl: string };
+type StreamChatMessage = { id: string; body: string; createdAt: string; authorId: string; authorName: string; authorAvatarUrl: string | null; authorRole: "STUDENT" | "CURATOR" | "OWNER"; attachment: { fileId: string; url: string } | null; linkPreview: StreamChatLinkPreview | null; replyTo: { id: string; authorName: string; authorRole: "STUDENT" | "CURATOR" | "OWNER"; body: string } | null; reactions: StreamChatReaction[] };
 type ChatReactionEvent = { messageId: string; emoji: string; userId: string; added: boolean };
 
 function applyReactionEvent(messages: StreamChatMessage[], event: ChatReactionEvent): StreamChatMessage[] {
@@ -2689,6 +2823,7 @@ function useStreamChat() {
     socket.on("chat:history", (history: StreamChatMessage[]) => setMessages(history));
     socket.on("chat:message", (message: StreamChatMessage) => setMessages((current) => [...current, message]));
     socket.on("chat:reaction", (event: ChatReactionEvent) => setMessages((current) => applyReactionEvent(current, event)));
+    socket.on("chat:delete", ({ messageId }: { messageId: string }) => setMessages((current) => current.filter((message) => message.id !== messageId)));
     socket.on("chat:error", (message: string) => setChatError(message));
     return () => { socket.disconnect(); socketRef.current = null; };
   }, []);
@@ -2702,7 +2837,11 @@ function useStreamChat() {
     socketRef.current?.emit("chat:react", { messageId, emoji });
   }, []);
 
-  return { messages, connected, chatError, currentUserId, sendMessage, react };
+  const deleteMessage = useCallback((messageId: string) => {
+    socketRef.current?.emit("chat:delete", { messageId });
+  }, []);
+
+  return { messages, connected, chatError, currentUserId, sendMessage, react, deleteMessage };
 }
 
 async function uploadChatImage(file: File): Promise<string> {
@@ -2735,45 +2874,86 @@ function linkifyText(text: string): ReactNode[] {
   ));
 }
 
-function ChatMessageRow({ message, currentUserId, onReply, onReact }: { message: StreamChatMessage; currentUserId: string; onReply: (message: StreamChatMessage) => void; onReact: (messageId: string, emoji: string) => void }) {
+function ChatMessageRow({ message, currentUserId, onReact, onContextMenu }: { message: StreamChatMessage; currentUserId: string; onReact: (messageId: string, emoji: string) => void; onContextMenu: (event: ReactMouseEvent<HTMLDivElement>, message: StreamChatMessage) => void }) {
   const isStaff = message.authorRole === "CURATOR" || message.authorRole === "OWNER";
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const pickerRef = useRef<HTMLDivElement>(null);
+  const [lightboxImage, setLightboxImage] = useState<string | null>(null);
   useEffect(() => {
-    if (!pickerOpen) return;
-    const handleClickOutside = (event: MouseEvent) => { if (pickerRef.current && !pickerRef.current.contains(event.target as Node)) setPickerOpen(false); };
-    window.addEventListener("mousedown", handleClickOutside);
-    return () => window.removeEventListener("mousedown", handleClickOutside);
-  }, [pickerOpen]);
+    if (!lightboxImage) return;
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setLightboxImage(null); };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [lightboxImage]);
 
   const replyIsStaff = message.replyTo?.authorRole === "CURATOR" || message.replyTo?.authorRole === "OWNER";
   // A student answering another student's question — distinct from a curator's reply, so
   // whoever is scanning the chat can tell at a glance who actually helped.
   const isPeerAnswer = !isStaff && Boolean(message.replyTo) && message.replyTo?.authorRole === "STUDENT";
 
-  return <div className={`live-room-chat-message ${isStaff ? "is-staff" : ""} ${isPeerAnswer ? "is-peer-answer" : ""}`}>
-    <div className="live-room-chat-message-toolbar">
-      <button type="button" className="icon-button compact" aria-label="Ответить на сообщение" onClick={() => onReply(message)}><CornerUpLeft size={13} /></button>
-      <div className="live-room-reaction-picker-wrap" ref={pickerRef}>
-        <button type="button" className="icon-button compact" aria-label="Добавить реакцию" onClick={() => setPickerOpen((current) => !current)}><SmilePlus size={13} /></button>
-        {pickerOpen && <div className="live-room-reaction-picker">{REACTION_OPTIONS.map((emoji) => <button type="button" key={emoji} onClick={() => { onReact(message.id, emoji); setPickerOpen(false); }}>{emoji}</button>)}</div>}
-      </div>
+  return <div className={`live-room-chat-message ${isStaff ? "is-staff" : ""} ${isPeerAnswer ? "is-peer-answer" : ""}`} onContextMenu={(event) => onContextMenu(event, message)}>
+    <div className="live-room-chat-message-avatar">
+      {message.authorAvatarUrl ? <Image className="live-room-chat-avatar-image" src={message.authorAvatarUrl} alt={message.authorName} width={32} height={32} unoptimized /> : <div className="live-room-chat-avatar-fallback">{getInitials(message.authorName, "?")}</div>}
     </div>
-    <div><span className="live-room-chat-author"><strong className={isStaff ? "author-staff" : undefined}>{message.authorName}</strong>{isStaff && <em className="live-room-chat-staff-badge">Куратор</em>}{isPeerAnswer && <em className="live-room-chat-peer-badge">Ответ ученика</em>}</span><span>{new Date(message.createdAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</span></div>
-    {message.replyTo && <div className="live-room-chat-reply-quote"><CornerUpLeft size={13} /><strong className={replyIsStaff ? "author-staff" : undefined}>{message.replyTo.authorName}</strong><span>{message.replyTo.body || "Вложение"}</span></div>}
-    {message.body && <p>{linkifyText(message.body)}</p>}
-    {message.attachment && <a className="live-room-chat-image-link" href={message.attachment.url} target="_blank" rel="noopener noreferrer"><img className="live-room-chat-image" src={message.attachment.url} alt="Скриншот" loading="lazy" /></a>}
-    {message.reactions.length > 0 && <div className="live-room-chat-reactions">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={`live-room-chat-reaction ${reaction.userIds.includes(currentUserId) ? "active" : ""}`} onClick={() => onReact(message.id, reaction.emoji)}>{reaction.emoji} <span>{reaction.userIds.length}</span></button>)}</div>}
+    <div className="live-room-chat-message-body">
+      <div className="live-room-chat-message-head"><span className="live-room-chat-author"><strong className={isStaff ? "author-staff" : undefined}>{message.authorName}</strong>{isStaff && <em className="live-room-chat-staff-badge">Куратор</em>}{isPeerAnswer && <em className="live-room-chat-peer-badge">Ответ ученика</em>}</span><span>{new Date(message.createdAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</span></div>
+      {message.replyTo && <div className="live-room-chat-reply-quote"><CornerUpLeft size={13} /><div className="live-room-chat-reply-quote-body"><strong className={replyIsStaff ? "author-staff" : undefined}>{message.replyTo.authorName}</strong><span>{message.replyTo.body || "Вложение"}</span></div></div>}
+      {message.body && <p>{linkifyText(message.body)}</p>}
+      {message.attachment && <button type="button" className="live-room-chat-image-link" onClick={() => setLightboxImage(message.attachment!.url)}><img className="live-room-chat-image" src={message.attachment.url} alt="Скриншот" loading="lazy" /></button>}
+      {message.linkPreview && <div className="live-room-chat-embed">
+        <span className="live-room-chat-embed-site">{message.linkPreview.siteName}</span>
+        <a className="live-room-chat-embed-title" href={message.linkPreview.sourceUrl} target="_blank" rel="noopener noreferrer">{message.linkPreview.title}</a>
+        <button type="button" className="live-room-chat-embed-image-link" onClick={() => setLightboxImage(message.linkPreview!.imageUrl)}><img className="live-room-chat-embed-image" src={message.linkPreview.imageUrl} alt={message.linkPreview.title} loading="lazy" /></button>
+      </div>}
+      {lightboxImage && typeof document !== "undefined" && createPortal(
+        <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxImage(null); }}>
+          <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxImage(null)}><X size={22} /></button>
+          <img className="chat-image-lightbox-image" src={lightboxImage} alt="Просмотр изображения" />
+        </div>,
+        document.body,
+      )}
+      {message.reactions.length > 0 && <div className="live-room-chat-reactions">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={`live-room-chat-reaction ${reaction.userIds.includes(currentUserId) ? "active" : ""}`} onClick={() => onReact(message.id, reaction.emoji)}>{reaction.emoji} <span>{reaction.userIds.length}</span></button>)}</div>}
+    </div>
   </div>;
 }
 
-function ChatPanel({ isFullscreen }: { isFullscreen: boolean }) {
+function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete }: {
+  state: { message: StreamChatMessage; x: number; y: number };
+  canDelete: boolean;
+  onClose: () => void;
+  onReply: (message: StreamChatMessage) => void;
+  onReact: (messageId: string, emoji: string) => void;
+  onDelete: (messageId: string) => void;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(event.target as Node)) onClose(); };
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("mousedown", handleClickOutside);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => { window.removeEventListener("mousedown", handleClickOutside); window.removeEventListener("keydown", handleKeyDown); };
+  }, [onClose]);
+
+  const menuHeight = canDelete ? 232 : 192;
+  const left = Math.min(state.x, window.innerWidth - 220);
+  const top = Math.min(state.y, window.innerHeight - menuHeight);
+
+  return typeof document === "undefined" ? null : createPortal(
+    <div className="live-room-chat-menu" ref={menuRef} role="menu" style={{ left, top }}>
+      <div className="live-room-chat-menu-reactions">{REACTION_OPTIONS.map((emoji) => <button type="button" key={emoji} onClick={() => { onReact(state.message.id, emoji); onClose(); }}>{emoji}</button>)}</div>
+      <button type="button" className="live-room-chat-menu-item" role="menuitem" onClick={() => { onReply(state.message); onClose(); }}><CornerUpLeft size={14} /> Ответить</button>
+      {canDelete && <button type="button" className="live-room-chat-menu-item danger" role="menuitem" onClick={() => { onDelete(state.message.id); onClose(); }}><Trash2 size={14} /> Удалить сообщение</button>}
+    </div>,
+    document.body,
+  );
+}
+
+function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen: boolean; canModerate?: boolean }) {
   const [chatDraft, setChatDraft] = useState("");
   const [uploadingImage, setUploadingImage] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [replyingTo, setReplyingTo] = useState<StreamChatMessage | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ message: StreamChatMessage; x: number; y: number } | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
-  const { messages: chatMessages, connected: chatConnected, chatError, currentUserId, sendMessage, react } = useStreamChat();
+  const { messages: chatMessages, connected: chatConnected, chatError, currentUserId, sendMessage, react, deleteMessage } = useStreamChat();
 
   useEffect(() => {
     chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
@@ -2816,8 +2996,16 @@ function ChatPanel({ isFullscreen }: { isFullscreen: boolean }) {
           <strong>Сообщений пока нет</strong>
           <span>Здесь будет обсуждение эфира в реальном времени{isFullscreen ? " — чат остаётся справа и на весь экран." : "."}</span>
         </div>
-      ) : chatMessages.map((message) => <ChatMessageRow message={message} currentUserId={currentUserId} onReply={setReplyingTo} onReact={react} key={message.id} />)}
+      ) : chatMessages.map((message) => <ChatMessageRow message={message} currentUserId={currentUserId} onReact={react} onContextMenu={(event, targetMessage) => { event.preventDefault(); setContextMenu({ message: targetMessage, x: event.clientX, y: event.clientY }); }} key={message.id} />)}
     </div>
+    {contextMenu && <ChatContextMenu
+      state={contextMenu}
+      canDelete={canModerate || contextMenu.message.authorId === currentUserId}
+      onClose={() => setContextMenu(null)}
+      onReply={setReplyingTo}
+      onReact={react}
+      onDelete={deleteMessage}
+    />}
     {(chatError || uploadError) && <span className="live-room-error live-room-chat-error">{uploadError ?? chatError}</span>}
     {replyingTo && <div className="live-room-chat-replying-bar"><CornerUpLeft size={13} /><span>Ответ для <strong>{replyingTo.authorName}</strong>: {replyingTo.body || "Вложение"}</span><button type="button" className="icon-button compact" aria-label="Отменить ответ" onClick={() => setReplyingTo(null)}><X size={13} /></button></div>}
     <form className="live-room-chat-form" onSubmit={submitChatMessage}>
@@ -2992,7 +3180,7 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
         )}
       </section>
 
-      <ChatPanel isFullscreen={isFullscreen} />
+      <ChatPanel isFullscreen={isFullscreen} canModerate />
     </div>
 
     <section className="content-panel live-room-upcoming">
@@ -3034,10 +3222,10 @@ function ScheduleEventForm({ initialDate = toDateKey(new Date()), initialEvent, 
     if (!canCreate) return;
     const parsedDate = new Date(`${date}T12:00:00`);
     const weekday = new Intl.DateTimeFormat("ru-RU", { weekday: "long" }).format(parsedDate);
-    onCreate({ id: initialEvent?.id ?? `event-${Date.now()}`, date, day: date.slice(-2), month: parsedDate.toLocaleDateString("ru-RU", { month: "short" }).replace(".", "").toUpperCase(), weekday, type, title: title.trim(), time: time.trim(), live: type === "Практическая часть", description: description.trim(), recordingAvailable: initialEvent?.recordingAvailable ?? false, coverPath: coverPath.trim() || undefined });
+    onCreate({ id: initialEvent?.id ?? `event-${Date.now()}`, date, day: date.slice(-2), month: parsedDate.toLocaleDateString("ru-RU", { month: "short" }).replace(".", "").toUpperCase(), weekday, type, title: title.trim(), time: time.trim(), live: type === "Практическая часть" || type === "Лекция", description: description.trim(), recordingAvailable: initialEvent?.recordingAvailable ?? false, coverPath: coverPath.trim() || undefined });
   };
 
-  return <form className="content-panel schedule-form" onSubmit={submit}><div className="section-heading"><div><span className="section-kicker">НОВОЕ СОБЫТИЕ</span><h2>Добавить встречу в поток</h2></div><button type="button" className="icon-button compact" aria-label="Закрыть форму" onClick={onCancel}><X size={16} /></button></div><div className="form-body"><div className="form-grid"><label className="form-field form-field-wide"><span>Название</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Разбор рынка в прямом эфире" /></label><label className="form-field"><span>Тип события</span><select value={type} onChange={(event) => setType(event.target.value as ScheduleEvent["type"])}><option>Практическая часть</option><option>Q&A</option><option>Разбор ДЗ</option><option>Бэктест</option></select>{type === "Бэктест" && <small className="form-field-hint">Индивидуальный слот: свободен для записи, пока его не займёт один ученик — лимит 1 звонок на весь практикум.</small>}</label><label className="form-field"><span>Дата</span><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label className="form-field"><span>Время</span><input value={time} onChange={(event) => setTime(event.target.value)} placeholder="19:00 — 20:30" /></label><label className="form-field form-field-wide"><span>Описание</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={3} placeholder="Что будет происходить на встрече и что подготовить ученикам?" /></label></div><div className="schedule-cover-picker"><div><span className="form-section-label">Обложка события</span><p>Выберите готовую обложку или загрузите свою.</p></div><div className="schedule-cover-grid">{scheduleCoverOptions.map((option) => <button type="button" className={`schedule-cover-option ${coverPath === option.path ? "selected" : ""}`} key={option.path} onClick={() => { setCoverPath(option.path); setCoverFileName(""); }}><span style={{ backgroundImage: `url("${option.path}")` }} /><strong>{option.label}</strong></button>)}</div><label className="schedule-cover-upload"><Plus size={16} /><span>{coverFileName || "Выбрать изображение с компьютера"}</span><small>PNG, JPG, WEBP · до 5 МБ</small><input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => handleCoverFile(event.target.files?.[0])} /></label>{coverError && <div className="file-error" role="alert">{coverError}</div>}</div><div className="create-actions"><button type="button" className="secondary-button" onClick={onCancel}>Отмена</button><button type="submit" className="primary-button" disabled={!canCreate}>Опубликовать событие <ChevronRight size={16} /></button></div></div></form>;
+  return <form className="content-panel schedule-form" onSubmit={submit}><div className="section-heading"><div><span className="section-kicker">НОВОЕ СОБЫТИЕ</span><h2>Добавить встречу в поток</h2></div><button type="button" className="icon-button compact" aria-label="Закрыть форму" onClick={onCancel}><X size={16} /></button></div><div className="form-body"><div className="form-grid"><label className="form-field form-field-wide"><span>Название</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Разбор рынка в прямом эфире" /></label><label className="form-field"><span>Тип события</span><select value={type} onChange={(event) => setType(event.target.value as ScheduleEvent["type"])}><option>Лекция</option><option>Практическая часть</option><option>Q&A</option><option>Разбор ДЗ</option><option>Бэктест</option><option>Пресессия</option></select>{isBookableSlotType(type) && <small className="form-field-hint">Индивидуальный слот: свободен для записи, пока его не займёт ученик — количество слотов на ученика настраивается в блоке «Лимиты записи» на странице «Расписание».</small>}</label><label className="form-field"><span>Дата</span><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label className="form-field"><span>Время</span><input value={time} onChange={(event) => setTime(event.target.value)} placeholder="19:00 — 20:30" /></label><label className="form-field form-field-wide"><span>Описание</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={3} placeholder="Что будет происходить на встрече и что подготовить ученикам?" /></label></div><div className="schedule-cover-picker"><div><span className="form-section-label">Обложка события</span><p>Выберите готовую обложку или загрузите свою.</p></div><div className="schedule-cover-grid">{scheduleCoverOptions.map((option) => <button type="button" className={`schedule-cover-option ${coverPath === option.path ? "selected" : ""}`} key={option.path} onClick={() => { setCoverPath(option.path); setCoverFileName(""); }}><span style={{ backgroundImage: `url("${option.path}")` }} /><strong>{option.label}</strong></button>)}</div><label className="schedule-cover-upload"><Plus size={16} /><span>{coverFileName || "Выбрать изображение с компьютера"}</span><small>PNG, JPG, WEBP · до 5 МБ</small><input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => handleCoverFile(event.target.files?.[0])} /></label>{coverError && <div className="file-error" role="alert">{coverError}</div>}</div><div className="create-actions"><button type="button" className="secondary-button" onClick={onCancel}>Отмена</button><button type="submit" className="primary-button" disabled={!canCreate}>Опубликовать событие <ChevronRight size={16} /></button></div></div></form>;
 }
 
 type SubmissionFormat = "comment" | "image" | "video";
@@ -3675,18 +3863,22 @@ function scheduleApiTypeToUi(type: ScheduleApiEvent["type"]): ScheduleEvent["typ
   if (type === "QA") return "Q&A";
   if (type === "BREAKDOWN") return "Разбор ДЗ";
   if (type === "BACKTEST") return "Бэктест";
+  if (type === "LECTURE") return "Лекция";
+  if (type === "PRE_SESSION") return "Пресессия";
   return "Практическая часть";
 }
 
 function scheduleApiToUi(event: ScheduleApiEvent): ScheduleEvent {
   const parsedDate = new Date(`${event.date}T12:00:00`);
-  return { id: event.id, date: event.date, day: event.date.slice(-2), month: parsedDate.toLocaleDateString("ru-RU", { month: "short" }).replace(".", "").toUpperCase(), weekday: parsedDate.toLocaleDateString("ru-RU", { weekday: "long" }), type: scheduleApiTypeToUi(event.type), title: event.title, time: event.time, live: event.live, description: event.description, recordingAvailable: event.recordingAvailable, recordingIds: event.recordings.filter((recording) => recording.status === "PUBLISHED").map((recording) => recording.id), coverPath: event.coverPath ?? undefined, bookedByStudentId: event.bookedByStudentId, bookedByStudentName: event.bookedByStudentName, isBookedByActor: event.isBookedByActor };
+  return { id: event.id, date: event.date, day: event.date.slice(-2), month: parsedDate.toLocaleDateString("ru-RU", { month: "short" }).replace(".", "").toUpperCase(), weekday: parsedDate.toLocaleDateString("ru-RU", { weekday: "long" }), type: scheduleApiTypeToUi(event.type), title: event.title, time: event.time, live: event.live, description: event.description, recordingAvailable: event.recordingAvailable, recordingIds: event.recordings.filter((recording) => recording.status === "PUBLISHED").map((recording) => recording.id), coverPath: event.coverPath ?? undefined, bookedByStudentId: event.bookedByStudentId, bookedByStudentName: event.bookedByStudentName, isBookedByActor: event.isBookedByActor, slotLimit: event.slotLimit };
 }
 
-function scheduleUiTypeToApi(type: ScheduleEvent["type"]): "PRACTICE" | "QA" | "BREAKDOWN" | "BACKTEST" {
+function scheduleUiTypeToApi(type: ScheduleEvent["type"]): "PRACTICE" | "QA" | "BREAKDOWN" | "BACKTEST" | "LECTURE" | "PRE_SESSION" {
   if (type === "Q&A") return "QA";
   if (type === "Разбор ДЗ") return "BREAKDOWN";
   if (type === "Бэктест") return "BACKTEST";
+  if (type === "Лекция") return "LECTURE";
+  if (type === "Пресессия") return "PRE_SESSION";
   return "PRACTICE";
 }
 
@@ -3707,7 +3899,16 @@ function ScheduleView({ onOpenStreams, onJoinLive }: { onOpenStreams: (recording
   const [bookingError, setBookingError] = useState("");
   const selectedEvent = events.find((event) => event.id === selectedId) ?? events[0];
   const detailsEvent = events.find((event) => event.id === detailsId);
-  const hasBacktestBooking = events.some((event) => event.type === "Бэктест" && event.isBookedByActor);
+  const hasReachedSlotLimit = (type: ScheduleEvent["type"]) => {
+    const limit = events.find((event) => event.type === type)?.slotLimit ?? null;
+    if (limit === null) return false;
+    return events.filter((event) => event.type === type && event.isBookedByActor).length >= limit;
+  };
+  // Slots someone else has already taken clutter the "Участие" list for every other student —
+  // the calendar grid still shows them (colored, so a day's availability is visible at a
+  // glance), but this side list only surfaces slots that are still open, or that the viewer
+  // holds themselves.
+  const visibleEvents = events.filter((event) => !isBookableSlotType(event.type) || !event.bookedByStudentId || event.isBookedByActor);
   useEffect(() => {
     const load = async () => {
       const response = await fetch(`${API_ORIGIN}/api/schedule`, { credentials: "include", cache: "no-store" });
@@ -3735,23 +3936,24 @@ function ScheduleView({ onOpenStreams, onJoinLive }: { onOpenStreams: (recording
     }
   };
 
-  return <>{<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedId} onSelect={openEvent} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">СОБЫТИЯ</span><h2>Участие</h2></div><CalendarDays size={18} className="heading-icon" /></div>{bookingError && <div className="file-error" role="alert">{bookingError}</div>}{events.length > 0 ? events.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} onOpen={() => openEvent(event.id)} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(event.id, "book")} onCancelBooking={() => void runBooking(event.id, "cancel-booking")} bookingBusy={bookingEventId === event.id} hasBacktestBooking={hasBacktestBooking} key={event.id} />) : <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Куратор ещё не опубликовал встречи потока — они появятся здесь.</span></div>}</section></div>}{detailsEvent && <RichScheduleEventDetails event={detailsEvent} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(detailsEvent.id, "book")} onCancelBooking={() => void runBooking(detailsEvent.id, "cancel-booking")} bookingBusy={bookingEventId === detailsEvent.id} hasBacktestBooking={hasBacktestBooking} onClose={() => setDetailsId(null)} />}</>;
+  return <>{<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedId} onSelect={openEvent} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">СОБЫТИЯ</span><h2>Участие</h2></div><CalendarDays size={18} className="heading-icon" /></div>{bookingError && <div className="file-error" role="alert">{bookingError}</div>}{visibleEvents.length > 0 ? visibleEvents.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} onOpen={() => openEvent(event.id)} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(event.id, "book")} onCancelBooking={() => void runBooking(event.id, "cancel-booking")} bookingBusy={bookingEventId === event.id} hasReachedSlotLimit={hasReachedSlotLimit(event.type)} key={event.id} />) : <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Куратор ещё не опубликовал встречи потока — они появятся здесь.</span></div>}</section></div>}{detailsEvent && <RichScheduleEventDetails event={detailsEvent} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(detailsEvent.id, "book")} onCancelBooking={() => void runBooking(detailsEvent.id, "cancel-booking")} bookingBusy={bookingEventId === detailsEvent.id} hasReachedSlotLimit={hasReachedSlotLimit(detailsEvent.type)} onClose={() => setDetailsId(null)} />}</>;
 }
 
 function CalendarGrid({ events, selectedId, onSelect, onDateSelect }: { events: readonly ScheduleEvent[]; selectedId: string; onSelect: (eventId: string) => void; onDateSelect?: (date: string) => void }) {
   const [currentMonth, setCurrentMonth] = useState(() => startOfMonth(new Date()));
   const days = buildCalendarDays(currentMonth);
   const todayKey = toDateKey(new Date());
-  const eventsByDate = new Map(events.map((event) => [event.date, event]));
+  const eventsByDate = new Map<string, ScheduleEvent[]>();
+  for (const event of events) eventsByDate.set(event.date, [...(eventsByDate.get(event.date) ?? []), event]);
   const shiftMonth = (amount: number) => setCurrentMonth((current) => new Date(current.getFullYear(), current.getMonth() + amount, 1));
 
-  return <><div className="calendar-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><h2>{formatCalendarMonth(currentMonth)}</h2></div><div className="calendar-controls"><button className="icon-button compact" aria-label="Предыдущий месяц" onClick={() => shiftMonth(-1)}><ChevronRight size={16} className="rotate-left" /></button><button className="today-button" onClick={() => setCurrentMonth(startOfMonth(new Date()))}>Сегодня</button><button className="icon-button compact" aria-label="Следующий месяц" onClick={() => shiftMonth(1)}><ChevronRight size={16} /></button></div></div><div className="calendar-weekdays"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div><div className="calendar-grid">{days.map(({ date, isOutside }) => { const event = eventsByDate.get(toDateKey(date)); const dateKey = toDateKey(date); const isToday = dateKey === todayKey; return <div className={`calendar-day ${isToday ? "today" : ""} ${isOutside ? "outside" : ""} ${event ? "has-event" : ""}`} key={dateKey} aria-label={event ? `${formatEventDate(event.date)}: ${event.title}` : formatEventDate(dateKey)} onClick={() => onDateSelect?.(dateKey)}><span className="calendar-day-number">{date.getDate()}</span>{event && <button className={`calendar-event ${eventTone(event)} ${event.id === selectedId ? "selected" : ""}`} onClick={(clickEvent) => { clickEvent.stopPropagation(); onSelect(event.id); }}><span>{event.type}</span><strong>{event.title}</strong></button>}</div>; })}</div></>;
+  return <><div className="calendar-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><h2>{formatCalendarMonth(currentMonth)}</h2></div><div className="calendar-controls"><button className="icon-button compact" aria-label="Предыдущий месяц" onClick={() => shiftMonth(-1)}><ChevronRight size={16} className="rotate-left" /></button><button className="today-button" onClick={() => setCurrentMonth(startOfMonth(new Date()))}>Сегодня</button><button className="icon-button compact" aria-label="Следующий месяц" onClick={() => shiftMonth(1)}><ChevronRight size={16} /></button></div></div><div className="calendar-weekdays"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div><div className="calendar-grid">{days.map(({ date, isOutside }) => { const dateKey = toDateKey(date); const dayEvents = eventsByDate.get(dateKey) ?? []; const isToday = dateKey === todayKey; return <div className={`calendar-day ${isToday ? "today" : ""} ${isOutside ? "outside" : ""} ${dayEvents.length > 0 ? "has-event" : ""}`} key={dateKey} aria-label={dayEvents.length > 0 ? `${formatEventDate(dateKey)}: ${dayEvents.map((event) => event.title).join(", ")}` : formatEventDate(dateKey)} onClick={() => onDateSelect?.(dateKey)}><span className="calendar-day-number">{date.getDate()}</span>{dayEvents.map((event) => { const bookingClass = isBookableSlotType(event.type) ? (event.bookedByStudentId ? "is-booked" : "is-open") : ""; return <button className={`calendar-event ${eventTone(event)} ${bookingClass} ${event.id === selectedId ? "selected" : ""}`} key={event.id} onClick={(clickEvent) => { clickEvent.stopPropagation(); onSelect(event.id); }}><span>{event.type}</span><strong>{event.title}</strong></button>; })}</div>; })}</div></>;
 }
 
-function RichScheduleEventDetails({ event, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy, hasBacktestBooking, onClose }: { event: ScheduleEvent; onOpenStreams: (recordingId?: string) => void; onJoinLive: () => void; onBook: () => void; onCancelBooking: () => void; bookingBusy: boolean; hasBacktestBooking: boolean; onClose: () => void }) {
+function RichScheduleEventDetails({ event, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy, hasReachedSlotLimit, onClose }: { event: ScheduleEvent; onOpenStreams: (recordingId?: string) => void; onJoinLive: () => void; onBook: () => void; onCancelBooking: () => void; bookingBusy: boolean; hasReachedSlotLimit: boolean; onClose: () => void }) {
   const formattedDate = formatEventDate(event.date);
   const coverPath = eventCoverPath(event);
-  const isBacktest = event.type === "Бэктест";
+  const isBookable = isBookableSlotType(event.type);
   const [now] = useState(() => Date.now());
   const liveNow = isEventLiveNow(event, now);
   const onOpenStreams = () => {
@@ -3763,15 +3965,15 @@ function RichScheduleEventDetails({ event, onOpenStreams: navigateToStreams, onJ
   let footerAction: ReactNode;
   if (event.recordingAvailable) {
     footerAction = <button className="primary-button" onClick={() => { onClose(); onOpenStreams(); }}>Открыть запись <Play size={15} /></button>;
-  } else if (isBacktest) {
+  } else if (isBookable) {
     if (event.isBookedByActor) footerAction = <button className="primary-button is-joined" onClick={onCancelBooking} disabled={bookingBusy}>{bookingBusy ? "Отменяем…" : "Вы записаны · отменить"}</button>;
     else if (event.bookedByStudentId) footerAction = <button className="primary-button" disabled>Слот уже занят</button>;
-    else if (hasBacktestBooking) footerAction = <button className="primary-button" disabled>Бэктест уже использован</button>;
+    else if (hasReachedSlotLimit) footerAction = <button className="primary-button" disabled>Слоты этого типа исчерпаны</button>;
     else footerAction = <button className="primary-button" onClick={onBook} disabled={bookingBusy}>{bookingBusy ? "Записываем…" : "Записаться"}</button>;
   } else {
     footerAction = <button className={`primary-button ${liveNow ? "is-joined" : ""}`} onClick={() => { onClose(); onJoinLive(); }} disabled={!liveNow}>{liveNow ? "Присоединиться" : "Эфир ещё не начался"}</button>;
   }
-  return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal" role="dialog" aria-modal="true" aria-labelledby="rich-schedule-event-title"><div className="rich-event-topbar"><h2 id="rich-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>Участники потока</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong></div><h3>{event.title}</h3><div className="rich-event-line"><span>◉</span><span>Project FIX</span></div><div className="rich-event-line"><CalendarDays size={16} /><span>{formattedDate}</span></div><div className="rich-event-description">{event.description}</div>{isBacktest && event.isBookedByActor && <div className="event-recording-note"><Target size={16} /><div><strong>Слот забронирован за вами</strong><span>Куратор свяжется с вами по расписанному времени.</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Запись доступна в разделе «Стримы» и останется там после завершения события.</span></div></div>}</div><div className="rich-event-footer">{footerAction}</div></section></div>;
+  return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal" role="dialog" aria-modal="true" aria-labelledby="rich-schedule-event-title"><div className="rich-event-topbar"><h2 id="rich-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>Участники потока</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong></div><h3>{event.title}</h3><div className="rich-event-line"><span>◉</span><span>Project FIX</span></div><div className="rich-event-line"><CalendarDays size={16} /><span>{formattedDate}</span></div><div className="rich-event-description">{event.description}</div>{isBookable && event.isBookedByActor && <div className="event-recording-note"><Target size={16} /><div><strong>Слот забронирован за вами</strong><span>Куратор свяжется с вами по расписанному времени.</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Запись доступна в разделе «Стримы» и останется там после завершения события.</span></div></div>}</div><div className="rich-event-footer">{footerAction}</div></section></div>;
 }
 
 function startOfMonth(date: Date) {
@@ -3801,7 +4003,7 @@ function buildCalendarDays(month: Date) {
   });
 }
 
-function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy = false, hasBacktestBooking = false }: {
+function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy = false, hasReachedSlotLimit = false }: {
   event: ScheduleEvent;
   selected: boolean;
   mode?: "student" | "curator";
@@ -3811,7 +4013,7 @@ function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenSt
   onBook?: () => void;
   onCancelBooking?: () => void;
   bookingBusy?: boolean;
-  hasBacktestBooking?: boolean;
+  hasReachedSlotLimit?: boolean;
 }) {
   const coverPath = eventCoverPath(event);
   const coverStyle = coverPath ? { backgroundImage: `linear-gradient(90deg, #030303 0%, rgba(3,3,3,.97) 58%, rgba(3,3,3,.82) 78%, rgba(3,3,3,.35) 100%), url("${coverPath}")` } : undefined;
@@ -3820,7 +4022,7 @@ function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenSt
     if (recordingId && typeof window !== "undefined") window.sessionStorage.setItem("fix-target-stream", recordingId);
     navigateToStreams(recordingId);
   } : undefined;
-  const isBacktest = event.type === "Бэктест";
+  const isBookable = isBookableSlotType(event.type);
   const [now] = useState(() => Date.now());
   const liveNow = isEventLiveNow(event, now);
   const stop = (handler?: () => void) => (clickEvent: ReactMouseEvent<HTMLButtonElement>) => { clickEvent.stopPropagation(); handler?.(); };
@@ -3830,16 +4032,16 @@ function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenSt
     actionButton = <button className="event-action" aria-label={`Открыть событие: ${event.title}`} onClick={onOpen}><ArrowUpRight size={17} /></button>;
   } else if (event.recordingAvailable) {
     actionButton = <button className="event-register joined" onClick={onOpen}>Смотреть запись</button>;
-  } else if (isBacktest) {
+  } else if (isBookable) {
     if (event.isBookedByActor) actionButton = <button className="event-register joined" onClick={stop(onCancelBooking)} disabled={bookingBusy}>{bookingBusy ? "…" : "Вы записаны"}</button>;
     else if (event.bookedByStudentId) actionButton = <button className="event-register" disabled>Занято</button>;
-    else if (hasBacktestBooking) actionButton = <button className="event-register" disabled>Использовано</button>;
+    else if (hasReachedSlotLimit) actionButton = <button className="event-register" disabled>Использовано</button>;
     else actionButton = <button className="event-register" onClick={stop(onBook)} disabled={bookingBusy}>{bookingBusy ? "…" : "Записаться"}</button>;
   } else {
     actionButton = <button className={`event-register ${liveNow ? "joined" : ""}`} onClick={stop(onJoinLive)} disabled={!liveNow}>{liveNow ? "Присоединиться" : "Скоро"}</button>;
   }
 
-  return <div className={`event-card schedule-event-card ${coverPath ? "has-cover" : ""} ${selected ? "selected" : ""}`} style={coverStyle}><button className="event-card-main" onClick={onOpen}><div className={`event-date ${eventTone(event)}`}><strong>{event.day}</strong><span>{event.month}</span></div><div className="event-info"><div className="event-type">{event.live && <span className="live-dot" />} {event.type.toUpperCase()}</div><h3>{event.title}</h3><p><Clock3 size={14} /> {event.weekday} · {event.time}</p>{isBacktest && mode === "curator" && <p className="event-backtest-status">{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот свободен"}</p>}</div></button>{actionButton}{mode === "student" && event.recordingAvailable && onOpenStreams && <button className="event-recording-link" onClick={(clickEvent) => { clickEvent.stopPropagation(); onOpenStreams(); }}><Play size={14} /> Запись добавлена · смотреть в «Стримах»</button>}</div>;
+  return <div className={`event-card schedule-event-card ${coverPath ? "has-cover" : ""} ${selected ? "selected" : ""}`} style={coverStyle}><button className="event-card-main" onClick={onOpen}><div className={`event-date ${eventTone(event)}`}><strong>{event.day}</strong><span>{event.month}</span></div><div className="event-info"><div className="event-type">{event.live && <span className="live-dot" />} {event.type.toUpperCase()}</div><h3>{event.title}</h3><p><Clock3 size={14} /> {event.weekday} · {event.time}</p>{isBookable && mode === "curator" && <p className="event-backtest-status">{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот свободен"}</p>}</div></button>{actionButton}{mode === "student" && event.recordingAvailable && onOpenStreams && <button className="event-recording-link" onClick={(clickEvent) => { clickEvent.stopPropagation(); onOpenStreams(); }}><Play size={14} /> Запись добавлена · смотреть в «Стримах»</button>}</div>;
 }
 
 function eventCoverPath(event: ScheduleEvent): string | undefined {
@@ -3852,6 +4054,10 @@ function eventCoverPath(event: ScheduleEvent): string | undefined {
 
 function eventTone(event: ScheduleEvent) {
   return event.type === "Практическая часть" ? "blue" : event.type === "Q&A" ? "cyan" : "amber";
+}
+
+function isBookableSlotType(type: ScheduleEvent["type"]): boolean {
+  return type === "Бэктест" || type === "Пресессия";
 }
 
 function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: DashboardNav) => void }) {
