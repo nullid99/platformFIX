@@ -25,7 +25,7 @@ test("student asks a question, curator replies, student sees the reply", async (
     // 1. Student opens the default module and asks a question from its Q&A card.
     await studentPage.goto("/");
     await studentPage.getByRole("navigation", { name: "Основная навигация" }).getByRole("button", { name: "Мой практикум", exact: true }).click();
-    await studentPage.getByRole("button", { name: /Открыть модуль|Продолжить обучение/ }).click();
+    await studentPage.getByRole("button", { name: /Открыть урок|Продолжить обучение/ }).click();
     await studentPage.getByRole("button", { name: "Открыть обсуждение" }).click();
 
     await studentPage.getByPlaceholder("Например: Как определить точку входа в этом сценарии?").fill(uniqueTitle);
@@ -48,7 +48,7 @@ test("student asks a question, curator replies, student sees the reply", async (
     await curatorPage.getByRole("navigation", { name: "Основная навигация" }).getByRole("button", { name: "Обсуждения" }).click();
     await curatorPage.getByRole("button", { name: new RegExp(uniqueTitle) }).click();
     await expect(curatorPage.getByText(questionBody)).toBeVisible();
-    await curatorPage.getByPlaceholder("Напиши ответ и добавь ученику следующий шаг…").fill(replyBody);
+    await curatorPage.getByPlaceholder("Напишите ответ…").fill(replyBody);
     await curatorPage.getByRole("button", { name: "Отправить ответ" }).click();
     await expect(curatorPage.getByText(replyBody)).toBeVisible();
 

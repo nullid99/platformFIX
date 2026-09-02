@@ -24,6 +24,8 @@ test("curator publishes an assignment, student submits it, curator accepts it, s
     await curatorPage.getByRole("navigation", { name: "Основная навигация" }).getByRole("button", { name: "Создать задание" }).click();
     await curatorPage.getByPlaceholder("Например, Разметка зон на истории").fill(uniqueTitle);
     await curatorPage.getByPlaceholder("Объясни, что ученик должен сделать и зачем это нужно в системе…").fill("E2E: описание задания для автотеста.");
+    // The criteria inputs are collapsed by default and revealed by this toggle.
+    await curatorPage.getByRole("button", { name: "Добавить критерии" }).click();
     await curatorPage.getByPlaceholder("Добавить критерий проверки").first().fill("E2E: критерий проверки");
 
     const publishButton = curatorPage.getByRole("button", { name: "Опубликовать задание" });
