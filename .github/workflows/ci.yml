@@ -35,6 +35,10 @@ jobs:
 
       - run: npm ci
 
+      # The Prisma client is generated code (app/generated, git-ignored) — lint, typecheck,
+      # the API build and the bootstrap scripts all import it, same as the Docker build does.
+      - run: npx prisma generate
+
       - run: npm run lint
 
       - run: npx tsc --noEmit -p tsconfig.json
@@ -81,6 +85,10 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      # The Prisma client is generated code (app/generated, git-ignored) — lint, typecheck,
+      # the API build and the bootstrap scripts all import it, same as the Docker build does.
+      - run: npx prisma generate
 
       - run: npx prisma migrate deploy
 
