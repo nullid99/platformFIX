@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { IdentityProvider, UserRole, UserStatus } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
+import { seedOpenModuleAccess } from "@/app/server/course/module-access";
 
 const confirmation = process.env.BOOTSTRAP_LOCAL_TEST_USERS_CONFIRM;
 
@@ -37,11 +38,19 @@ async function main(): Promise<void> {
   const curatorId = await ensureLocalUser(UserRole.CURATOR, "local-curator", "local-curator", "Тестовый куратор");
   const studentId = await ensureLocalUser(UserRole.STUDENT, "local-student", "local-student", "Тестовый ученик");
 
-  await prisma.enrollment.upsert({
+  const enrollment = await prisma.enrollment.upsert({
     where: { studentId_practicumId: { studentId, practicumId: practicum.id } },
     update: { status: "ACTIVE" },
     create: { studentId, practicumId: practicum.id, status: "ACTIVE" },
+    select: { id: true },
   });
+  // Real students only ever get an Enrollment via the invitation-accept path, which also
+  // seeds EnrollmentModuleAccess for every module marked open-by-default (see auth-service.ts).
+  // This script creates the Enrollment directly, so it has to seed access the same way —
+  // otherwise the test student is enrolled but locked out of every module (isModuleOpenForStudent
+  // in module-access.ts returns false with no access row), and e.g. a freshly published
+  // assignment never appears in "Задания" for them.
+  await seedOpenModuleAccess(prisma, enrollment.id, practicum.id);
   await prisma.curatorAssignment.upsert({
     where: { curatorId_studentId: { curatorId, studentId } },
     update: {},
