@@ -16,8 +16,13 @@ const courseOutline = [
 ] as const;
 
 async function main(): Promise<void> {
+  // A freshly bootstrapped instance has exactly one practicum, and it must be the active one —
+  // every "current practicum" resolver (and bootstrap-local-test-users) reads Practicum.isActive.
   const existingPracticum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" } });
-  const practicum = existingPracticum ?? await prisma.practicum.create({ data: { title: "Practicum 04", description: "Учебный поток практикума." } });
+  const practicum = existingPracticum ?? await prisma.practicum.create({ data: { title: "Practicum 04", description: "Учебный поток практикума.", isActive: true } });
+  if (!(await prisma.practicum.findFirst({ where: { isActive: true }, select: { id: true } }))) {
+    await prisma.practicum.update({ where: { id: practicum.id }, data: { isActive: true } });
+  }
 
   for (const moduleData of courseOutline) {
     const courseModule = await prisma.module.upsert({
