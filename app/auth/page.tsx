@@ -105,15 +105,26 @@ const translations: Record<Lang, {
   },
 };
 
+/** Hosts where the one-click test sign-in may appear: local development and the staging host. */
+function isTestHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname.startsWith("staging.");
+}
+
 export default function AuthPage() {
   const [authState, setAuthState] = useState("");
   const [devLoginError, setDevLoginError] = useState("");
   const [lang, setLang] = useState<Lang>("ua");
+  // The one-click test sign-in is for the tester on the staging host (and local dev) only. On
+  // the public domain a credential-less "sign in as curator" button both widens the attack
+  // surface and reads as a fake login form to phishing classifiers, so it never renders there.
+  // Decided after mount (not at render) so the statically prerendered HTML matches on hydration.
+  const [devPanelAllowed, setDevPanelAllowed] = useState(false);
   const t = translations[lang];
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setAuthState(new URLSearchParams(window.location.search).get("auth") ?? "");
+      setDevPanelAllowed(process.env.NEXT_PUBLIC_DEV_AUTH_ENABLED === "true" && isTestHost(window.location.hostname));
     }, 0);
     return () => window.clearTimeout(timer);
   }, []);
@@ -195,7 +206,7 @@ export default function AuthPage() {
             <div className="auth-note-icon"><LockKeyhole size={16} /></div>
             <div><strong>{t.noLinkTitle}</strong><span>{t.noLinkText}</span></div>
           </div>
-          {process.env.NEXT_PUBLIC_DEV_AUTH_ENABLED === "true" && <div className="auth-dev-panel">
+          {devPanelAllowed && <div className="auth-dev-panel">
             <span className="section-kicker">{t.devPanelKicker}</span>
             <strong>{t.devPanelTitle}</strong>
             <span>{t.devPanelNote}</span>

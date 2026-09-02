@@ -5,6 +5,7 @@ import { prisma } from "@/app/server/db";
 import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { sendNewEventNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
+import { getActivePracticumId } from "@/app/server/course/practicum-service";
 
 export type ScheduleEventInput = {
   type: ScheduleEventType;
@@ -71,12 +72,6 @@ function mediaDto(media: { id: string; title: string | null; provider: string; p
       embedUrl = `https://player.vimeo.com/video/${videoId}${hash ? `?h=${encodeURIComponent(hash)}` : ""}`;
       thumbnailUrl = `https://vumbnail.com/${videoId}.jpg`;
     }
-  } else if (media.provider.toUpperCase() === "CLOUDFLARE_STREAM") {
-    const [subdomain, uid] = media.providerKey.split("/");
-    if (subdomain && uid) {
-      embedUrl = `https://${subdomain}/${uid}/iframe`;
-      thumbnailUrl = `https://${subdomain}/${uid}/thumbnails/thumbnail.jpg`;
-    }
   }
 
   return { id: media.id, title: media.title, provider: media.provider, status: media.status, embedUrl, thumbnailUrl };
@@ -95,7 +90,7 @@ export class ScheduleService {
       })
       : null;
     if (user.role === UserRole.STUDENT && !enrollment) throw new AuthServiceError("FORBIDDEN", "Student is not enrolled in a practicum");
-    const practicumId = enrollment?.practicumId ?? (await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } }))?.id;
+    const practicumId = enrollment?.practicumId ?? (await getActivePracticumId());
     if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
 
     const [events, limits] = await Promise.all([
@@ -176,7 +171,9 @@ export class ScheduleService {
 
   public async create(actorId: string, input: ScheduleEventInput) {
     await this.assertCurator(actorId);
-    const practicum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true, backtestSlotLimit: true, preSessionSlotLimit: true } });
+    const activePracticumId = await getActivePracticumId();
+    if (!activePracticumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
+    const practicum = await prisma.practicum.findUnique({ where: { id: activePracticumId }, select: { id: true, backtestSlotLimit: true, preSessionSlotLimit: true } });
     if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
     const event = await prisma.scheduleEvent.create({ data: { ...this.eventFields(input), practicumId: practicum.id } });
     const eventDate = new Intl.DateTimeFormat("ru-RU").format(event.date);
@@ -189,23 +186,23 @@ export class ScheduleService {
     return this.toDto(event, actorId, { backtestSlotLimit: practicum.backtestSlotLimit, preSessionSlotLimit: practicum.preSessionSlotLimit });
   }
 
+  /** No practicum-equality gate — a curator can edit an event from any practicum, finished cohorts included. */
   public async update(actorId: string, eventId: string, input: ScheduleEventInput) {
     await this.assertCurator(actorId);
-    const practicumId = await this.curatorPracticumId();
     const existing = await prisma.scheduleEvent.findUnique({ where: { id: requiredText(eventId, "eventId", 100) }, select: { practicumId: true } });
-    if (!existing || existing.practicumId !== practicumId) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+    if (!existing) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
     const event = await prisma.scheduleEvent.update({ where: { id: eventId }, data: this.eventFields(input) }).catch(() => null);
     if (!event) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
-    const limits = await this.practicumBookingLimits(practicumId);
+    const limits = await this.practicumBookingLimits(existing.practicumId);
     return this.toDto(event, actorId, limits);
   }
 
+  /** No practicum-equality gate — a curator can delete an event from any practicum, finished cohorts included. */
   public async remove(actorId: string, eventId: string) {
     await this.assertCurator(actorId);
-    const practicumId = await this.curatorPracticumId();
     const normalizedEventId = requiredText(eventId, "eventId", 100);
-    const existing = await prisma.scheduleEvent.findUnique({ where: { id: normalizedEventId }, select: { practicumId: true } });
-    if (!existing || existing.practicumId !== practicumId) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+    const existing = await prisma.scheduleEvent.findUnique({ where: { id: normalizedEventId }, select: { id: true } });
+    if (!existing) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
     const deleted = await prisma.scheduleEvent.delete({ where: { id: normalizedEventId } }).catch(() => null);
     if (!deleted) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
     return { id: deleted.id };
@@ -279,10 +276,12 @@ export class ScheduleService {
     return value;
   }
 
-  /** For the curator's student card — the student's current bookings plus their full book/cancel history. */
+  /** For the curator's student card — the student's current bookings plus their full book/cancel history, scoped to the STUDENT's own practicum (their enrollment), not the curator's active one — a finished cohort's student still has their real booking history. */
   public async getStudentBookingHistory(actorId: string, studentId: string) {
     await this.assertCurator(actorId);
-    const practicumId = await this.curatorPracticumId();
+    const enrollment = await prisma.enrollment.findFirst({ where: { studentId }, orderBy: { createdAt: "asc" }, select: { practicumId: true } });
+    if (!enrollment) throw new AuthServiceError("INVALID_INPUT", "Student is not enrolled in a practicum");
+    const practicumId = enrollment.practicumId;
     const [current, history] = await Promise.all([
       prisma.scheduleEvent.findMany({
         where: { practicumId, bookedByStudentId: studentId },
@@ -321,9 +320,9 @@ export class ScheduleService {
   }
 
   private async curatorPracticumId(): Promise<string> {
-    const practicum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
-    if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
-    return practicum.id;
+    const practicumId = await getActivePracticumId();
+    if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
+    return practicumId;
   }
 }
 

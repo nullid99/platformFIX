@@ -132,6 +132,8 @@ enum NotificationType {
   DISCUSSION_REPLY
   REVIEW_DECISION
   STREAM_LIVE
+  SCHEDULE_REMINDER
+  SECURITY_ALERT
 }
 
 model User {
@@ -292,10 +294,26 @@ model Practicum {
   title        String
   description  String?
   accessUntil  DateTime?
-  streamLiveInputUid String?
+  // The one practicum new curator-side content (modules, streams, schedule events, invitations)
+  // targets by default — see app/server/course/practicum-service.ts#getActivePracticumId. A
+  // finished cohort's own enrollments/modules/media keep pointing at its (now inactive) row
+  // forever, so its students keep seeing exactly what they always saw.
+  isActive     Boolean      @default(false)
+  liveKitIngressId String?
+  isCurrentlyLive Boolean @default(false)
   currentStreamSessionStartedAt DateTime?
   backtestSlotLimit   Int @default(1)
   preSessionSlotLimit Int @default(1)
+  // What the curator picked as the target for the NEXT/current broadcast on the "Стримы"
+  // page — consumed (and cleared) by StreamService.createMediaAssetFromRecording once the
+  // LiveKit egress completes, so it auto-attaches + auto-publishes there instead of landing as an
+  // unassigned draft. Mutually exclusive by convention, same as MediaAsset.moduleId/scheduleEventId.
+  pendingStreamModuleId        String?
+  pendingStreamScheduleEventId String?
+  // Only meaningful alongside pendingStreamModuleId — a module's stream recordings split into
+  // the "Тематические записи" (STREAM) and "Q&A с куратором" (QA) blocks, so the curator picks
+  // which one this broadcast is for. Null/unset defaults to STREAM in createMediaAssetFromRecording.
+  pendingStreamMediaKind       MediaAssetKind?
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
   enrollments  Enrollment[]
@@ -434,6 +452,12 @@ model MediaAsset {
   durationSec Int?
   position    Int              @default(0)
   publishedAt DateTime?
+  // Snapshot of the live-chat time window at the moment this asset was auto-created from a
+  // stream recording — lets StreamChatService.getArchivedMessages find "the chat that
+  // happened during this broadcast" without needing a session id on StreamMessage itself.
+  // Null for anything not auto-created from a live recording (manual Vimeo uploads etc).
+  chatSessionStartedAt DateTime?
+  chatSessionEndedAt   DateTime?
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
   practicum   Practicum        @relation(fields: [practicumId], references: [id], onDelete: Cascade)

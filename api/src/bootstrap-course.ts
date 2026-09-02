@@ -3,16 +3,16 @@ import { AssignmentStatus, ModuleAccessStatus, UserRole, UserStatus } from "@/ap
 import { prisma } from "@/app/server/db";
 
 const courseOutline = [
-  { position: 0, section: "Welcome", title: "Welcome", description: "Познакомься с форматом практикума и подготовь рабочее пространство.", coverPath: "/welcome-cover.png", unlocked: true, progress: 100 },
-  { position: 1, section: "Education", title: "Market Logic", description: "Разбираем логику движения рынка, контекст и последовательность наблюдений.", coverPath: "/market-logic-cover.png", unlocked: true, progress: 56, stream: { providerKey: "1197792122", title: "Практика с куратором", durationSec: 4876 } },
-  { position: 2, section: "Education", title: "Eq Point & Narrative. Storyline & Reversal", description: "Учимся собирать рыночный нарратив и замечать момент смены сценария.", coverPath: "/eq-point-narrative-cover.png", unlocked: false, progress: 0 },
-  { position: 3, section: "Education", title: "Delivery A.B. Part 1&2", description: "Последовательно разбираем delivery и читаем движение цены по этапам.", coverPath: "/delivery-ab-part-12-cover.png", unlocked: false, progress: 0 },
-  { position: 4, section: "Education", title: "Delivery A.B. Part 3", description: "Закрепляем модель delivery на истории и готовим переход к практике.", coverPath: "/delivery-ab-part-3-cover.png", unlocked: false, progress: 0 },
-  { position: 5, section: "Education", title: "Entry Models. Q/A Session", description: "Собираем варианты входа и разбираем вопросы, возникающие во время практики.", coverPath: "/entry-models-qa-cover.png", unlocked: false, progress: 0 },
-  { position: 6, section: "Q&A", title: "Ответы на вопросы", description: "Ответы куратора на вопросы по урокам и торговой системе.", coverPath: "/qa-cover.png", unlocked: true, progress: 0 },
-  { position: 7, section: "Practice", title: "Pre session", description: "Подготовь наблюдения и рабочий план перед практической сессией.", coverPath: "/pre-session-cover.jpg", unlocked: true, progress: 0 },
-  { position: 8, section: "Practice", title: "Backtest", description: "Проверяем торговую систему на истории и фиксируем повторяющиеся сценарии.", coverPath: "/backtest-performance.png", unlocked: false, progress: 0 },
-  { position: 9, section: "Practice", title: "Weekly performance review", description: "Подводим итоги недели, смотрим на решения и формируем следующий фокус практики.", coverPath: "/backtest-performance.png", unlocked: false, progress: 0 },
+  { position: 0, section: "Welcome", title: "Welcome", description: "Познакомься с форматом практикума и подготовь рабочее пространство.", coverPath: "/welcome-cover.webp", unlocked: true, progress: 100 },
+  { position: 1, section: "Education", title: "Market Logic", description: "Разбираем логику движения рынка, контекст и последовательность наблюдений.", coverPath: "/market-logic-cover.webp", unlocked: true, progress: 56, stream: { providerKey: "1197792122", title: "Практика с куратором", durationSec: 4876 } },
+  { position: 2, section: "Education", title: "Eq Point & Narrative. Storyline & Reversal", description: "Учимся собирать рыночный нарратив и замечать момент смены сценария.", coverPath: "/eq-point-narrative-cover.webp", unlocked: false, progress: 0 },
+  { position: 3, section: "Education", title: "Delivery A.B. Part 1&2", description: "Последовательно разбираем delivery и читаем движение цены по этапам.", coverPath: "/delivery-ab-part-12-cover.webp", unlocked: false, progress: 0 },
+  { position: 4, section: "Education", title: "Delivery A.B. Part 3", description: "Закрепляем модель delivery на истории и готовим переход к практике.", coverPath: "/delivery-ab-part-3-cover.webp", unlocked: false, progress: 0 },
+  { position: 5, section: "Education", title: "Entry Models. Q/A Session", description: "Собираем варианты входа и разбираем вопросы, возникающие во время практики.", coverPath: "/entry-models-qa-cover.webp", unlocked: false, progress: 0 },
+  { position: 6, section: "Q&A", title: "Ответы на вопросы", description: "Ответы куратора на вопросы по урокам и торговой системе.", coverPath: "/qa-cover.webp", unlocked: true, progress: 0 },
+  { position: 7, section: "Practice", title: "Pre session", description: "Подготовь наблюдения и рабочий план перед практической сессией.", coverPath: "/pre-session-cover.webp", unlocked: true, progress: 0 },
+  { position: 8, section: "Practice", title: "Backtest", description: "Проверяем торговую систему на истории и фиксируем повторяющиеся сценарии.", coverPath: "/backtest-performance.webp", unlocked: false, progress: 0 },
+  { position: 9, section: "Practice", title: "Weekly performance review", description: "Подводим итоги недели, смотрим на решения и формируем следующий фокус практики.", coverPath: "/backtest-performance.webp", unlocked: false, progress: 0 },
 ] as const;
 
 async function main(): Promise<void> {

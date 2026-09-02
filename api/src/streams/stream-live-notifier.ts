@@ -6,6 +6,13 @@ import { notificationService } from "@/app/server/notifications/notification-ser
 import { StreamsGateway } from "./streams.gateway";
 
 const POLL_INTERVAL_MS = 20_000;
+// LiveKit webhook delivery is at-least-once but not guaranteed — a single dropped delivery (a
+// network blip between the LiveKit box and this API, a transient 5xx, etc.) would otherwise leave
+// isCurrentlyLive stuck wrong indefinitely, since nothing besides the webhook and the one-off
+// startup reconciliation ever touches it. This re-derives it from LiveKit's own participant list
+// periodically so a missed webhook self-heals within one interval instead of lasting until the
+// next deploy/restart.
+const RECONCILE_INTERVAL_TICKS = 15; // 15 * 20s = 5 min
 const SUSTAIN_BEFORE_NOTIFY_MS = 30_000;
 // A brief OBS reconnect (crash, network blip, encoder restart) drops the live-input
 // status for a tick or two and then comes back — that used to look identical to a
@@ -21,18 +28,23 @@ type PracticumLiveState = {
 };
 
 /**
- * Watches Cloudflare live-input status independently of any open browser tab,
- * and emails active students once a stream has stayed connected for a short
- * grace period — filters out accidental test connects in OBS.
+ * Watches LiveKit room live-status (Practicum.isCurrentlyLive, kept up to date by the
+ * LiveKit webhook) independently of any open browser tab, and emails active students
+ * once a stream has stayed connected for a short grace period — filters out accidental
+ * test connects in OBS.
  */
 @Injectable()
 export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly state = new Map<string, PracticumLiveState>();
+  private tickCount = 0;
 
   constructor(private readonly gateway: StreamsGateway) {}
 
   public onModuleInit(): void {
+    // If the API restarts mid-broadcast, no room_started webhook re-fires (the room didn't just
+    // start) — without this, isCurrentlyLive would stay stale until the next room_finished.
+    void streamService.reconcileLiveStatus();
     this.timer = setInterval(() => { void this.tick(); }, POLL_INTERVAL_MS);
   }
 
@@ -41,6 +53,9 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
   }
 
   private async tick(): Promise<void> {
+    this.tickCount += 1;
+    if (this.tickCount % RECONCILE_INTERVAL_TICKS === 0) await streamService.reconcileLiveStatus();
+
     const results = await streamService.checkLiveForNotifications().catch((error: unknown) => {
       console.error("Stream live notifier poll failed", error instanceof Error ? error.message : "unknown error");
       return [];
@@ -80,10 +95,11 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
     });
     this.gateway.broadcastChatReset();
     try {
+      const topic = await streamService.getPendingStreamTopic(practicumId).catch(() => null);
       const emails = await activeStudentEmails(practicumId);
-      await Promise.all(emails.map((to) => sendStreamLiveNotification({ to })));
+      await Promise.all(emails.map((to) => sendStreamLiveNotification({ to, topic })));
       const studentIds = await activeStudentIds(practicumId);
-      await notificationService.createMany(studentIds, "STREAM_LIVE", "Стрим начался", "Куратор сейчас в эфире");
+      await notificationService.createMany(studentIds, "STREAM_LIVE", topic ? `Стрим начался: ${topic}` : "Стрим начался", "Куратор сейчас в эфире");
     } catch (error) {
       console.error("Stream live notification dispatch failed", error instanceof Error ? error.message : "unknown error");
     }

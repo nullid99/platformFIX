@@ -9,7 +9,6 @@
     "api:bootstrap-owner": "tsx api/src/bootstrap-owner.ts",
     "api:bootstrap-course": "tsx api/src/bootstrap-course.ts",
     "api:bootstrap-local-test-users": "tsx api/src/bootstrap-local-test-users.ts",
-    "api:bootstrap-stream-webhook": "tsx api/src/bootstrap-stream-webhook.ts",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
@@ -20,6 +19,9 @@
     "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1123.0",
+    "@aws-sdk/s3-request-presigner": "3.1123.0",
+    "@livekit/protocol": "1.50.4",
     "@nestjs/common": "^11.1.28",
     "@nestjs/core": "^11.1.28",
     "@nestjs/platform-express": "^11.1.28",
@@ -31,6 +33,8 @@
     "dotenv": "^17.4.2",
     "helmet": "^8.3.0",
     "jose": "^6.2.4",
+    "livekit-client": "2.22.1",
+    "livekit-server-sdk": "2.18.0",
     "lucide-react": "latest",
     "next": "latest",
     "pg": "^8.22.0",

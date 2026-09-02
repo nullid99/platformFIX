@@ -38,3 +38,16 @@ export async function assignmentPrerequisiteGate(client: Prisma.TransactionClien
   const access = await client.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId: previousModule.id } }, select: { status: true } });
   return access?.status === ModuleAccessStatus.COMPLETED ? null : previousModule.title;
 }
+
+/**
+ * Whether a module itself (not the one before it — see assignmentPrerequisiteGate) is open
+ * to this student. A curator's "Закрыт" toggle on a module hides its assignments entirely
+ * instead of showing them as a locked placeholder — closed means closed, not "visible but
+ * greyed out". No enrollment or access row (LOCKED default) both read as closed.
+ */
+export async function isModuleOpenForStudent(client: Prisma.TransactionClient, studentId: string, practicumId: string, moduleId: string): Promise<boolean> {
+  const enrollment = await client.enrollment.findFirst({ where: { studentId, practicumId, status: "ACTIVE" }, select: { id: true } });
+  if (!enrollment) return false;
+  const access = await client.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, select: { status: true } });
+  return access?.status === ModuleAccessStatus.UNLOCKED || access?.status === ModuleAccessStatus.COMPLETED;
+}

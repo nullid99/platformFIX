@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     throw new Error("Set BOOTSTRAP_LOCAL_TEST_USERS_CONFIRM to the exact confirmation phrase");
   }
 
-  const practicum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
+  const practicum = await prisma.practicum.findFirst({ where: { isActive: true }, select: { id: true } });
   if (!practicum) throw new Error("Bootstrap the course before creating local test users");
 
   const curatorId = await ensureLocalUser(UserRole.CURATOR, "local-curator", "local-curator", "Тестовый куратор");

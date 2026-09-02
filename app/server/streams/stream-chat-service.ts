@@ -1,4 +1,4 @@
-import { StoredFileStatus, UserRole } from "@/app/generated/prisma/enums";
+import { MediaAssetStatus, StoredFileStatus, UserRole } from "@/app/generated/prisma/enums";
 import { AuthServiceError } from "@/app/server/auth";
 import { prisma } from "@/app/server/db";
 import { assertPracticumViewer } from "./access";
@@ -6,6 +6,7 @@ import { fetchTradingViewPreview, findTradingViewUrl, type LinkPreview } from ".
 
 const MESSAGE_MAX_LENGTH = 2_000;
 const HISTORY_LIMIT = 50;
+const ARCHIVE_LIMIT = 500;
 
 // Fixed set so the picker is small and every reaction renders consistently — matches the
 // quick-react row Discord shows, not a full emoji keyboard.
@@ -122,6 +123,24 @@ export class StreamChatService {
       include: { author: { select: AUTHOR_SELECT }, replyTo: REPLY_TO_INCLUDE, reactions: REACTIONS_INCLUDE },
     });
     return this.toDto(message);
+  }
+
+  /** Read-only chat archive for a published (or, for curators, any) recording — keyed off the
+    * chat-window snapshot StreamService.createMediaAssetFromRecording takes at creation time. */
+  public async getArchivedMessages(userId: string, mediaId: string): Promise<StreamChatMessageDto[]> {
+    const { practicumId, role } = await this.assertAccess(userId);
+    const isStaff = role === UserRole.CURATOR || role === UserRole.OWNER;
+    const media = await prisma.mediaAsset.findUnique({ where: { id: mediaId }, select: { practicumId: true, status: true, chatSessionStartedAt: true, chatSessionEndedAt: true } });
+    if (!media || (!isStaff && media.practicumId !== practicumId)) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
+    if (role === UserRole.STUDENT && media.status !== MediaAssetStatus.PUBLISHED) throw new AuthServiceError("FORBIDDEN", "Media is not published");
+    if (!media.chatSessionStartedAt || !media.chatSessionEndedAt) return [];
+    const messages = await prisma.streamMessage.findMany({
+      where: { practicumId: media.practicumId, createdAt: { gte: media.chatSessionStartedAt, lte: media.chatSessionEndedAt } },
+      orderBy: { createdAt: "asc" },
+      take: ARCHIVE_LIMIT,
+      include: { author: { select: AUTHOR_SELECT }, replyTo: REPLY_TO_INCLUDE, reactions: REACTIONS_INCLUDE },
+    });
+    return messages.map((message) => this.toDto(message));
   }
 
   /** Toggles the actor's own reaction — adding it if absent, removing it if already set. */

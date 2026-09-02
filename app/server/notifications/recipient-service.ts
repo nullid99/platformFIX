@@ -44,6 +44,14 @@ export async function activeCuratorEmails(curatorId?: string): Promise<string[]>
   return uniqueEmails(users.map((user) => user.email));
 }
 
+export async function activeCuratorIds(): Promise<string[]> {
+  const users = await prisma.user.findMany({
+    where: { status: UserStatus.ACTIVE, role: { in: [UserRole.CURATOR, UserRole.OWNER] } },
+    select: { id: true },
+  });
+  return users.map((user) => user.id);
+}
+
 export async function userEmail(userId: string): Promise<string | undefined> {
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
   return user?.status === UserStatus.ACTIVE ? user.email?.trim().toLowerCase() || undefined : undefined;

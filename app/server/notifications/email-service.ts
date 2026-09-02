@@ -176,17 +176,33 @@ export async function sendNewEventNotification(input: { to: string; eventTitle: 
   }
 }
 
-export async function sendStreamLiveNotification(input: { to: string }): Promise<void> {
+export async function sendScheduleReminderNotification(input: { to: string; eventTitle: string; eventTypeLabel: string; eventTime: string; eventId: string }): Promise<void> {
+  try {
+    const content: ContentNotificationInput = {
+      eyebrow: "СКОРО НАЧАЛО",
+      title: input.eventTitle,
+      body: `${input.eventTypeLabel} начнётся через 15 минут (${input.eventTime}). Проверьте, что всё готово к эфиру.`,
+      ctaLabel: "Открыть расписание",
+      ctaPath: `/?eventId=${encodeURIComponent(input.eventId)}`,
+      accent: "#eab46b",
+    };
+    await sendEmail({ to: input.to, subject: `Через 15 минут · ${input.eventTitle}`, html: notificationHtml(content), text: notificationText(content) });
+  } catch (error) {
+    console.error("Schedule reminder email delivery failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
+export async function sendStreamLiveNotification(input: { to: string; topic: string | null }): Promise<void> {
   try {
     const content: ContentNotificationInput = {
       eyebrow: "ПРЯМОЙ ЭФИР",
-      title: "Куратор начал трансляцию",
+      title: input.topic ?? "Куратор начал трансляцию",
       body: "Эфир уже идёт на платформе — заходите, пока не пропустили начало.",
       ctaLabel: "Смотреть эфир",
       ctaPath: "/",
       accent: "#ed7777",
     };
-    await sendEmail({ to: input.to, subject: "Эфир начался", html: notificationHtml(content), text: notificationText(content) });
+    await sendEmail({ to: input.to, subject: input.topic ? `Эфир начался · ${input.topic}` : "Эфир начался", html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Stream live email delivery failed", error instanceof Error ? error.message : "unknown error");
   }

@@ -42,6 +42,7 @@ services:
       args:
         API_PROXY_TARGET: http://api:4000
         NEXT_PUBLIC_DEV_AUTH_ENABLED: ${NEXT_PUBLIC_DEV_AUTH_ENABLED:-false}
+        NEXT_PUBLIC_LIVEKIT_URL: ${NEXT_PUBLIC_LIVEKIT_URL:?set NEXT_PUBLIC_LIVEKIT_URL in .env.staging}
     container_name: fix-platform-staging-web
     restart: unless-stopped
     env_file: .env.staging
@@ -65,6 +66,24 @@ services:
       - "8082:80"
     volumes:
       - ./infra/nginx/staging.conf:/etc/nginx/nginx.conf:ro
+    networks: [staging]
+
+  # Isolated HTTPS entry point for the public staging domain (Secure cookies and the
+  # LiveKit webhook both need HTTPS). Kept separate from `proxy` (talks directly to
+  # api/web) to avoid a double proxy hop and to avoid touching the plain-HTTP :8082
+  # path anything else may already rely on.
+  tls-proxy:
+    image: nginx:1.27-alpine
+    container_name: fix-platform-staging-tls
+    restart: unless-stopped
+    depends_on:
+      - api
+      - web
+    ports:
+      - "8443:443"
+    volumes:
+      - ./infra/nginx/staging-tls.conf:/etc/nginx/nginx.conf:ro
+      - /opt/fix-staging-cert/staging.fix-trading.info_ecc:/certs:ro
     networks: [staging]
 
 volumes:

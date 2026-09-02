@@ -13,6 +13,7 @@ import { activeStudentEmails, activeStudentIds } from "@/app/server/notification
 import { sendNewMediaNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { fileService } from "@/app/server/files";
+import { getActivePracticumId } from "./practicum-service";
 
 type CourseAccess = {
   locked: boolean;
@@ -44,12 +45,13 @@ function jsonStrings(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
-function cloudflareStreamParts(providerKey: string): { subdomain: string; uid: string } | null {
-  const [subdomain, uid] = providerKey.split("/");
-  return subdomain && uid ? { subdomain, uid } : null;
-}
-
-function mediaEmbedUrl(provider: string, providerKey: string): string | null {
+/**
+ * `assetId` is only used by the LIVEKIT_RECORDING branch: a presigned S3 URL expires and can only
+ * be minted per-request, so this points the player at our own redirect route
+ * (`GET /streams/recordings/:mediaId/play`, see streams.controller.ts) instead of embedding a
+ * static URL the way the other providers do.
+ */
+function mediaEmbedUrl(provider: string, providerKey: string, assetId: string): string | null {
   if (provider.toUpperCase() === "VIMEO") {
     const match = /^(\d+)(?:\?h=([A-Za-z0-9]+))?$/.exec(providerKey);
     if (match?.[1]) {
@@ -57,23 +59,21 @@ function mediaEmbedUrl(provider: string, providerKey: string): string | null {
     }
   }
 
-  if (provider.toUpperCase() === "CLOUDFLARE_STREAM") {
-    const parts = cloudflareStreamParts(providerKey);
-    if (parts) return `https://${parts.subdomain}/${parts.uid}/iframe`;
+  if (provider.toUpperCase() === "LIVEKIT_RECORDING") {
+    return `/api/streams/recordings/${assetId}/play`;
   }
 
   return null;
 }
 
-function mediaThumbnailUrl(provider: string, providerKey: string): string | null {
+function mediaThumbnailUrl(provider: string, providerKey: string, assetId: string): string | null {
   if (provider.toUpperCase() === "VIMEO") {
     const videoId = providerKey.split("?", 1)[0];
     return /^\d+$/.test(videoId) ? `https://vumbnail.com/${videoId}.jpg` : null;
   }
 
-  if (provider.toUpperCase() === "CLOUDFLARE_STREAM") {
-    const parts = cloudflareStreamParts(providerKey);
-    if (parts) return `https://${parts.subdomain}/${parts.uid}/thumbnails/thumbnail.jpg`;
+  if (provider.toUpperCase() === "LIVEKIT_RECORDING") {
+    return `/api/streams/recordings/${assetId}/thumbnail`;
   }
 
   return null;
@@ -123,14 +123,14 @@ export class CourseService {
     if (coverPath && (!coverPath.startsWith("/") || coverPath.length > 500)) {
       throw new AuthServiceError("INVALID_INPUT", "coverPath is invalid");
     }
-    const practicum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
-    if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
+    const practicumId = await getActivePracticumId();
+    if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
 
     try {
       return await prisma.$transaction(async (tx) => {
-        const lastModule = await tx.module.findFirst({ where: { practicumId: practicum.id }, orderBy: { position: "desc" }, select: { position: true } });
+        const lastModule = await tx.module.findFirst({ where: { practicumId }, orderBy: { position: "desc" }, select: { position: true } });
         const position = (lastModule?.position ?? -1) + 1;
-        const courseModule = await tx.module.create({ data: { practicumId: practicum.id, title, description, section, coverPath, position } });
+        const courseModule = await tx.module.create({ data: { practicumId, title, description, section, coverPath, position } });
         return {
           id: courseModule.id,
           number: String(position).padStart(2, "0"),
@@ -213,12 +213,13 @@ export class CourseService {
   }
 
   /**
-   * The curator's explicit "this student is done with this module" call — a module can
-   * hold several assignments, a stream, or none at all, so only a curator can judge
-   * completion; accepting one submission no longer does this automatically (see
-   * assignment-service.ts#decide). Marks the module COMPLETED for this student and opens
-   * the content of the next module by position — an assignment inside that next module
-   * still stays gated until IT is marked completed too (see assignment-service.ts#submit).
+   * Marks a module COMPLETED for one student and opens the content of the next module by
+   * position — an assignment inside that next module still stays gated until IT is marked
+   * completed too (see assignment-service.ts#submit). Called two ways: a curator's explicit
+   * "Урок пройден" click for this one student, or automatically from assignment-service.ts
+   * #decide once every assignment in the module has been accepted for this student (a module
+   * with no assignments, or one still missing an accepted submission, only completes via the
+   * manual click).
    */
   public async markModuleCompletedForStudent(actorId: string, studentId: string, moduleId: string) {
     await this.assertCurator(actorId);
@@ -352,10 +353,7 @@ export class CourseService {
       throw new AuthServiceError("FORBIDDEN", "Student is not enrolled in a practicum");
     }
 
-    const practicumId = enrollment?.practicumId ?? (await prisma.practicum.findFirst({
-      orderBy: { createdAt: "asc" },
-      select: { id: true },
-    }))?.id;
+    const practicumId = enrollment?.practicumId ?? (await getActivePracticumId());
 
     if (!practicumId) {
       throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
@@ -364,10 +362,13 @@ export class CourseService {
     const practicum = await prisma.practicum.findUnique({
       where: { id: practicumId },
       include: {
+        // moduleId/scheduleEventId both null — truly unassigned (Talks, or a stream nobody
+        // targeted). Anything with a scheduleEventId is already surfaced under that event's own
+        // `recordings` below; including it here too would list the same MediaAsset twice.
         mediaAssets: {
           where: user.role === UserRole.STUDENT
-            ? { status: MediaAssetStatus.PUBLISHED, moduleId: null }
-            : { status: { not: MediaAssetStatus.ARCHIVED }, moduleId: null },
+            ? { status: MediaAssetStatus.PUBLISHED, moduleId: null, scheduleEventId: null }
+            : { status: { not: MediaAssetStatus.ARCHIVED }, moduleId: null, scheduleEventId: null },
           orderBy: [{ position: "asc" }, { createdAt: "asc" }],
         },
         scheduleEvents: {
@@ -424,8 +425,8 @@ export class CourseService {
         durationSec: asset.durationSec,
         position: asset.position,
         publishedAt: asset.publishedAt,
-        embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey),
-        thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey),
+        embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey, asset.id),
+        thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey, asset.id),
       })),
       scheduleEvents: practicum.scheduleEvents.map((event) => ({
         id: event.id,
@@ -439,10 +440,17 @@ export class CourseService {
         recordingAvailable: event.mediaAssets.some((asset) => asset.status === MediaAssetStatus.PUBLISHED),
         recordings: event.mediaAssets.map((asset) => ({
           id: asset.id,
+          scheduleEventId: event.id,
+          provider: asset.provider,
+          kind: asset.kind,
           title: asset.title,
+          description: asset.description,
+          durationSec: asset.durationSec,
+          position: asset.position,
           status: asset.status,
-          embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey),
-          thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey),
+          publishedAt: asset.publishedAt,
+          embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey, asset.id),
+          thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey, asset.id),
         })),
       })),
       modules: practicum.modules.map((module) => {
@@ -460,8 +468,8 @@ export class CourseService {
             durationSec: asset.durationSec,
             position: asset.position,
             publishedAt: asset.publishedAt,
-            embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey),
-            thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey),
+            embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey, asset.id),
+            thumbnailUrl: mediaThumbnailUrl(asset.provider, asset.providerKey, asset.id),
           }));
         const assignments = access.locked
           ? []
@@ -507,10 +515,8 @@ export class CourseService {
     const scheduleEvent = scheduleEventId ? await prisma.scheduleEvent.findUnique({ where: { id: scheduleEventId }, select: { id: true, practicumId: true } }) : null;
     if (scheduleEventId && !scheduleEvent) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
     if (courseModule && scheduleEvent && courseModule.practicumId !== scheduleEvent.practicumId) throw new AuthServiceError("INVALID_INPUT", "Module and event belong to different practicums");
-    const practicumId = courseModule?.practicumId ?? scheduleEvent?.practicumId ?? (await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } }))?.id;
+    const practicumId = courseModule?.practicumId ?? scheduleEvent?.practicumId ?? (await getActivePracticumId());
     if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
-    const actorPracticum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
-    if (scheduleEvent && actorPracticum && scheduleEvent.practicumId !== actorPracticum.id) throw new AuthServiceError("FORBIDDEN", "Event belongs to another practicum");
 
     const lastMedia = await prisma.mediaAsset.findFirst({
       where: scheduleEventId ? { scheduleEventId } : moduleId ? { moduleId } : { practicumId, moduleId: null, scheduleEventId: null },
@@ -628,17 +634,15 @@ export class CourseService {
     return this.toMediaDto(media);
   }
 
+  /** No practicum-equality gate here — a curator can archive a recording from any practicum, finished cohorts included. */
   public async archiveMedia(actorId: string, mediaId: string) {
     await this.assertCurator(actorId);
     const normalizedMediaId = requiredText(mediaId, "mediaId", 100);
-    const practicum = await prisma.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } });
-    if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
 
     const existing = await prisma.mediaAsset.findUnique({
       where: { id: normalizedMediaId },
       select: {
         id: true,
-        practicumId: true,
         scheduleEventId: true,
         provider: true,
         providerKey: true,
@@ -653,7 +657,6 @@ export class CourseService {
       },
     });
     if (!existing) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
-    if (existing.practicumId !== practicum.id) throw new AuthServiceError("FORBIDDEN", "Media belongs to another practicum");
     if (existing.status === MediaAssetStatus.ARCHIVED) return this.toMediaDto(existing);
 
     const archived = await prisma.$transaction(async (tx) => {
@@ -873,8 +876,8 @@ export class CourseService {
       durationSec: media.durationSec,
       position: media.position,
       publishedAt: media.publishedAt,
-      embedUrl: mediaEmbedUrl(media.provider, media.providerKey),
-      thumbnailUrl: mediaThumbnailUrl(media.provider, media.providerKey),
+      embedUrl: mediaEmbedUrl(media.provider, media.providerKey, media.id),
+      thumbnailUrl: mediaThumbnailUrl(media.provider, media.providerKey, media.id),
     };
   }
 }

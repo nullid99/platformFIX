@@ -8,7 +8,8 @@ import {
 } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
 import { AuthServiceError } from "@/app/server/auth";
-import { assignmentPrerequisiteGate, seedOpenModuleAccess } from "@/app/server/course/module-access";
+import { assignmentPrerequisiteGate, isModuleOpenForStudent, seedOpenModuleAccess } from "@/app/server/course/module-access";
+import { courseService } from "@/app/server/course/course-service";
 import { sendReviewNotification } from "@/app/server/notifications/email-service";
 import { sendNewAssignmentNotification } from "@/app/server/notifications/email-service";
 import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
@@ -244,13 +245,19 @@ export class AssignmentService {
     // curator's explicit call (markModuleCompletedForStudent), so each assignment still
     // needs its own gate check against the module before it, not just "is the module open."
     const gateCache = new Map<string, string | null>();
-    return Promise.all(assignments.map(async (assignment) => {
+    const openCache = new Map<string, boolean>();
+    const results = await Promise.all(assignments.map(async (assignment) => {
+      if (!openCache.has(assignment.moduleId)) {
+        openCache.set(assignment.moduleId, await isModuleOpenForStudent(prisma, studentId, assignment.module.practicumId, assignment.moduleId));
+      }
+      if (!openCache.get(assignment.moduleId)) return null;
       const cacheKey = `${assignment.module.practicumId}:${assignment.module.position}`;
       if (!gateCache.has(cacheKey)) {
         gateCache.set(cacheKey, await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position));
       }
       return this.toStudentDto(assignment, gateCache.get(cacheKey) ?? null);
     }));
+    return results.filter((item): item is NonNullable<typeof item> => item !== null);
   }
 
   public async listForCurator(actorId: string) {
@@ -387,9 +394,10 @@ export class AssignmentService {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
     const assignment = await prisma.assignment.findFirst({
       where: { id: assignmentId, status: AssignmentStatus.PUBLISHED },
-      select: { id: true, module: { select: { position: true, practicumId: true } } },
+      select: { id: true, moduleId: true, module: { select: { position: true, practicumId: true } } },
     });
     if (!assignment) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
+    if (!(await isModuleOpenForStudent(prisma, studentId, assignment.module.practicumId, assignment.moduleId))) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
     const blockedByModuleTitle = await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position);
     if (blockedByModuleTitle) throw new AuthServiceError("INVALID_INPUT", `Сначала нужно сдать ДЗ модуля «${blockedByModuleTitle}»`);
     const answerText = optionalText(input.answerText, MAX_TEXT_LENGTH);
@@ -597,11 +605,7 @@ export class AssignmentService {
           });
         }
 
-        // Accepting a submission only accepts THAT submission — a module can hold several
-        // assignments (or none at all), so only a curator can judge when the module itself
-        // is done. See CourseService.markModuleCompletedForStudent, triggered by the
-        // "Отметить модуль пройденным" button on the student's page.
-        return { ...submission, studentEmail: current.student.email, studentId: current.studentId, assignmentId: current.assignmentId, assignmentTitle: current.assignment.title };
+        return { ...submission, studentEmail: current.student.email, studentId: current.studentId, assignmentId: current.assignmentId, assignmentTitle: current.assignment.title, moduleId: current.assignment.moduleId };
       });
       if (result.studentEmail) void sendReviewNotification({ to: result.studentEmail, assignmentTitle: result.assignmentTitle, decision, feedback });
       void notificationService.create(
@@ -611,6 +615,20 @@ export class AssignmentService {
         feedback,
         result.assignmentId,
       ).catch((error: unknown) => console.error("Review notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+      // Accepting one submission doesn't complete the module by itself — a module can hold
+      // several assignments — but once every one of them is accepted for this student, the
+      // module counts as done and the next module unlocks for them, same as a curator
+      // clicking "Урок пройден" by hand. Matches what the "Сначала сдайте ДЗ урока X" gate
+      // message on the locked next assignment actually promises.
+      if (decision === "accepted") {
+        void (async () => {
+          const moduleAssignments = await prisma.assignment.findMany({ where: { moduleId: result.moduleId, status: AssignmentStatus.PUBLISHED }, select: { id: true } });
+          if (moduleAssignments.length === 0) return;
+          const latestStatuses = await Promise.all(moduleAssignments.map((moduleAssignment) => prisma.submission.findFirst({ where: { assignmentId: moduleAssignment.id, studentId: result.studentId }, orderBy: { attempt: "desc" }, select: { status: true } })));
+          if (!latestStatuses.every((submission) => submission?.status === SubmissionStatus.ACCEPTED)) return;
+          await courseService.markModuleCompletedForStudent(actorId, result.studentId, result.moduleId);
+        })().catch((error: unknown) => console.error("Auto module completion failed", error instanceof Error ? error.message : "unknown error"));
+      }
       return { id: result.id, status: result.status };
     } catch (error) {
       if (error instanceof AuthServiceError) throw error;

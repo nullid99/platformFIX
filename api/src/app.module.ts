@@ -7,6 +7,7 @@ import { CourseController } from "./course/course.controller";
 import { FilesController } from "./files/files.controller";
 import { DiscussionsController } from "./discussions/discussions.controller";
 import { ScheduleController } from "./schedule/schedule.controller";
+import { ScheduleReminderNotifier } from "./schedule/schedule-reminder-notifier";
 import { StreamsController } from "./streams/streams.controller";
 import { StreamsGateway } from "./streams/streams.gateway";
 import { StreamLiveNotifier } from "./streams/stream-live-notifier";
@@ -14,6 +15,6 @@ import { NotificationsController } from "./notifications/notifications.controlle
 
 @Module({
   controllers: [AuthController, DiscordController, SecurityController, AssignmentsController, ReviewController, CourseController, FilesController, DiscussionsController, ScheduleController, StreamsController, NotificationsController],
-  providers: [StreamsGateway, StreamLiveNotifier],
+  providers: [StreamsGateway, StreamLiveNotifier, ScheduleReminderNotifier],
 })
 export class AppModule {}

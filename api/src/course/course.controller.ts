@@ -14,7 +14,7 @@ import {
 } from "@nestjs/common";
 import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
-import { courseService } from "@/app/server/course";
+import { courseService, createNewPracticum, listPracticums, setActivePracticum } from "@/app/server/course";
 import { getRequestContext } from "../common/request-context";
 import { parseCreateModuleBody, parseCreateVimeoMediaBody, parseUpdateMediaKindBody } from "./course-input";
 
@@ -268,6 +268,51 @@ export class CourseController {
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       throw new InternalServerErrorException("Course access lookup failed");
+    }
+  }
+
+  /** Owner-only — freezes the current practicum and starts a fresh one; every new module/stream/schedule event/invitation targets the new one from this point on. */
+  @Post("practicum")
+  public async startNewPracticum(@Req() request: RequestWithCookies, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    if (!body || typeof body !== "object" || typeof (body as { title?: unknown }).title !== "string") throw new BadRequestException("title is required");
+    try {
+      const session = await authService.validateSession(token);
+      const input = body as { title: string; description?: string };
+      return { data: await createNewPracticum(session.userId, input) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Starting a new practicum failed");
+    }
+  }
+
+  /** Owner or curator — every past and present practicum (owners switch the active one; curators use it to target an invitation). */
+  @Get("practicums")
+  public async getPracticums(@Req() request: RequestWithCookies) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await listPracticums(session.userId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      throw new InternalServerErrorException("Practicum list failed");
+    }
+  }
+
+  /** Owner-only — re-activates an existing practicum instead of creating a new one (e.g. switching back). */
+  @Post("practicums/:practicumId/activate")
+  public async activatePracticum(@Req() request: RequestWithCookies, @Param("practicumId") practicumId: string) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await setActivePracticum(session.userId, practicumId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      throw new InternalServerErrorException("Switching practicum failed");
     }
   }
 

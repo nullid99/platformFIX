@@ -2,6 +2,7 @@ import "reflect-metadata";
 import "dotenv/config";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
+import { raw } from "express";
 import { NestFactory } from "@nestjs/core";
 import { IoAdapter } from "@nestjs/platform-socket.io";
 import { AppModule } from "./app.module";
@@ -16,10 +17,14 @@ function getTrustProxySetting(): boolean | number {
 }
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  const app = await NestFactory.create(AppModule);
   app.getHttpAdapter().getInstance().set("trust proxy", getTrustProxySetting());
   app.use(helmet());
   app.use(cookieParser());
+  // LiveKit sends webhooks as Content-Type: application/webhook+json, which Nest's own
+  // application/json parser never touches. WebhookReceiver needs the exact raw bytes to check
+  // the JWT's payload hash, so this route gets its own raw-body parser ahead of Nest's routing.
+  app.use("/api/streams/livekit-webhook", raw({ type: "application/webhook+json" }));
   app.enableCors({
     origin: process.env.WEB_ORIGIN ?? "http://localhost:3000",
     credentials: true,

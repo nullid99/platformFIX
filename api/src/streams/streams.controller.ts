@@ -1,16 +1,9 @@
-import { BadRequestException, Controller, ForbiddenException, Get, Headers, HttpCode, InternalServerErrorException, Post, Req, UnauthorizedException } from "@nestjs/common";
-import type { Request } from "express";
+import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, HttpCode, InternalServerErrorException, Param, Post, Put, Req, Res, UnauthorizedException } from "@nestjs/common";
+import type { Request, Response } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
-import { streamService, verifyStreamWebhookSignature } from "@/app/server/streams";
+import { streamChatService, streamService, webhookReceiver } from "@/app/server/streams";
 
 type RequestWithCookies = Request & { cookies?: Record<string, string | undefined> };
-type RequestWithRawBody = Request & { rawBody?: Buffer };
-
-type StreamWebhookPayload = {
-  uid?: string;
-  readyToStream?: boolean;
-  playback?: { hls?: string; dash?: string };
-};
 
 function mapError(error: unknown): never {
   if (!(error instanceof AuthServiceError)) throw new InternalServerErrorException("Stream operation failed");
@@ -29,12 +22,12 @@ async function sessionUser(request: RequestWithCookies): Promise<string> {
 export class StreamsController {
   @Get("live-input")
   public async get(@Req() request: RequestWithCookies) {
-    try { return { data: await streamService.getLiveInput(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+    try { return { data: await streamService.getIngress(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
   @Post("live-input")
   public async create(@Req() request: RequestWithCookies) {
-    try { return { data: await streamService.ensureLiveInput(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+    try { return { data: await streamService.ensureIngress(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
   @Get("status")
@@ -42,19 +35,64 @@ export class StreamsController {
     try { return { data: await streamService.getPlaybackStatus(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
-  /** Called by Cloudflare, not by our own frontend — authenticated via HMAC signature, not a session cookie. */
-  @Post("webhook")
-  @HttpCode(200)
-  public async webhook(@Req() request: RequestWithRawBody, @Headers("webhook-signature") signatureHeader: string | undefined) {
-    const secret = process.env.CLOUDFLARE_STREAM_WEBHOOK_SECRET?.trim();
-    if (!secret) { console.error("Stream webhook received but CLOUDFLARE_STREAM_WEBHOOK_SECRET is not configured"); return { received: false }; }
-    if (!request.rawBody || !verifyStreamWebhookSignature(signatureHeader, request.rawBody, secret)) {
-      throw new UnauthorizedException("Invalid webhook signature");
-    }
+  @Get("target")
+  public async getTarget(@Req() request: RequestWithCookies) {
+    try { return { data: await streamService.getStreamTarget(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
 
-    const payload = request.body as StreamWebhookPayload;
-    if (payload.readyToStream && payload.uid) {
-      await streamService.handleRecordingReady({ videoUid: payload.uid, playbackUrl: payload.playback?.hls ?? payload.playback?.dash });
+  @Put("target")
+  public async setTarget(@Req() request: RequestWithCookies, @Body() body: { moduleId?: unknown; scheduleEventId?: unknown; mediaKind?: unknown }) {
+    try {
+      const moduleId = typeof body?.moduleId === "string" ? body.moduleId : null;
+      const scheduleEventId = typeof body?.scheduleEventId === "string" ? body.scheduleEventId : null;
+      const mediaKind = body?.mediaKind === "QA" ? "QA" : body?.mediaKind === "STREAM" ? "STREAM" : null;
+      return { data: await streamService.setStreamTarget(await sessionUser(request), { moduleId, scheduleEventId, mediaKind }) };
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  @Get("media/:mediaId/chat")
+  public async getMediaChat(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string) {
+    try { return { data: await streamChatService.getArchivedMessages(await sessionUser(request), mediaId) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  /** The player's `src`/`embedUrl` points here rather than at a static MinIO URL — a presigned S3 URL expires, so it can only be minted per-request, right before the redirect. */
+  @Get("recordings/:mediaId/play")
+  public async playRecording(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Res() response: Response) {
+    try {
+      const url = await streamService.getRecordingPlaybackUrl(await sessionUser(request), mediaId);
+      response.redirect(302, url);
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  /** Same reasoning as playRecording above, for the cover image shown in the recordings grid. */
+  @Get("recordings/:mediaId/thumbnail")
+  public async recordingThumbnail(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Res() response: Response) {
+    try {
+      const url = await streamService.getRecordingThumbnailUrl(await sessionUser(request), mediaId);
+      response.redirect(302, url);
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  /** Curator-only — see getRecordingDownloadUrl for why this exists as a separate route from playRecording rather than a query param on it. */
+  @Get("recordings/:mediaId/download")
+  public async downloadRecording(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Res() response: Response) {
+    try {
+      const url = await streamService.getRecordingDownloadUrl(await sessionUser(request), mediaId);
+      response.redirect(302, url);
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  /** Called by our self-hosted LiveKit server, not by our own frontend — authenticated via the SDK's own JWT check, not a session cookie. Body arrives as a raw Buffer in request.body (see main.ts's dedicated application/webhook+json parser for this route). The livekit-server-sdk's own "Authorize" constant and LiveKit's general docs disagree on the exact header name in the wild, so both are accepted here. */
+  @Post("livekit-webhook")
+  @HttpCode(200)
+  public async livekitWebhook(@Req() request: Request, @Headers("authorize") authorizeHeader: string | undefined, @Headers("authorization") authorizationHeader: string | undefined) {
+    if (!Buffer.isBuffer(request.body)) { console.error("LiveKit webhook received with no raw body"); return { received: false }; }
+    try {
+      const event = await webhookReceiver().receive(request.body.toString("utf8"), authorizeHeader || authorizationHeader);
+      await streamService.handleLiveKitWebhookEvent(event);
+    } catch (error) {
+      console.error("LiveKit webhook verification/handling failed", error instanceof Error ? error.message : "unknown error", "headers:", JSON.stringify(request.headers));
+      throw new UnauthorizedException("Invalid webhook signature");
     }
     return { received: true };
   }

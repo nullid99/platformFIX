@@ -1,9 +1,11 @@
 "use client";
 
-import { createContext, forwardRef, useCallback, useContext, useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { createContext, forwardRef, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import Image from "next/image";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
+import { Room, RoomEvent, Track, VideoQuality, type RemoteTrackPublication } from "livekit-client";
 import {
   ArrowUpRight,
   ArrowLeft,
@@ -17,6 +19,7 @@ import {
   ChevronRight,
   Clock3,
   CornerUpLeft,
+  Download,
   Eye,
   EyeOff,
   FileCheck2,
@@ -27,11 +30,14 @@ import {
   Menu,
   Minimize2,
   MessageSquareText,
+  Pause,
   Play,
   Plus,
   Copy,
   Pencil,
   Radio,
+  Volume2,
+  VolumeX,
   RotateCcw,
   Save,
   Trash2,
@@ -59,6 +65,9 @@ const API_ORIGIN = "";
 // an internal Docker hostname would be unreachable from the user's browser.
 const SOCKET_ORIGIN = process.env.NEXT_PUBLIC_API_URL?.trim() || "";
 const SOCKET_PATH = "/api/socket.io/";
+// The browser connects directly to the self-hosted LiveKit server (its own TLS/Caddy), bypassing
+// the app's own nginx/proxy entirely — no path-rewrite story needed here, unlike Socket.IO above.
+const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL?.trim() || "";
 const ASSIGNMENT_TARGET_MODULE_KEY = "curator-assignment-target-module";
 const OPEN_MODULE_AFTER_PUBLISH_KEY = "curator-open-module-after-publish";
 const baseCuratorDashboard = curatorDashboard;
@@ -107,19 +116,190 @@ type DiscussionContext = { module: string; coverPath?: string | null; moduleId?:
 // Identifies the current viewer on the on-screen video watermark (see TrackedVideo below).
 const ViewerLabelContext = createContext<string>("");
 
+/** Assigns one DOM node to several refs at once (a callback ref plus TrackedVideo's own internal ref). */
+function mergeRefs<T>(...refs: Array<Ref<T> | undefined>): (node: T | null) => void {
+  return (node) => {
+    for (const ref of refs) {
+      if (!ref) continue;
+      if (typeof ref === "function") ref(node);
+      else (ref as { current: T | null }).current = node;
+    }
+  };
+}
+
+type LiveKitPlaybackProps = { token: string; roomName: string };
+
+const QUALITY_OPTIONS: Array<{ value: VideoQuality | "auto"; label: string }> = [
+  { value: "auto", label: "Авто" },
+  { value: VideoQuality.HIGH, label: "Высокое (1440p)" },
+  { value: VideoQuality.MEDIUM, label: "Среднее (720p)" },
+  { value: VideoQuality.LOW, label: "Низкое (360p)" },
+];
+
+/**
+ * The actual WebRTC connection for a LiveKit-backed <TrackedVideo>. Chrome/Safari block audio
+ * autoplay without either a prior user gesture or starting muted — starts muted with a visible
+ * "Включить звук" affordance rather than risk a silently-frozen player.
+ *
+ * `token` is read through a ref, not a effect dependency: the caller's status poll mints a fresh
+ * JWT every ~15s (same viewer, same room, just a new token string), and reconnecting the whole
+ * WebRTC peer connection on every poll tick caused a full drop/reconnect glitch every 15 seconds
+ * in production — the intermittent audio stutter this was meant to fix. The room is connected
+ * once per mount and just keeps using whichever token was current at that moment (it doesn't
+ * expire mid-broadcast, see mintViewerToken's 6h ttl).
+ *
+ * `fullscreenRef` points at TrackedVideo's own outer wrapper (not a div local to this component)
+ * so the watermark overlay — a sibling of this component, not a child — is included when
+ * fullscreened; requesting fullscreen on just the <video> would leave it behind.
+ */
+function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlaybackProps & { fullscreenRef: RefObject<HTMLDivElement | null> }) {
+  const videoElRef = useRef<HTMLVideoElement>(null);
+  const videoPublicationRef = useRef<RemoteTrackPublication | null>(null);
+  const [muted, setMuted] = useState(true);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
+  const [quality, setQuality] = useState<VideoQuality | "auto">("auto");
+  const tokenRef = useRef(token);
+  useEffect(() => { tokenRef.current = token; }, [token]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => setFullscreen(document.fullscreenElement === fullscreenRef.current);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, [fullscreenRef]);
+
+  useEffect(() => {
+    // adaptiveStream: pick a resolution matching this <video>'s actual rendered size instead of
+    // always pulling the full 720p layer — less bandwidth/CPU pressure on the viewer, which is
+    // also where audio stutter under constrained connections tends to come from.
+    // dynacast: stop encoding simulcast layers nobody is currently watching (saves the curator's
+    // upload bandwidth too).
+    const room = new Room({ adaptiveStream: true, dynacast: true });
+    room.on(RoomEvent.TrackSubscribed, (track, publication) => {
+      if (track.kind === Track.Kind.Video) videoPublicationRef.current = publication;
+      if ((track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) && videoElRef.current) track.attach(videoElRef.current);
+    });
+    void room.connect(LIVEKIT_URL, tokenRef.current).catch((error: unknown) => console.error("LiveKit connect failed", error));
+    return () => { void room.disconnect(); };
+  }, [roomName]);
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) { void document.exitFullscreen(); return; }
+    void fullscreenRef.current?.requestFullscreen();
+  };
+
+  // "Авто" hands control back to adaptiveStream's own resize-driven quality selection; picking a
+  // specific tier sets an explicit ceiling (still capped further by real bandwidth if needed).
+  // adaptiveStream may re-assert itself on the next resize/visibility change — this is a
+  // best-effort override, not a hard lock, since livekit-client exposes no "disable adaptiveStream
+  // for this one track" toggle short of reconnecting the whole room.
+  const selectQuality = (next: VideoQuality | "auto") => {
+    setQuality(next);
+    setQualityMenuOpen(false);
+    videoPublicationRef.current?.setVideoQuality(next === "auto" ? VideoQuality.HIGH : next);
+  };
+
+  return <>
+    <video ref={videoElRef} autoPlay playsInline muted={muted} />
+    {muted && (
+      <button type="button" className="tracked-video-unmute" onClick={() => { setMuted(false); if (videoElRef.current) videoElRef.current.muted = false; }}>
+        Включить звук
+      </button>
+    )}
+    <div className="livekit-video-controls">
+      <div className="livekit-quality-menu">
+        <button type="button" className="livekit-video-control-button" aria-label="Качество" onClick={() => setQualityMenuOpen((current) => !current)}><Settings2 size={15} /></button>
+        {qualityMenuOpen && <div className="livekit-quality-options" role="menu">
+          {QUALITY_OPTIONS.map((option) => <button type="button" key={option.label} role="menuitemradio" aria-checked={quality === option.value} className={quality === option.value ? "active" : ""} onClick={() => selectQuality(option.value)}>{option.label}</button>)}
+        </div>}
+      </div>
+      <button type="button" className="livekit-video-control-button" aria-label={fullscreen ? "Свернуть" : "На весь экран"} onClick={toggleFullscreen}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
+    </div>
+  </>;
+}
+
+function formatVideoTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const total = Math.floor(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * A recorded LiveKit broadcast, played back with our own minimal controls instead of the
+ * browser's native `<video controls>` bar — deliberately narrower than the native set (no
+ * playback-speed menu, no download, no picture-in-picture) to keep the player visually quiet and
+ * consistent with the rest of the UI, matching the live surface's own custom mute affordance
+ * above rather than mixing native and custom chrome in the same component.
+ */
+function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenRef: RefObject<HTMLDivElement | null> }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => setFullscreen(document.fullscreenElement === fullscreenRef.current);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, [fullscreenRef]);
+
+  const togglePlay = () => { const video = videoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause(); };
+  // In fullscreen, a tap on the video exits instead of toggling play/pause — Escape works too,
+  // but not everyone knows that, and the fullscreen toggle button itself is easy to lose track
+  // of once the player fills the whole screen.
+  const handleVideoClick = () => { if (document.fullscreenElement) { void document.exitFullscreen(); return; } togglePlay(); };
+  const toggleMute = () => { const video = videoRef.current; if (!video) return; video.muted = !video.muted; setMuted(video.muted); };
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) { void document.exitFullscreen(); return; }
+    void fullscreenRef.current?.requestFullscreen();
+  };
+  const seekTo = (event: ReactMouseEvent<HTMLDivElement>) => {
+    const video = videoRef.current;
+    if (!video || !duration) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    video.currentTime = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)) * duration;
+  };
+
+  return <div className="recorded-video-surface">
+    <video
+      ref={videoRef}
+      src={src}
+      playsInline
+      onClick={handleVideoClick}
+      onPlay={() => setPlaying(true)}
+      onPause={() => setPlaying(false)}
+      onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+      onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
+    />
+    <div className="recorded-video-controls">
+      <button type="button" onClick={togglePlay} aria-label={playing ? "Пауза" : "Воспроизвести"}>{playing ? <Pause size={16} /> : <Play size={16} />}</button>
+      <span className="recorded-video-time">{formatVideoTime(currentTime)} / {formatVideoTime(duration)}</span>
+      <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
+      <button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button>
+      <button type="button" onClick={toggleFullscreen} aria-label={fullscreen ? "Свернуть" : "На весь экран"}>{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
+    </div>
+  </div>;
+}
+
 /**
  * Drop-in replacement for a plain video <iframe>: overlays the viewer's name and a live
  * clock on top of the player (deters casual screen-recording redistribution — a frozen
  * screenshot still carries a real, current timestamp) and logs the open server-side via
  * `mediaId` so a leaked recording can be traced back to who actually opened it and when.
- * Sizing is intentionally generic (fills its container) so it drops into any existing
- * video-stage CSS unchanged.
+ * Pass either `src` (recorded media: Vimeo embed or our own recording route) or `livekit` (live broadcast) —
+ * never both. Sizing is intentionally generic (fills its container) so it drops into any
+ * existing video-stage CSS unchanged.
  */
-const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src: string; title: string; className?: string }>(
-  function TrackedVideo({ mediaId, src, title, className = "" }, forwardedRef) {
+const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src?: string; livekit?: LiveKitPlaybackProps | null; title: string; className?: string }>(
+  function TrackedVideo({ mediaId, src, livekit, title, className = "" }, forwardedRef) {
     const viewerLabel = useContext(ViewerLabelContext);
     const [clock, setClock] = useState(() => new Date().toLocaleString("ru-RU"));
     const loggedMediaId = useRef<string | null>(null);
+    const wrapperRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
       const timer = window.setInterval(() => setClock(new Date().toLocaleString("ru-RU")), 5_000);
@@ -132,10 +312,21 @@ const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src: 
       void fetch(`${API_ORIGIN}/api/course/media/${mediaId}/access`, { method: "POST", credentials: "include" }).catch(() => undefined);
     }, [mediaId]);
 
-    // Forwards to the wrapper (not the iframe) so requesting fullscreen on this ref
-    // still shows the watermark overlay instead of leaving it behind.
-    return <div className={`tracked-video ${className}`} ref={forwardedRef}>
-      <iframe src={src} title={title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />
+    // wrapperRef (not the iframe/video) is what gets fullscreened, so requesting fullscreen
+    // still shows the watermark overlay instead of leaving it behind — also merged onto
+    // forwardedRef so a future caller that actually passes a ref still gets the DOM node.
+    // Our own recorded-media redirect route (see streams.controller.ts) resolves to a raw video
+    // file, unlike Vimeo's `src` which is an actual embed-player page — loading a raw
+    // file in an <iframe> makes the browser render its own native "media document" viewer, whose
+    // built-in controls include a Download option and (being cross-origin, after the redirect)
+    // an unreliable fullscreen button. A same-origin <video> avoids both: controlsList hides the
+    // download affordance, and fullscreen on an element in our own document just works.
+    return <div className={`tracked-video ${className}`} ref={mergeRefs(wrapperRef, forwardedRef)}>
+      {livekit
+        ? <LiveKitVideoSurface key={livekit.roomName} token={livekit.token} roomName={livekit.roomName} fullscreenRef={wrapperRef} />
+        : src?.startsWith("/api/streams/recordings/")
+          ? <RecordedVideoSurface src={src} fullscreenRef={wrapperRef} />
+          : <iframe src={src} title={title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}
       {viewerLabel && <div className="tracked-video-watermark" aria-hidden="true"><span>{viewerLabel}</span><span>{clock}</span></div>}
     </div>;
   },
@@ -143,7 +334,7 @@ const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src: 
 
 type AppNotification = {
   id: string;
-  type: "NEW_ASSIGNMENT" | "NEW_MEDIA" | "NEW_EVENT" | "DISCUSSION_REPLY" | "REVIEW_DECISION" | "STREAM_LIVE";
+  type: "NEW_ASSIGNMENT" | "NEW_MEDIA" | "NEW_EVENT" | "DISCUSSION_REPLY" | "REVIEW_DECISION" | "STREAM_LIVE" | "SCHEDULE_REMINDER" | "SECURITY_ALERT";
   title: string;
   body: string | null;
   entityId: string | null;
@@ -158,6 +349,8 @@ const NOTIFICATION_ICON: Record<AppNotification["type"], { icon: typeof Bell; to
   DISCUSSION_REPLY: { icon: MessageSquareText, tone: "blue" },
   REVIEW_DECISION: { icon: CheckCircle2, tone: "amber" },
   STREAM_LIVE: { icon: Radio, tone: "amber" },
+  SCHEDULE_REMINDER: { icon: Clock3, tone: "amber" },
+  SECURITY_ALERT: { icon: ShieldCheck, tone: "red" },
 };
 
 function relativeTimeFromNow(iso: string): string {
@@ -230,7 +423,7 @@ type CourseApiModule = {
 
 type CourseModule = PracticumModule & { position: number; coverPath: string | null };
 
-type CourseScheduleEvent = { id: string; type: "PRACTICE" | "QA" | "BREAKDOWN" | "BACKTEST" | "LECTURE" | "PRE_SESSION"; title: string; date: string; time: string; description: string; live: boolean; coverPath: string | null; recordingAvailable: boolean; recordings: Array<{ id: string; title: string | null; status: "DRAFT" | "PUBLISHED" | "ARCHIVED"; embedUrl: string | null; thumbnailUrl: string | null }>; bookedByStudentId: string | null; bookedByStudentName: string | null; isBookedByActor: boolean; slotLimit: number | null };
+type CourseScheduleEvent = { id: string; type: "PRACTICE" | "QA" | "BREAKDOWN" | "BACKTEST" | "LECTURE" | "PRE_SESSION"; title: string; date: string; time: string; description: string; live: boolean; coverPath: string | null; recordingAvailable: boolean; recordings: Array<CourseLessonMedia>; bookedByStudentId: string | null; bookedByStudentName: string | null; isBookedByActor: boolean; slotLimit: number | null };
 type CourseApiPayload = { data?: { modules?: CourseApiModule[]; media?: CourseLessonMedia[]; scheduleEvents?: CourseScheduleEvent[] } };
 
 type CourseState = {
@@ -296,26 +489,129 @@ const curatorNavItems: NavItem[] = [
   { label: "Обсуждения", icon: MessageSquareText },
 ];
 
+// What each section is called in the address bar (`?tab=…`). Short Latin slugs instead of the
+// Cyrillic UI labels, so a copied link reads `?tab=schedule` rather than `%D0%A0%D0%B0…`. The
+// UI labels themselves are unchanged; this is only the URL spelling. Covers every value
+// activeNav can hold: sidebar items plus the destinations reached only programmatically
+// ("Профиль", the student's "Обзор" landing).
+const NAV_SLUGS: Record<AppNav, string> = {
+  "Мой практикум": "practicum",
+  "Задания": "tasks",
+  "Расписание": "schedule",
+  "Стрим": "stream",
+  "Записи": "recordings",
+  "Обсуждение": "discussion",
+  "Кабинет куратора": "curator",
+  "Очередь проверки": "review",
+  "Создать задание": "new-task",
+  "Ученики": "students",
+  "Программа": "program",
+  "Приглашения": "invitations",
+  "Стримы": "streams",
+  "Медиатека": "media",
+  "Обсуждения": "discussions",
+  "Профиль": "profile",
+  "Обзор": "overview",
+};
+const NAV_BY_SLUG = new Map<string, AppNav>((Object.keys(NAV_SLUGS) as AppNav[]).map((nav) => [NAV_SLUGS[nav], nav]));
+function navToSlug(nav: AppNav): string {
+  return NAV_SLUGS[nav];
+}
+// Resolves a `?tab=` value back to a section. Accepts the slug, and also the old Cyrillic
+// label so links/bookmarks saved before the slugs existed keep working. Anything else (a
+// hand-edited or stale URL) is ignored rather than trusted.
+function navFromTabParam(value: string): AppNav | null {
+  const bySlug = NAV_BY_SLUG.get(value);
+  if (bySlug) return bySlug;
+  return value in NAV_SLUGS ? (value as AppNav) : null;
+}
+
+// useSearchParams() (used below to sync activeNav with a `?tab=` URL param, so Back/Forward
+// walk through in-app tabs — see the comment above that effect) requires a Suspense boundary
+// around whatever calls it, or Next's build fails prerendering "/" with a CSR-bailout error.
 export default function Home() {
+  return <Suspense fallback={null}><HomeContent /></Suspense>;
+}
+
+function HomeContent() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [sessionProfile, setSessionProfile] = useState<SessionProfile | null>(null);
   const [role, setRole] = useState<UserRole>("student");
   const [activeNav, setActiveNav] = useState<AppNav>("Мой практикум");
+  // The sidebar tabs never changed the URL, so the browser's Back button had nothing of
+  // ours to step through — it jumped straight past the whole app to whatever page the user
+  // was on before. Mirroring activeNav into a `?tab=` query param (through Next's own
+  // router, not raw history.pushState — App Router owns popstate itself and a foreign
+  // history.state shape makes it fall back to a full reload) gives Back something to walk
+  // through first, and only leaves the site once that's exhausted.
+  //
+  // The two effects below are deliberately one-directional and gate on a single ref rather
+  // than cross-comparing activeNav against searchParams: a URL change (Back/Forward) updates
+  // both in the same render pass, but only ONE of React's state updates (activeNav) has
+  // landed by the time the other effect re-runs — comparing the fresh searchParams against
+  // the still-stale activeNav in that window reads as "out of sync" and pushes right back to
+  // where we just navigated away from. lastSyncedNavRef always holds the nav value already
+  // reflected in the URL, updated by whichever effect acts first, so the other one sees
+  // "already in sync" and no-ops instead of fighting it.
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const hasSeededNavUrlRef = useRef(false);
+  const lastSyncedNavRef = useRef<AppNav | null>(null);
+  useEffect(() => {
+    // Before sign-in there is no section to remember, and the very first address a new
+    // student sees should be the bare domain — so the URL is only touched once authenticated.
+    if (authenticated !== true) return;
+    if (activeNav === lastSyncedNavRef.current) return;
+    lastSyncedNavRef.current = activeNav;
+    const params = new URLSearchParams(window.location.search);
+    params.set("tab", navToSlug(activeNav));
+    const url = `${pathname}?${params.toString()}`;
+    if (!hasSeededNavUrlRef.current) {
+      hasSeededNavUrlRef.current = true;
+      router.replace(url, { scroll: false });
+    } else {
+      router.push(url, { scroll: false });
+    }
+  }, [activeNav, authenticated, pathname, router]);
+  useEffect(() => {
+    const tab = searchParams.get("tab");
+    const nav = tab ? navFromTabParam(tab) : null;
+    if (!nav || nav === lastSyncedNavRef.current) return;
+    lastSyncedNavRef.current = nav;
+    setActiveNav(nav);
+  }, [searchParams]);
   const [requestedAssignmentId, setRequestedAssignmentId] = useState("");
   const [requestedDiscussionContext, setRequestedDiscussionContext] = useState<DiscussionContext | null>(null);
+  const [requestedStudentId, setRequestedStudentId] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
   const notificationWrapRef = useRef<HTMLDivElement>(null);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [pendingDiscussionCount, setPendingDiscussionCount] = useState(0);
+  const [pendingReviewCount, setPendingReviewCount] = useState(0);
   const [revisionAssignmentIds, setRevisionAssignmentIds] = useState<string[]>([]);
   const [seenRevisionIds, setSeenRevisionIds] = useState<Set<string>>(new Set());
   const pendingRevisionCount = revisionAssignmentIds.filter((id) => !seenRevisionIds.has(id)).length;
   const [unlockedModuleIds] = useState(() => new Set(practicumModules.filter((module) => !module.locked).map((module) => module.id)));
+  // Same "unread count next to the tab" pattern as "Задания" (revision count), reusing the
+  // notification bell's already-fetched list instead of polling separately. Student side:
+  // "Обсуждение" counts unread DISCUSSION_REPLY, "Записи" counts NEW_MEDIA, "Расписание"
+  // counts NEW_EVENT. Curator side: "Расписание" counts SCHEDULE_REMINDER — the only
+  // notification type the backend ever sends to curators (stream-live-notifier and
+  // course-service's NEW_MEDIA/NEW_EVENT broadcasts are student-only; a curator's own
+  // "Обсуждения"/"Очередь проверки" badges above already use their own dedicated polls,
+  // not the notification feed). Clearing happens on tab visit, same as "Задания" below.
+  const unreadNotificationsByType = (type: AppNotification["type"]) => notifications.filter((notification) => notification.type === type && !notification.read).length;
   const currentNavItems = (role === "student" ? navItems : curatorNavItems).map((item) => {
     if (item.label === "Обсуждения" && pendingDiscussionCount > 0) return { ...item, badge: String(pendingDiscussionCount) };
+    if (item.label === "Очередь проверки" && pendingReviewCount > 0) return { ...item, badge: String(pendingReviewCount) };
     if (item.label === "Задания" && pendingRevisionCount > 0) return { ...item, badge: String(pendingRevisionCount) };
+    if (role === "student" && item.label === "Обсуждение" && unreadNotificationsByType("DISCUSSION_REPLY") > 0) return { ...item, badge: String(unreadNotificationsByType("DISCUSSION_REPLY")) };
+    if (role === "student" && item.label === "Записи" && unreadNotificationsByType("NEW_MEDIA") > 0) return { ...item, badge: String(unreadNotificationsByType("NEW_MEDIA")) };
+    if (role === "student" && item.label === "Расписание" && unreadNotificationsByType("NEW_EVENT") > 0) return { ...item, badge: String(unreadNotificationsByType("NEW_EVENT")) };
+    if (role === "curator" && item.label === "Расписание" && unreadNotificationsByType("SCHEDULE_REMINDER") > 0) return { ...item, badge: String(unreadNotificationsByType("SCHEDULE_REMINDER")) };
     return item;
   });
   // Real logged-in identity (Discord displayName/username) for whoever is viewing — used
@@ -350,7 +646,17 @@ export default function Home() {
             setSessionProfile(payload.data);
             const nextRole = payload.data.role === "STUDENT" ? "student" : "curator";
             setRole(nextRole);
-            setActiveNav(nextRole === "student" ? "Мой практикум" : "Кабинет куратора");
+            // Land on the section named in `?tab=` (a reload, a shared link, an old Cyrillic
+            // bookmark) when it exists for this role; otherwise on the role's home section.
+            // Resetting lastSyncedNavRef makes the URL-sync effect rewrite the param in its
+            // canonical slug form via replace(), so a legacy `?tab=Задания` becomes `?tab=tasks`.
+            const tabParam = new URLSearchParams(window.location.search).get("tab");
+            const requestedNav = tabParam ? navFromTabParam(tabParam) : null;
+            const allowedNavs: AppNav[] = nextRole === "student"
+              ? [...navItems.map((item) => item.label), "Профиль", "Обзор"]
+              : [...curatorNavItems.map((item) => item.label), "Профиль"];
+            lastSyncedNavRef.current = null;
+            setActiveNav(requestedNav && allowedNavs.includes(requestedNav) ? requestedNav : nextRole === "student" ? "Мой практикум" : "Кабинет куратора");
             // Email notification links point at "/" with a query param (see ctaPath
             // comments in email-service.ts — /assignments, /schedule etc. aren't real
             // routes) instead of the in-app notification bell's setActiveNav() calls.
@@ -425,6 +731,22 @@ export default function Home() {
   }, [authenticated, role]);
 
   useEffect(() => {
+    // The "Очередь проверки" badge means "how many submissions are actually waiting on a
+    // curator decision right now" — "На проверке" only, not "Нужна доработка" (that's
+    // waiting on the student, same distinction the dashboard's own stat cards already make).
+    if (!authenticated || role !== "curator") return;
+    let cancelled = false;
+    const refresh = () => {
+      void fetchReviewQueue()
+        .then((queue) => { if (!cancelled) setPendingReviewCount(queue.filter((item) => item.status === "На проверке").length); })
+        .catch(() => undefined);
+    };
+    refresh();
+    const poll = window.setInterval(refresh, 30_000);
+    return () => { cancelled = true; window.clearInterval(poll); };
+  }, [authenticated, role]);
+
+  useEffect(() => {
     // The "Задания" badge means "a curator sent this back for revision and you haven't
     // opened the tab since" — it clears the moment the student visits, not when the
     // assignment itself changes state (that still requires an actual resubmission).
@@ -453,6 +775,14 @@ export default function Home() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [showNotifications]);
 
+  const markNotificationsReadByType = (...types: AppNotification["type"][]) => {
+    const targets = notifications.filter((notification) => types.includes(notification.type) && !notification.read);
+    if (targets.length === 0) return;
+    setNotifications((current) => current.map((notification) => types.includes(notification.type) ? { ...notification, read: true } : notification));
+    setUnreadCount((current) => Math.max(0, current - targets.length));
+    targets.forEach((notification) => void fetch(`${API_ORIGIN}/api/notifications/${notification.id}/read`, { method: "POST", credentials: "include" }).catch(() => undefined));
+  };
+
   const openNotification = (item: AppNotification) => {
     setShowNotifications(false);
     if (!item.read) {
@@ -465,13 +795,23 @@ export default function Home() {
       setActiveNav("Задания");
     } else if (item.type === "NEW_MEDIA") {
       setActiveNav("Записи");
-    } else if (item.type === "NEW_EVENT") {
+    } else if (item.type === "NEW_EVENT" || item.type === "SCHEDULE_REMINDER") {
       setActiveNav("Расписание");
     } else if (item.type === "DISCUSSION_REPLY") {
       setActiveNav(role === "student" ? "Обсуждение" : "Обсуждения");
     } else if (item.type === "STREAM_LIVE") {
       setActiveNav(role === "student" ? "Стрим" : "Стримы");
+    } else if (item.type === "SECURITY_ALERT") {
+      if (item.entityId) setRequestedStudentId(item.entityId);
+      setActiveNav("Ученики");
     }
+  };
+
+  const markAllNotificationsRead = () => {
+    if (unreadCount === 0) return;
+    setNotifications((current) => current.map((notification) => ({ ...notification, read: true })));
+    setUnreadCount(0);
+    void fetch(`${API_ORIGIN}/api/notifications/read-all`, { method: "POST", credentials: "include" }).catch(() => undefined);
   };
 
   if (authenticated === null) {
@@ -526,8 +866,11 @@ export default function Home() {
                 key={item.label}
                 onClick={() => {
                   setActiveNav(item.label);
-                  if (role === "student" && item.label === "Обсуждение") setRequestedDiscussionContext(null);
+                  if (role === "student" && item.label === "Обсуждение") { setRequestedDiscussionContext(null); markNotificationsReadByType("DISCUSSION_REPLY"); }
                   if (role === "student" && item.label === "Задания") setSeenRevisionIds((current) => new Set([...current, ...revisionAssignmentIds]));
+                  if (role === "student" && item.label === "Записи") markNotificationsReadByType("NEW_MEDIA");
+                  if (role === "student" && item.label === "Расписание") markNotificationsReadByType("NEW_EVENT");
+                  if (role === "curator" && item.label === "Расписание") markNotificationsReadByType("SCHEDULE_REMINDER");
                   setMenuOpen(false);
                 }}
               >
@@ -557,7 +900,7 @@ export default function Home() {
       <section className="content-area">
         <header className="topbar">
           <button className="icon-button menu-button" aria-label="Открыть меню" onClick={() => setMenuOpen(true)}><Menu size={20} /></button>
-          <div className="breadcrumbs"><span>Практикум 04</span><ChevronRight size={14} /><strong>{activeNav}</strong></div>
+          <div className="breadcrumbs"><strong>{activeNav}</strong></div>
           <div className="topbar-actions">
             <div className="notification-wrap" ref={notificationWrapRef}>
               <button className="icon-button notification-button" aria-label="Уведомления" onClick={() => setShowNotifications((value) => !value)}>
@@ -565,7 +908,7 @@ export default function Home() {
               </button>
               {showNotifications && (
                 <div className="notification-popover">
-                  <div className="popover-heading"><strong>Уведомления</strong><span>{unreadCount > 0 ? `${unreadCount} новых` : "Всё прочитано"}</span></div>
+                  <div className="popover-heading"><strong>Уведомления</strong><div className="popover-heading-actions">{unreadCount > 0 && <button type="button" className="popover-mark-all" onClick={markAllNotificationsRead}>Прочитать все</button>}<span>{unreadCount > 0 ? `${unreadCount} новых` : "Всё прочитано"}</span></div></div>
                   {notifications.length === 0 && <div className="notification-empty">Пока нет уведомлений</div>}
                   {notifications.map((item) => {
                     const meta = NOTIFICATION_ICON[item.type];
@@ -579,6 +922,7 @@ export default function Home() {
                       >
                         <div className={`notification-symbol ${meta.tone}`}><Icon size={15} /></div>
                         <div><strong>{item.title}</strong><span>{item.body ? `${item.body} · ${relativeTimeFromNow(item.createdAt)}` : relativeTimeFromNow(item.createdAt)}</span></div>
+                        {!item.read && <span className="notification-item-unread-dot" aria-hidden="true" />}
                       </button>
                     );
                   })}
@@ -592,7 +936,7 @@ export default function Home() {
         <div className={`page-content ${activeNav === "Мой практикум" ? "course-page-shell" : ""}`}>
           {activeNav === "Профиль" && sessionProfile && <ProfileView profile={sessionProfile.profile} name={currentProfile.name} initials={currentProfile.initials} role={role} onProfileUpdated={(profile) => setSessionProfile((current) => current ? { ...current, profile: { ...current.profile, ...profile } } : current)} onLogout={logout} />}
           {role === "student" && activeNav !== "Обзор" && activeNav !== "Профиль" && <SectionView activeNav={activeNav as DashboardNav} unlockedModuleIds={unlockedModuleIds} requestedAssignmentId={requestedAssignmentId} requestedDiscussionContext={requestedDiscussionContext} onNavigate={(nextNav) => setActiveNav(nextNav)} onOpenAssignment={(assignmentId) => { setRequestedAssignmentId(assignmentId); setActiveNav("Задания"); }} onOpenDiscussion={(context) => { setRequestedDiscussionContext(context); setActiveNav("Обсуждение"); }} onCloseDiscussionContext={() => setRequestedDiscussionContext(null)} />}
-          {role === "curator" && activeNav !== "Профиль" && <CuratorSectionView activeNav={activeNav as CuratorNav} onNavigate={(nextNav) => setActiveNav(nextNav)} />}
+          {role === "curator" && activeNav !== "Профиль" && <CuratorSectionView activeNav={activeNav as CuratorNav} requestedStudentId={requestedStudentId} isOwner={sessionProfile?.role === "OWNER"} onNavigate={(nextNav) => setActiveNav(nextNav)} />}
           <div className={role === "student" && activeNav === "Обзор" ? "dashboard-view" : "dashboard-view is-hidden"}>
           <div className="welcome-row">
             <div>
@@ -818,7 +1162,7 @@ function SectionView({ activeNav, unlockedModuleIds, requestedAssignmentId, requ
   </div>;
 }
 
-function CuratorSectionView({ activeNav, onNavigate }: { activeNav: CuratorNav; onNavigate: (nextNav: CuratorNav) => void }) {
+function CuratorSectionView({ activeNav, requestedStudentId, isOwner, onNavigate }: { activeNav: CuratorNav; requestedStudentId: string; isOwner: boolean; onNavigate: (nextNav: CuratorNav) => void }) {
   const headings: Record<CuratorNav, { kicker: string; title: string; description: string }> = {
     "Кабинет куратора": { kicker: "РАБОЧИЙ ЦЕНТР", title: "Кабинет куратора", description: "Все работы, ученики и обратная связь по потоку собраны в одном рабочем контуре." },
     "Очередь проверки": { kicker: "ПРОВЕРКА ДЗ", title: "Очередь проверки", description: "" },
@@ -834,7 +1178,7 @@ function CuratorSectionView({ activeNav, onNavigate }: { activeNav: CuratorNav; 
   const heading = headings[activeNav] ?? headings["Кабинет куратора"];
 
   const headingClass = activeNav === "Обсуждения" ? "curator-discussion-page-heading" : activeNav === "Медиатека" ? "media-page-heading" : activeNav === "Расписание" ? "schedule-page-heading" : activeNav === "Стримы" ? "curator-streams-page-heading" : activeNav === "Кабинет куратора" ? "curator-dashboard-page-heading" : activeNav === "Очередь проверки" ? "curator-queue-page-heading" : activeNav === "Создать задание" ? "curator-create-page-heading" : activeNav === "Ученики" ? "curator-students-page-heading" : activeNav === "Приглашения" ? "curator-invite-page-heading" : activeNav === "Программа" ? "curator-program-page-heading" : "";
-  return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1>{heading.description && <p>{heading.description}</p>}</div></div>{activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView onInvite={() => onNavigate("Приглашения")} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} />} {activeNav === "Приглашения" && <CuratorInvitationsView />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && <CuratorPlaceholder title={heading.title} />}</div>;
+  return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1>{heading.description && <p>{heading.description}</p>}</div></div>{activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} isOwner={isOwner} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView requestedStudentId={requestedStudentId} onInvite={() => onNavigate("Приглашения")} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} />} {activeNav === "Приглашения" && <CuratorInvitationsView />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && <CuratorPlaceholder title={heading.title} />}</div>;
 }
 
 async function fetchReviewQueue(): Promise<ReviewQueueItem[]> {
@@ -945,7 +1289,7 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
     status: "NEW",
     updatedAt: "18 минут назад",
     messages: [
-      { id: "discussion-1-message-1", author: "student", name: "Алексей К.", time: "Сегодня, 12:06", body: "Подскажите, правильно ли я отметил возврат в зону на графике? Не понимаю, где заканчивается реакция и начинается ложный пробой.", attachment: "EURUSD-уровни.png", attachmentPreview: "/market-logic-cover.png" },
+      { id: "discussion-1-message-1", author: "student", name: "Алексей К.", time: "Сегодня, 12:06", body: "Подскажите, правильно ли я отметил возврат в зону на графике? Не понимаю, где заканчивается реакция и начинается ложный пробой.", attachment: "EURUSD-уровни.png", attachmentPreview: "/market-logic-cover.webp" },
     ],
   },
   {
@@ -991,6 +1335,11 @@ function CuratorDiscussionsView() {
   const [reply, setReply] = useState("");
   const [replySaving, setReplySaving] = useState(false);
   const [replyError, setReplyError] = useState("");
+  const [replyAttachmentName, setReplyAttachmentName] = useState("");
+  const [replySelectedFile, setReplySelectedFile] = useState<File | null>(null);
+  const [replyAttachmentPreviewUrl, setReplyAttachmentPreviewUrl] = useState("");
+  const [replyAttachmentType, setReplyAttachmentType] = useState<"image" | "video" | "file" | "">("");
+  const [replyAttachmentError, setReplyAttachmentError] = useState("");
   // Derived only from real threads — the old seed also mixed in `defaultPracticumModules`
   // (static demo data), which drifts out of sync with the actual course structure and
   // cluttered the filter with modules that no longer exist.
@@ -1011,25 +1360,74 @@ function CuratorDiscussionsView() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => () => {
+    if (replyAttachmentPreviewUrl) URL.revokeObjectURL(replyAttachmentPreviewUrl);
+  }, [replyAttachmentPreviewUrl]);
+
+  const selectReplyAttachment = (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setReplyAttachmentError("Файл слишком большой. Максимальный размер — 10 МБ.");
+      return;
+    }
+    setReplyAttachmentError("");
+    setReplyAttachmentName(file.name);
+    setReplySelectedFile(file);
+    setReplyAttachmentType(file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "file");
+    setReplyAttachmentPreviewUrl(URL.createObjectURL(file));
+  };
+
+  const clearReplyAttachment = () => {
+    setReplyAttachmentName("");
+    setReplySelectedFile(null);
+    setReplyAttachmentPreviewUrl("");
+    setReplyAttachmentType("");
+    setReplyAttachmentError("");
+  };
+
+  const handleReplyPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItem = Array.from(event.clipboardData.items).find((item) => item.type.startsWith("image/"));
+    if (!imageItem) return;
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    event.preventDefault();
+    const extension = imageItem.type.split("/")[1] || "png";
+    selectReplyAttachment(new File([file], `screenshot-${Date.now()}.${extension}`, { type: imageItem.type }));
+  };
+
   const sendReply = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const body = reply.trim();
-    if (!body || !selectedThread || replySaving) return;
+    if ((!body && !replySelectedFile) || !selectedThread || replySaving) return;
     setReplySaving(true);
     setReplyError("");
+    let uploadedFileId = "";
     try {
+      if (replySelectedFile) {
+        const createResponse = await fetch(`${API_ORIGIN}/api/files`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalName: replySelectedFile.name, mimeType: replySelectedFile.type, byteSize: replySelectedFile.size }) });
+        const createPayload = await createResponse.json().catch(() => ({})) as { message?: string; data?: { id: string; uploadUrl: string } };
+        if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
+        uploadedFileId = createPayload.data.id;
+        const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": replySelectedFile.type }, body: replySelectedFile });
+        if (!uploadResponse.ok) throw new Error("Не удалось загрузить файл.");
+      }
       const response = await fetch(`${API_ORIGIN}/api/discussions/${selectedThread.id}/messages`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body, attachments: replySelectedFile && uploadedFileId ? [{ fileId: uploadedFileId, originalName: replySelectedFile.name, mimeType: replySelectedFile.type, byteSize: replySelectedFile.size }] : [] }),
       });
       const payload = await response.json().catch(() => ({})) as { data?: DiscussionApiThread; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось сохранить ответ.");
       const nextThread = mapDiscussionApiThread(payload.data);
       setThreads((current) => current.map((thread) => thread.id === nextThread.id ? nextThread : thread));
       setReply("");
+      setReplyAttachmentName("");
+      setReplySelectedFile(null);
+      setReplyAttachmentPreviewUrl("");
+      setReplyAttachmentType("");
     } catch (error: unknown) {
+      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
       setReplyError(error instanceof Error ? error.message : "Не удалось сохранить ответ.");
     } finally {
       setReplySaving(false);
@@ -1045,9 +1443,9 @@ function CuratorDiscussionsView() {
       <section className="content-panel curator-discussion-list-panel">
         <div className="section-heading"><div><h2>Темы обсуждений</h2></div><span className="progress-inline">{threads.length} темы</span></div>
         <div className="assignment-filter curator-discussion-filters">
-          {(["all", "NEW", "WAITING", "ANSWERED"] as const).map((item) => {
+          {(["all", "NEW", "WAITING", "ANSWERED", "CLOSED"] as const).map((item) => {
             const count = item === "all" ? moduleThreads.length : moduleThreads.filter((thread) => thread.status === item).length;
-            const label = item === "all" ? "Все" : curatorDiscussionStatusLabel(item);
+            const label = item === "all" ? "Все" : item === "NEW" ? "Новые" : item === "WAITING" ? "Ждёт" : item === "ANSWERED" ? "Отвечен" : "Закрыт";
             return <button className={`filter-chip ${filter === item ? "active" : ""}`} type="button" key={item} onClick={() => setFilter(item)} aria-pressed={filter === item}>{label} <span>{count}</span></button>;
           })}
           <label className="curator-discussion-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
@@ -1056,20 +1454,21 @@ function CuratorDiscussionsView() {
       </section>
       {selectedThread ? <section className="content-panel curator-discussion-detail">
         <div className="curator-discussion-detail-head"><div><span className="section-kicker">{selectedThread.module}</span><h2>{selectedThread.title}</h2><p>{selectedThread.student}{selectedThread.assignment ? ` · ${selectedThread.assignment}` : ""}</p></div><span className={`curator-discussion-status ${selectedThread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(selectedThread.status)}</span></div>
-        <div className="curator-discussion-module-cover" role="img" aria-label={`Обложка ${selectedThread.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(0,0,0,.9), rgba(0,0,0,.28)), url("${selectedThread.coverPath ?? discussionCoverForContext({ module: selectedThread.module })}")` }}><strong>{selectedThread.module}</strong></div>
+        <div className="curator-discussion-module-cover" role="img" aria-label={`Обложка ${selectedThread.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(4,7,12,.94), rgba(4,7,12,.72)), url("${selectedThread.coverPath ?? discussionCoverForContext({ module: selectedThread.module })}")` }}><strong>{selectedThread.module}</strong></div>
         <div className="curator-discussion-context">{selectedThread.assignment && <span><FileCheck2 size={14} /> {selectedThread.assignment}</span>}<span><MessageSquareText size={14} /> Личная тема ученика</span></div>
         <div className="curator-discussion-messages">{selectedThread.messages.map((message) => <article className={`curator-discussion-message ${message.author}`} key={message.id}><div className="curator-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{message.body}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
-        <form className="curator-discussion-reply" onSubmit={sendReply}><label htmlFor="curator-discussion-reply">ОТВЕТ КУРАТОРА</label><textarea id="curator-discussion-reply" value={reply} onChange={(event) => setReply(event.target.value)} placeholder="Напиши ответ и добавь ученику следующий шаг…" rows={4} /><div><span className="curator-discussion-draft-note"><FileCheck2 size={14} /> Ответ сохранится в истории этой темы</span><button className="primary-button" type="submit" disabled={!reply.trim() || replySaving}>{replySaving ? "Сохраняем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div>{replyError && <div className="file-error" role="alert">{replyError}</div>}</form>
+        <form className="curator-discussion-reply" onSubmit={sendReply}><label htmlFor="curator-discussion-reply">ОТВЕТ КУРАТОРА</label><div className="curator-discussion-input-wrap"><textarea id="curator-discussion-reply" value={reply} onChange={(event) => setReply(event.target.value)} onPaste={handleReplyPaste} placeholder="Напишите ответ…" rows={4} /><label className="discussion-reply-attach-button" htmlFor="curator-discussion-reply-attachment" title="Прикрепить файл" aria-label="Прикрепить файл"><Plus size={18} /><input id="curator-discussion-reply-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectReplyAttachment(event.target.files?.[0])} /></label></div>{replyAttachmentName && <div className="discussion-reply-attach-chip"><FileCheck2 size={14} /><span>{replyAttachmentName}</span><button type="button" onClick={clearReplyAttachment} aria-label="Убрать вложение"><X size={12} /></button></div>}{replyAttachmentError && <div className="file-error" role="alert">{replyAttachmentError}</div>}{replyAttachmentPreviewUrl && <div className="discussion-selected-preview">{replyAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${replyAttachmentName}`} style={{ backgroundImage: `url("${replyAttachmentPreviewUrl}")` }} />}{replyAttachmentType === "video" && <video src={replyAttachmentPreviewUrl} controls playsInline preload="metadata" />}{replyAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{replyAttachmentName}</span></div>}</div>}<div><span className="curator-discussion-draft-note"><FileCheck2 size={14} /> Ответ сохранится в истории этой темы</span><button className="primary-button" type="submit" disabled={(!reply.trim() && !replySelectedFile) || replySaving}>{replySaving ? "Сохраняем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div>{replyError && <div className="file-error" role="alert">{replyError}</div>}</form>
       </section> : <section className="content-panel curator-discussion-empty empty-state"><MessageSquareText size={22} /><strong>Выбери тему</strong><span>Справа появится история вопроса и форма ответа.</span></section>}
     </div>
   </div>;
 }
 
-function CuratorDashboardOverview({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
+function CuratorDashboardOverview({ onNavigate, isOwner }: { onNavigate: (nextNav: CuratorNav) => void; isOwner: boolean }) {
   const [localQueue, setLocalQueue] = useState<ReviewQueueItem[]>([]);
   const [studentCount, setStudentCount] = useState<number | null>(null);
   const [discussions, setDiscussions] = useState<CuratorDiscussion[]>([]);
   const [upcomingEvents, setUpcomingEvents] = useState<ScheduleEvent[]>([]);
+  const [liveScheduleEventId, setLiveScheduleEventId] = useState<string | null>(null);
 
   useEffect(() => {
     const handleSubmitted = (event: Event) => {
@@ -1114,6 +1513,20 @@ function CuratorDashboardOverview({ onNavigate }: { onNavigate: (nextNav: Curato
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    const refreshLiveStatus = async () => {
+      try {
+        const response = await fetch(`${API_ORIGIN}/api/streams/status`, { credentials: "include", cache: "no-store" });
+        if (!response.ok) return;
+        const payload = await response.json() as { data?: { liveScheduleEventId: string | null } };
+        setLiveScheduleEventId(payload.data?.liveScheduleEventId ?? null);
+      } catch { /* keep last known state */ }
+    };
+    void refreshLiveStatus();
+    const poll = window.setInterval(() => { void refreshLiveStatus(); }, 15_000);
+    return () => window.clearInterval(poll);
+  }, []);
+
   // Cohort-wide counts stay in the top row (curators share one queue); "Проверено вами" is
   // scoped to this curator specifically — with 2-3 curators on one stream, a shared "Принято"
   // number told nobody which of them was actually doing the reviewing.
@@ -1141,7 +1554,7 @@ function CuratorDashboardOverview({ onNavigate }: { onNavigate: (nextNav: Curato
             <div className={`assignment-badge ${item.status === "Принято" ? "green" : item.tone}`}>{item.status}</div>
           </button>) : <div className="empty-state"><FileCheck2 size={20} /><strong>Пока пусто</strong><span>Новые работы появятся здесь.</span></div>}
         </div>
-        <button className="text-button" onClick={() => onNavigate("Очередь проверки")}>Открыть всю очередь <ChevronRight size={15} /></button>
+        <button className="support-card" type="button" onClick={() => onNavigate("Очередь проверки")}><span className="support-card-label">Открыть всю очередь</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button>
       </section>
       <section className="content-panel curator-dashboard-widget">
         <div className="section-heading"><div><h2>Вопросы учеников</h2></div><span className="progress-inline">{pendingDiscussions.length}</span></div>
@@ -1152,20 +1565,112 @@ function CuratorDashboardOverview({ onNavigate }: { onNavigate: (nextNav: Curato
             <b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b>
           </button>) : <div className="empty-state"><MessageSquareText size={20} /><strong>Нет открытых вопросов</strong><span>Новые вопросы появятся здесь.</span></div>}
         </div>
-        <button className="text-button" onClick={() => onNavigate("Обсуждения")}>Открыть обсуждения <ChevronRight size={15} /></button>
+        <button className="support-card" type="button" onClick={() => onNavigate("Обсуждения")}><span className="support-card-label">Открыть обсуждения</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button>
       </section>
       <section className="content-panel curator-dashboard-widget">
         <div className="section-heading"><div><h2>Расписание</h2></div><span className="progress-inline">{nextEvents.length}</span></div>
         <div className="curator-dashboard-widget-list">
-          {nextEvents.length > 0 ? nextEvents.map((event) => <button className="curator-dashboard-widget-row" type="button" key={event.id} onClick={() => onNavigate("Расписание")}>
+          {nextEvents.length > 0 ? nextEvents.map((event) => <button className="curator-dashboard-widget-row" type="button" key={event.id} onClick={() => { window.sessionStorage.setItem("curator-target-schedule-event", event.id); onNavigate("Расписание"); }}>
             <div className="curator-dashboard-widget-date"><strong>{event.day}</strong><span>{event.month}</span></div>
             <div className="curator-dashboard-widget-copy"><strong>{event.title}</strong><span>{event.time}</span></div>
+            {event.id === liveScheduleEventId && <span className="curator-dashboard-widget-live-badge"><span className="live-dot" /> В эфире</span>}
           </button>) : <div className="empty-state"><CalendarDays size={20} /><strong>Ничего не запланировано</strong><span>Добавь событие в расписании.</span></div>}
         </div>
-        <button className="text-button" onClick={() => onNavigate("Расписание")}>Открыть расписание <ChevronRight size={15} /></button>
+        <button className="support-card" type="button" onClick={() => onNavigate("Расписание")}><span className="support-card-label">Открыть расписание</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button>
       </section>
     </div>
+    {isOwner && <PracticumManagerCard />}
   </>;
+}
+
+type PracticumSummary = { id: string; title: string; description: string | null; isActive: boolean; createdAt: string };
+
+/**
+ * Owner-only — lists every practicum (current and past) and lets the owner switch which one is
+ * active, or start a brand-new one. Every curator-side "current practicum" resolver reads the
+ * active flag live (see practicum-service.ts#getActivePracticumId), so switching here alone moves
+ * all new lessons/streams/schedule/invitations — nothing else needs touching, and it's reversible
+ * (switching back to an earlier practicum is just another click here, not a one-way door).
+ * A finished practicum's own students keep seeing exactly what they always saw regardless of
+ * which practicum is currently active.
+ */
+function PracticumManagerCard() {
+  const [practicums, setPracticums] = useState<PracticumSummary[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [title, setTitle] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  const loadPracticums = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/course/practicums`, { credentials: "include", cache: "no-store" });
+      const payload = await response.json().catch(() => ({})) as { data?: PracticumSummary[] };
+      if (response.ok && Array.isArray(payload.data)) setPracticums(payload.data);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => { void loadPracticums(); }, [loadPracticums]);
+
+  const startNewPracticum = async () => {
+    const trimmed = title.trim();
+    if (!trimmed || saving) return;
+    if (!window.confirm(`Начать новый поток «${trimmed}»? Текущий поток останется как есть и доступен своим ученикам — но все новые уроки, стримы, расписание и приглашения будут уходить уже в новый.`)) return;
+    setSaving(true);
+    setNotice("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/course/practicum`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: trimmed }) });
+      const payload = await response.json().catch(() => ({})) as { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось начать новый поток.");
+      setTitle("");
+      setNotice(`Новый поток «${trimmed}» запущен и стал активным.`);
+      await loadPracticums();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Не удалось начать новый поток.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const switchTo = async (practicum: PracticumSummary) => {
+    if (saving) return;
+    if (!window.confirm(`Сделать активным поток «${practicum.title}»? Новые уроки, стримы, расписание и приглашения начнут уходить в него.`)) return;
+    setSaving(true);
+    setNotice("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/course/practicums/${practicum.id}/activate`, { method: "POST", credentials: "include" });
+      const payload = await response.json().catch(() => ({})) as { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось переключить поток.");
+      setNotice(`Активным стал поток «${practicum.title}».`);
+      await loadPracticums();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Не удалось переключить поток.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <section className="content-panel curator-dashboard-widget">
+    <div className="section-heading"><div><h2>Потоки</h2><p className="section-heading-note">Новые уроки, стримы, расписание и приглашения всегда уходят в активный поток. Переключение обратимо — данные не удаляются и не двигаются.</p></div></div>
+    {loaded && practicums.length > 0 && <div className="curator-dashboard-widget-list">
+      {practicums.map((practicum) => <div className="curator-dashboard-widget-row" key={practicum.id}>
+        <div className="curator-dashboard-widget-copy"><strong>{practicum.title}</strong><span>{new Date(practicum.createdAt).toLocaleDateString("ru-RU")}</span></div>
+        {practicum.isActive
+          ? <span className="assignment-badge green">Активен</span>
+          : <button className="secondary-button" type="button" disabled={saving} onClick={() => void switchTo(practicum)}>Сделать активным</button>}
+      </div>)}
+    </div>}
+    <div className="media-editor-body">
+      <div className="media-editor-fields">
+        <label className="form-field"><span>Название нового потока</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Поток 05 · Октябрь" /></label>
+      </div>
+      <div className="media-form-actions">
+        <button className="primary-button" type="button" disabled={!title.trim() || saving} onClick={() => void startNewPracticum()}>{saving ? "Сохраняем…" : "Начать новый поток"} <ChevronRight size={16} /></button>
+        {notice && <span className="form-action-feedback"><Target size={16} /> {notice}</span>}
+      </div>
+    </div>
+  </section>;
 }
 
 function CuratorReviewWorkspace({ onNavigate }: { onNavigate?: (nextNav: CuratorNav) => void }) {
@@ -1288,6 +1793,13 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
   const [releasing, setReleasing] = useState(false);
   const [checkedCriteria, setCheckedCriteria] = useState<boolean[]>(() => (item.requirements ?? []).map(() => false));
   const [previewFile, setPreviewFile] = useState<NonNullable<ReviewQueueItem["attachmentFiles"]>[number] | null>(null);
+  const [zoomImageUrl, setZoomImageUrl] = useState("");
+  useEffect(() => {
+    if (!zoomImageUrl) return;
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setZoomImageUrl(""); };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [zoomImageUrl]);
   const [feedbackAttachmentName, setFeedbackAttachmentName] = useState("");
   const [feedbackSelectedFile, setFeedbackSelectedFile] = useState<File | null>(null);
   const [feedbackAttachmentPreviewUrl, setFeedbackAttachmentPreviewUrl] = useState("");
@@ -1420,15 +1932,22 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
       {item.requirements && item.requirements.length > 0 && <div className="submission-section review-criteria"><div className="review-section-heading"><div><span className="detail-label">КРИТЕРИИ ПРОВЕРКИ</span><small>{item.status === "Принято" ? "Отмечено на момент принятия работы — необязательно все." : "Отметь то, что ученик выполнил чётко. Работу можно принять и без всех галочек."}</small></div><strong>{(item.status === "Принято" ? (item.checkedRequirements?.length ?? 0) : checkedCriteria.filter(Boolean).length)}/{item.requirements.length}</strong></div><div className="review-criteria-list">{item.requirements.map((requirement, index) => { const checked = item.status === "Принято" ? (item.checkedRequirements?.includes(requirement) ?? false) : (checkedCriteria[index] ?? false); return <label className={`review-criteria-item ${checked ? "checked" : ""}`} key={`${item.id}-${requirement}`}><input type="checkbox" checked={checked} disabled={item.status === "Принято"} onChange={() => setCheckedCriteria((current) => current.map((value, currentIndex) => currentIndex === index ? !value : value))} /><span className="review-criteria-box">✓</span><span>{requirement}</span></label>; })}</div></div>}
       {(files.length > 0 || item.attachments.length > 0) && <div className="submission-section"><span className="detail-label">ВЛОЖЕНИЯ</span><div className="submission-files">
         {files.length > 0 ? files.map((file) => <div className="submission-file-card has-preview" key={file.id}>
-          {file.type.startsWith("image/") && <div className="submission-image-preview"><Image src={`${API_ORIGIN}${file.url}`} alt={`Предпросмотр вложения ${file.name}`} fill sizes="(max-width: 700px) 100vw, 720px" unoptimized /></div>}
+          {file.type.startsWith("image/") && <button type="button" className="submission-image-preview submission-image-preview-button" aria-label={`Увеличить изображение ${file.name}`} onClick={() => setZoomImageUrl(`${API_ORIGIN}${file.url}`)}><Image src={`${API_ORIGIN}${file.url}`} alt={`Предпросмотр вложения ${file.name}`} fill sizes="(max-width: 700px) 100vw, 720px" unoptimized /><span className="submission-image-preview-zoom-hint"><Maximize2 size={13} /> Увеличить</span></button>}
           {file.type.startsWith("video/") && <video src={`${API_ORIGIN}${file.url}`} controls preload="metadata" />}
-          <button type="button" className="submission-file" onClick={() => setPreviewFile(file)}><FileCheck2 size={16} /><span>{file.name}</span><Maximize2 size={14} /></button>
+          <button type="button" className="submission-file" onClick={() => file.type.startsWith("image/") ? setZoomImageUrl(`${API_ORIGIN}${file.url}`) : setPreviewFile(file)}><FileCheck2 size={16} /><span>{file.name}</span><Maximize2 size={14} /></button>
         </div>) : <div className="submission-legacy-file"><FileCheck2 size={16} /><div><strong>{[...new Set(item.attachments)].join(", ")}</strong><span>Это вложение сохранено до подключения защищённого хранилища. Попросите ученика отправить работу повторно.</span></div></div>}
       </div><p className="attachment-preview-note">Предпросмотр открыт внутри платформы и доступен только участникам этой проверки.</p></div>}
         <div className="submission-section review-history-section"><div className="review-section-heading"><span className="detail-label">ИСТОРИЯ ПОПЫТОК</span></div><div className="attempt-history">{attemptHistory.map((attempt) => { const isCurrent = attempt.attempt === currentAttemptNumber; const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted"; const statusLabel = attempt.status === "На проверке" ? "Отправлено на проверку" : attempt.status; return <div key={attempt.attempt}><span className={`attempt-dot ${dotTone}`} /><div><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><small>{attempt.submittedAt} · {statusLabel}</small></div></div>; })}</div></div>
       <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ВАШ ОТВЕТ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} onPaste={handleFeedbackPaste} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : awaitingResubmission ? "Ждём доработку от ученика — как только он отправит новую попытку, здесь снова будет можно оставить ответ." : "Напиши, что получилось и что нужно поправить… Скриншот можно вставить через Ctrl+V"} rows={4} disabled={item.status === "Принято" || !canDecide} />{item.status !== "Принято" && canDecide && <label className={`discussion-attachment-picker ${feedbackAttachmentName ? "has-file" : ""}`} htmlFor="curator-feedback-attachment"><FileCheck2 size={17} /><span>{feedbackAttachmentName || "Прикрепить скриншот или файл"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V</small><input id="curator-feedback-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectFeedbackAttachment(event.target.files?.[0])} /></label>}{feedbackAttachmentError && <div className="file-error" role="alert">{feedbackAttachmentError}</div>}{feedbackAttachmentPreviewUrl && <div className="discussion-selected-preview">{feedbackAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${feedbackAttachmentName}`} style={{ backgroundImage: `url("${feedbackAttachmentPreviewUrl}")` }} />}{feedbackAttachmentType === "video" && <video src={feedbackAttachmentPreviewUrl} controls playsInline preload="metadata" />}{feedbackAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{feedbackAttachmentName}</span></div>}</div>}{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}{awaitingResubmission && <div className="detail-feedback curator-decision"><Clock3 size={17} /><div><strong>Ждём доработку от ученика</strong><p>Вы уже отправили эту попытку на доработку. Как только ученик пришлёт новую, работа снова появится здесь для проверки.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
     </div>
-    {previewFile && <div className="attachment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Просмотр файла ${previewFile.name}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewFile(null); }}><div className="attachment-modal"><div className="video-modal-head"><strong>{previewFile.name}</strong><button className="icon-button" aria-label="Закрыть просмотр" onClick={() => setPreviewFile(null)}><X size={18} /></button></div>{previewFile.type.startsWith("image/") && <div className="attachment-modal-image" style={{ backgroundImage: `url("${API_ORIGIN}${previewFile.url}")` }} />}{previewFile.type.startsWith("video/") && <video src={`${API_ORIGIN}${previewFile.url}`} controls autoPlay playsInline />}{previewFile.type === "application/pdf" && <iframe src={`${API_ORIGIN}${previewFile.url}`} title={previewFile.name} />}</div></div>}
+    {previewFile && <div className="attachment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Просмотр файла ${previewFile.name}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewFile(null); }}><div className="attachment-modal"><div className="video-modal-head"><strong>{previewFile.name}</strong><button className="icon-button" aria-label="Закрыть просмотр" onClick={() => setPreviewFile(null)}><X size={18} /></button></div>{previewFile.type.startsWith("video/") && <video src={`${API_ORIGIN}${previewFile.url}`} controls autoPlay playsInline />}{previewFile.type === "application/pdf" && <iframe src={`${API_ORIGIN}${previewFile.url}`} title={previewFile.name} />}</div></div>}
+    {zoomImageUrl && typeof document !== "undefined" && createPortal(
+      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
+        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
+        <img className="chat-image-lightbox-image" src={zoomImageUrl} alt="Просмотр вложения" />
+      </div>,
+      document.body,
+    )}
   </section>;
 }
 
@@ -1467,7 +1986,7 @@ function formatLoginEventReason(reasonCode: string | null): string | null {
   return reasonCode ? `Причина: ${reasonCode}` : null;
 }
 
-function CuratorStudentsView({ onInvite }: { onInvite: () => void }) {
+function CuratorStudentsView({ onInvite, requestedStudentId = "" }: { onInvite: () => void; requestedStudentId?: string }) {
   const [students, setStudents] = useState<StudentDirectoryRecord[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -1482,7 +2001,7 @@ function CuratorStudentsView({ onInvite }: { onInvite: () => void }) {
         if (!response.ok) throw new Error(response.status === 403 ? "Нет прав для просмотра списка учеников." : "Не удалось загрузить список учеников.");
         const payload = await response.json() as { data: StudentDirectoryRecord[] };
         setStudents(payload.data);
-        setSelectedId("");
+        setSelectedId(requestedStudentId && payload.data.some((student) => student.id === requestedStudentId) ? requestedStudentId : "");
       } catch (requestError) {
         if (requestError instanceof DOMException && requestError.name === "AbortError") return;
         setError(requestError instanceof Error ? requestError.message : "Не удалось загрузить список учеников.");
@@ -1492,7 +2011,7 @@ function CuratorStudentsView({ onInvite }: { onInvite: () => void }) {
     };
     void loadStudents();
     return () => controller.abort();
-  }, []);
+  }, [requestedStudentId]);
 
   const selectedStudent = students.find((student) => student.id === selectedId) ?? students[0];
   const activeSessions = students.reduce((total, student) => total + student.activeSessionCount, 0);
@@ -2071,6 +2590,24 @@ function CuratorInvitationsView() {
   const [notice, setNotice] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [practicums, setPracticums] = useState<PracticumSummary[]>([]);
+  const [practicumId, setPracticumId] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`${API_ORIGIN}/api/course/practicums`, { credentials: "include", cache: "no-store" });
+        const payload = await response.json().catch(() => ({})) as { data?: PracticumSummary[] };
+        if (cancelled || !response.ok || !Array.isArray(payload.data)) return;
+        setPracticums(payload.data);
+        setPracticumId((current) => current || payload.data!.find((item) => item.isActive)?.id || payload.data![0]?.id || "");
+      } catch {
+        // form still works without the picker — server falls back to the active practicum
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const createInvitation = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2092,6 +2629,7 @@ function CuratorInvitationsView() {
           expiresInHours: Number(expiresInHours),
           targetProvider: "DISCORD",
           targetSubject: discordId.trim(),
+          practicumId: practicumId || undefined,
         }),
       });
       const payload = await response.json() as { data?: { token: string; expiresAt: string; emailSent?: boolean }; message?: string };
@@ -2133,6 +2671,7 @@ function CuratorInvitationsView() {
       <div className="section-heading"><div><span className="section-kicker">НОВЫЙ ДОСТУП</span><h2>Создать приглашение</h2><p className="section-heading-note">Ссылка будет работать только для указанного Discord-аккаунта.</p></div><UserPlus size={19} className="heading-icon" /></div>
       <div className="form-body">
         <label className="form-field"><span>Роль участника</span><select value={role} onChange={(event) => setRole(event.target.value as "STUDENT" | "CURATOR")}><option value="STUDENT">Ученик</option><option value="CURATOR">Куратор</option></select></label>
+        {practicums.length > 0 && <label className="form-field"><span>Поток</span><select value={practicumId} onChange={(event) => setPracticumId(event.target.value)}>{practicums.map((item) => <option key={item.id} value={item.id}>{item.title}{item.isActive ? " · активен" : ""}</option>)}</select><small className="file-field-note">Куда попадёт участник после подтверждения Discord. По умолчанию — активный поток.</small></label>}
         <label className="form-field"><span>Email участника</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="student@example.com" required={role === "STUDENT"} /><small className="file-field-note">На этот адрес будут приходить уведомления о ДЗ, стримах и обсуждениях.</small></label>
         <label className="form-field"><span>Discord ID участника</span><input type="text" inputMode="numeric" pattern="[0-9]{17,20}" value={discordId} onChange={(event) => setDiscordId(event.target.value)} placeholder="Например, 1535254297472925738" required /><small className="file-field-note">Это числовой ID Discord, не username. Найти его можно в Discord с включённым режимом разработчика.</small></label>
         <label className="form-field"><span>Ссылка действует, часов</span><input type="number" min="1" max="720" value={expiresInHours} onChange={(event) => setExpiresInHours(event.target.value)} required /></label>
@@ -2413,7 +2952,7 @@ function CuratorMediaLibraryView() {
   const [reclassifyKind, setReclassifyKind] = useState<CuratorMediaItem["kind"]>("STREAM");
   const [reclassifyModuleId, setReclassifyModuleId] = useState("");
   const [reclassifyScheduleEventId, setReclassifyScheduleEventId] = useState("");
-  const [showExisting, setShowExisting] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
 
   const loadCourse = useCallback(async () => {
     const response = await fetch(`${API_ORIGIN}/api/course/manage`, { credentials: "include", cache: "no-store" });
@@ -2454,18 +2993,22 @@ function CuratorMediaLibraryView() {
       moduleTitle: "Общая медиатека",
       eventTitle: media.scheduleEventId ? eventTitles.get(media.scheduleEventId) : undefined,
     }));
-    return [...moduleItems, ...globalItems];
+    // globalMedia is now scoped server-side to moduleId+scheduleEventId both null, so a
+    // schedule-event recording (moduleId null, scheduleEventId set) only shows up here.
+    const scheduleItems = course.scheduleEvents.flatMap((event) => event.recordings.map((media) => ({
+      ...media,
+      moduleId: null,
+      moduleTitle: "Расписание",
+      eventTitle: event.title,
+    })));
+    return [...moduleItems, ...globalItems, ...scheduleItems];
   }, [course]);
   const selected = items.find((item) => item.id === selectedId) ?? null;
+  // Newest first, independent of module/event — every stream/Q&A/lecture the curator has ever
+  // published or drafted, in one place, instead of the old per-scope "existing records" list.
+  const allItemsSorted = useMemo(() => [...items].sort((a, b) => new Date(b.publishedAt ?? 0).getTime() - new Date(a.publishedAt ?? 0).getTime()), [items]);
   const isGlobalMedia = kind === "TALKS";
   const mediaDestinationLabel = kind === "QA" ? "Q&A урока" : kind === "BREAKDOWN" ? "разбор урока" : kind === "LESSON_VIDEO" ? "урок" : "тематический блок урока";
-  const existingInScope = isGlobalMedia
-    ? items.filter((item) => item.kind === "TALKS")
-    : scheduleEventId
-      ? items.filter((item) => item.scheduleEventId === scheduleEventId && item.kind === kind)
-      : moduleId
-        ? items.filter((item) => item.moduleId === moduleId && item.kind === kind)
-        : [];
   useEffect(() => {
     const targetModuleId = window.sessionStorage.getItem("curator-target-module");
     const targetEventId = window.sessionStorage.getItem("curator-target-event");
@@ -2625,16 +3168,42 @@ function CuratorMediaLibraryView() {
          <div className="media-form-actions"><button className="secondary-button" type="submit" disabled={saving || (!isGlobalMedia && !moduleId && !scheduleEventId) || !title.trim() || !vimeoUrl.trim()}>Сохранить черновик</button><button className="primary-button" type="submit" data-publish="true" disabled={saving || (!isGlobalMedia && !moduleId && !scheduleEventId) || !title.trim() || !vimeoUrl.trim()}>{isGlobalMedia ? "Опубликовать в медиатеку" : scheduleEventId ? "Опубликовать к событию" : `Опубликовать в ${mediaDestinationLabel}`} <ChevronRight size={16} /></button>{notice && <span className="form-action-feedback"><Target size={16} /> {notice}</span>}</div>
       </form>
     </section>
-    {(isGlobalMedia || moduleId || scheduleEventId) && <section className="content-panel media-existing-toggle">
-      <button className="secondary-button" type="button" onClick={() => setShowExisting((current) => { const next = !current; if (!next) { setSelectedId(""); setReclassifying(false); } return next; })}>{showExisting ? "Скрыть существующие записи" : `Показать существующие записи (${existingInScope.length})`}</button>
-      {showExisting && (existingInScope.length === 0
-        ? <p className="media-link-note">Здесь пока пусто — это будет первая запись такого типа в этом блоке.</p>
-        : <div className="module-media-playlist">{existingInScope.map((item, index) => <button className={`module-media-item ${item.id === selectedId ? "selected" : ""}`} type="button" key={item.id} onClick={() => setSelectedId(item.id)}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.title ?? "Без названия"}</strong><small>{mediaKindLabel(item.kind)} · {item.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</small></div><ChevronRight size={14} /></button>)}</div>)}
+    <button className="secondary-button" type="button" onClick={() => setLibraryOpen((current) => !current)}>{libraryOpen ? "Скрыть все записи потока" : `Показать все записи потока (${allItemsSorted.length})`}</button>
+    {libraryOpen && <section className="content-panel media-library-inline">
+      {allItemsSorted.length === 0
+        ? <p className="media-link-note">Записей пока нет.</p>
+        : <div className="stream-grid">{allItemsSorted.map((item) => <CuratorMediaCard item={item} key={item.id} onOpen={() => { setSelectedId(item.id); setReclassifying(false); }} />)}</div>}
     </section>}
-    {selected && <section className="content-panel media-preview-panel">
-      <div className="section-heading"><div><span className="section-kicker">ЗАПИСЬ</span><h2>{selected.title ?? "Без названия"}</h2></div><span className="media-source-badge">{selected.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</span></div>{selected.embedUrl ? <div className="media-vimeo-stage"><iframe src={selected.embedUrl} title={selected.title ?? "Предпросмотр записи"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div> : <div className="empty-state"><Play size={22} /><strong>Плеер недоступен</strong><span>Проверь ссылку Vimeo.</span></div>}<div className="media-preview-meta"><div><span className="section-kicker">{selected.kind === "TALKS" ? "ОБЩАЯ МЕДИАТЕКА" : "ПРИВЯЗКА"}</span><strong>{selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle}</strong><small>{mediaKindLabel(selected.kind)}</small></div><div className="media-preview-actions">{selected.kind !== "TALKS" && <button className="secondary-button" type="button" disabled={saving || deletingId !== "" || !moduleId || !selected.moduleId || selected.moduleId === moduleId} onClick={() => void attachSelected()}>{selected.moduleId === moduleId ? "Уже привязан" : "Привязать к выбранному уроку"}</button>}<button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => (reclassifying ? setReclassifying(false) : openReclassify())}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>{reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId) setReclassifyModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyModuleId} onChange={(event) => { setReclassifyModuleId(event.target.value); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label><label className="form-field"><span>Привязать к событию (необязательно)</span><select value={reclassifyScheduleEventId} onChange={(event) => { setReclassifyScheduleEventId(event.target.value); if (event.target.value) setReclassifyModuleId(""); }}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label></>}</div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || (reclassifyKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId)} onClick={() => void saveReclassify()}>Сохранить тип</button></div></div>}{viewersFor === selected.id && <div className="media-viewers-panel">{viewersLoading ? <span className="media-viewers-empty">Загружаем…</span> : viewers.length === 0 ? <span className="media-viewers-empty">Пока никто не открывал эту запись.</span> : viewers.map((event) => <div className="media-viewers-row" key={event.id}><strong>{event.viewer.name}</strong><span>{event.viewer.role === "STUDENT" ? "Ученик" : event.viewer.role === "CURATOR" ? "Куратор" : "Владелец"}</span><span>{event.ipAddress ?? "IP не определён"}</span><span>{new Date(event.createdAt).toLocaleString("ru-RU")}</span></div>)}</div>}</div>
-    </section>}
+    {/* A second, focused popup for whichever card was opened — matches the student "Записи" flow
+        (grid page + a separate video-modal popup) instead of expanding in place inside the grid,
+        which meant scrolling past other cards to reach the action buttons. */}
+    {selected && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Запись: ${selected.title ?? "Без названия"}`} onMouseDown={(event) => { if (event.currentTarget === event.target) { setSelectedId(""); setReclassifying(false); } }}>
+      <div className="video-modal">
+        <div className="video-modal-head"><div><span className="section-kicker">{(selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle)} · {mediaKindLabel(selected.kind)}</span><strong>{selected.title ?? "Без названия"}</strong></div><button className="icon-button" aria-label="Закрыть" onClick={() => { setSelectedId(""); setReclassifying(false); }}><X size={18} /></button></div>
+        {selected.embedUrl ? <TrackedVideo mediaId={selected.id} src={selected.embedUrl} title={selected.title ?? "Запись"} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}
+        <div className="video-modal-foot media-preview-actions">{selected.kind !== "TALKS" && <button className="secondary-button" type="button" disabled={saving || deletingId !== "" || !moduleId || !selected.moduleId || selected.moduleId === moduleId} onClick={() => void attachSelected()}>{selected.moduleId === moduleId ? "Уже привязан" : "Привязать к выбранному уроку"}</button>}<button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => (reclassifying ? setReclassifying(false) : openReclassify())}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}{selected.provider === "LIVEKIT_RECORDING" && <a className="secondary-button" href={`/api/streams/recordings/${selected.id}/download`} target="_blank" rel="noopener noreferrer"><Download size={15} /> Скачать</a>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>
+        {reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId) setReclassifyModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyModuleId} onChange={(event) => { setReclassifyModuleId(event.target.value); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label><label className="form-field"><span>Привязать к событию (необязательно)</span><select value={reclassifyScheduleEventId} onChange={(event) => { setReclassifyScheduleEventId(event.target.value); if (event.target.value) setReclassifyModuleId(""); }}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label></>}</div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || (reclassifyKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId)} onClick={() => void saveReclassify()}>Сохранить тип</button></div></div>}
+        {viewersFor === selected.id && <div className="media-viewers-panel">{viewersLoading ? <span className="media-viewers-empty">Загружаем…</span> : viewers.length === 0 ? <span className="media-viewers-empty">Пока никто не открывал эту запись.</span> : viewers.map((event) => <div className="media-viewers-row" key={event.id}><strong>{event.viewer.name}</strong><span>{event.viewer.role === "STUDENT" ? "Ученик" : event.viewer.role === "CURATOR" ? "Куратор" : "Владелец"}</span><span>{event.ipAddress ?? "IP не определён"}</span><span>{new Date(event.createdAt).toLocaleString("ru-RU")}</span></div>)}</div>}
+      </div>
+    </div>}
   </div>;
+}
+
+/** One card in the curator's "all recordings" grid (mirroring the student "Записи" page) — opens the shared video-modal popup above rather than expanding in place. */
+function CuratorMediaCard({ item, onOpen }: { item: CuratorMediaItem; onOpen: () => void }) {
+  return <article className="stream-card"><button className="stream-card-button" type="button" onClick={onOpen}>
+    <div className={`stream-preview ${item.thumbnailUrl ? "has-cover" : ""}`}>
+      {item.thumbnailUrl ? <div className="stream-cover" role="img" aria-label={`Обложка: ${item.title ?? "запись"}`} style={{ backgroundImage: `url("${item.thumbnailUrl}")` }} /> : <div className="mini-candles"><i /><i /><i /><i /><i /></div>}
+      <div className="stream-preview-label">{item.status === "PUBLISHED" ? "ОПУБЛИКОВАНО" : "ЧЕРНОВИК"}</div>
+      <span className="play-button" aria-hidden="true"><Play size={17} fill="currentColor" /></span>
+      <span className="stream-duration">{formatDuration(item.durationSec)}</span>
+    </div>
+    <div className="stream-card-copy">
+      <span>{item.eventTitle ? `Событие · ${item.eventTitle}` : item.moduleTitle}</span>
+      <h3>{item.title ?? "Без названия"}</h3>
+      <p>{mediaKindLabel(item.kind)}</p>
+    </div>
+  </button></article>;
 }
 
 function normalizeVimeoUrl(rawUrl: string) {
@@ -2727,6 +3296,18 @@ function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav)
     void load().catch(() => setScheduleLoadError("Не удалось загрузить расписание с сервера. Показаны локальные/демонстрационные данные."));
   }, []);
 
+  // Consumed once when the curator clicks a schedule row on "Кабинет куратора" — opens
+  // that event's details directly instead of landing on the first event in the list.
+  useEffect(() => {
+    const targetEventId = window.sessionStorage.getItem("curator-target-schedule-event");
+    if (!targetEventId) return;
+    const target = events.find((event) => event.id === targetEventId);
+    if (!target) return;
+    window.sessionStorage.removeItem("curator-target-schedule-event");
+    const timer = window.setTimeout(() => { setSelectedId(target.id); setDetailsId(target.id); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [events]);
+
   const selectedEvent = events.find((event) => event.id === selectedId) ?? events[0];
   const detailsEvent = events.find((event) => event.id === detailsId);
   const openCreateForDate = (date: string) => {
@@ -2780,7 +3361,8 @@ function formatCountdown(ms: number): string {
   return days > 0 ? `${days} дн ${pad(hours)}:${pad(minutes)}:${pad(seconds)}` : `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
 }
 
-type LiveInputDto = { uid: string; rtmpsUrl: string | null; rtmpsStreamKey: string | null; isLive: boolean; playbackIframeUrl: string | null };
+type IngressDto = { ingressId: string; rtmpUrl: string | null; rtmpStreamKey: string | null; isLive: boolean };
+type PlaybackStatusDto = { isLive: boolean; viewerToken: string | null; roomName: string | null; liveScheduleEventId: string | null };
 
 const REACTION_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"] as const;
 
@@ -2888,14 +3470,28 @@ function ChatMessageRow({ message, currentUserId, onReact, onContextMenu }: { me
   // A student answering another student's question — distinct from a curator's reply, so
   // whoever is scanning the chat can tell at a glance who actually helped.
   const isPeerAnswer = !isStaff && Boolean(message.replyTo) && message.replyTo?.authorRole === "STUDENT";
+  // Discord-style "jump to message": the quoted reply names the original message's id, so a
+  // click just needs to find that row by DOM id (every row in this list carries one) and
+  // scroll to it — no server round-trip, the whole chat is already rendered in the list.
+  const jumpToMessage = (targetId: string) => {
+    const target = document.getElementById(`chat-msg-${targetId}`);
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.classList.remove("is-jump-highlight");
+    // Force a reflow so re-adding the class restarts the animation if the same message is
+    // jumped to twice in a row.
+    void target.offsetWidth;
+    target.classList.add("is-jump-highlight");
+    window.setTimeout(() => target.classList.remove("is-jump-highlight"), 1400);
+  };
 
-  return <div className={`live-room-chat-message ${isStaff ? "is-staff" : ""} ${isPeerAnswer ? "is-peer-answer" : ""}`} onContextMenu={(event) => onContextMenu(event, message)}>
+  return <div className={`live-room-chat-message ${isStaff ? "is-staff" : ""} ${isPeerAnswer ? "is-peer-answer" : ""}`} id={`chat-msg-${message.id}`} onContextMenu={(event) => onContextMenu(event, message)}>
     <div className="live-room-chat-message-avatar">
       {message.authorAvatarUrl ? <Image className="live-room-chat-avatar-image" src={message.authorAvatarUrl} alt={message.authorName} width={32} height={32} unoptimized /> : <div className="live-room-chat-avatar-fallback">{getInitials(message.authorName, "?")}</div>}
     </div>
     <div className="live-room-chat-message-body">
       <div className="live-room-chat-message-head"><span className="live-room-chat-author"><strong className={isStaff ? "author-staff" : undefined}>{message.authorName}</strong>{isStaff && <em className="live-room-chat-staff-badge">Куратор</em>}{isPeerAnswer && <em className="live-room-chat-peer-badge">Ответ ученика</em>}</span><span>{new Date(message.createdAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</span></div>
-      {message.replyTo && <div className="live-room-chat-reply-quote"><CornerUpLeft size={13} /><div className="live-room-chat-reply-quote-body"><strong className={replyIsStaff ? "author-staff" : undefined}>{message.replyTo.authorName}</strong><span>{message.replyTo.body || "Вложение"}</span></div></div>}
+      {message.replyTo && <button type="button" className="live-room-chat-reply-quote" onClick={() => jumpToMessage(message.replyTo!.id)}><CornerUpLeft size={13} /><div className="live-room-chat-reply-quote-body"><strong className={replyIsStaff ? "author-staff" : undefined}>{message.replyTo.authorName}</strong><span>{message.replyTo.body || "Вложение"}</span></div></button>}
       {message.body && <p>{linkifyText(message.body)}</p>}
       {message.attachment && <button type="button" className="live-room-chat-image-link" onClick={() => setLightboxImage(message.attachment!.url)}><img className="live-room-chat-image" src={message.attachment.url} alt="Скриншот" loading="lazy" /></button>}
       {message.linkPreview && <div className="live-room-chat-embed">
@@ -2946,7 +3542,7 @@ function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete
   );
 }
 
-function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen: boolean; canModerate?: boolean }) {
+function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boolean; canModerate?: boolean }) {
   const [chatDraft, setChatDraft] = useState("");
   const [uploadingImage, setUploadingImage] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -3015,17 +3611,130 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen: boolea
   </aside>;
 }
 
+/** Read-only history of the chat that happened during a specific recorded broadcast — lazy-loaded on expand. */
+function ArchivedChatPanel({ mediaId }: { mediaId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const [messages, setMessages] = useState<StreamChatMessage[] | null>(null);
+  const noop = () => { /* archived — reactions/replies/moderation don't apply */ };
+
+  useEffect(() => {
+    if (!expanded || messages !== null) return;
+    void fetch(`${API_ORIGIN}/api/streams/media/${mediaId}/chat`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload: { data?: StreamChatMessage[] } | null) => setMessages(payload?.data ?? []))
+      .catch(() => setMessages([]));
+  }, [expanded, messages, mediaId]);
+
+  return <div className={`module-archived-chat ${expanded ? "is-open" : ""}`}>
+    <button type="button" className="module-archived-chat-toggle" onClick={() => setExpanded((current) => !current)} aria-expanded={expanded}>
+      <span className="module-archived-chat-toggle-label"><MessageSquareText size={14} /> Чат эфира</span>
+      <ChevronDown size={15} className={`module-archived-chat-chevron ${expanded ? "is-open" : ""}`} />
+    </button>
+    {expanded && <div className="module-archived-chat-messages">
+      {messages === null
+        ? <p className="module-resource-note">Загружаем…</p>
+        : messages.length === 0
+          ? <p className="module-resource-note">Сообщений во время эфира не было.</p>
+          : messages.map((message) => <ChatMessageRow message={message} currentUserId="" onReact={noop} onContextMenu={noop} key={message.id} />)}
+    </div>}
+  </div>;
+}
+
+type StreamTargetApiDto = { moduleId: string | null; moduleTitle: string | null; scheduleEventId: string | null; scheduleEventTitle: string | null; mediaKind: "STREAM" | "QA" | null };
+
+function StreamTargetPicker({ upcoming }: { upcoming: ScheduleEvent[] }) {
+  const [mode, setMode] = useState<"none" | "module" | "event">("none");
+  const [moduleOptions, setModuleOptions] = useState<Array<{ id: string; title: string }>>([]);
+  const [moduleId, setModuleId] = useState("");
+  const [scheduleEventId, setScheduleEventId] = useState("");
+  const [mediaKind, setMediaKind] = useState<"STREAM" | "QA">("STREAM");
+  const [expanded, setExpanded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    void fetch(`${API_ORIGIN}/api/course/manage`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload: { data?: { modules: Array<{ id: string; title: string }> } } | null) => {
+        if (payload?.data) setModuleOptions(payload.data.modules.map((module) => ({ id: module.id, title: module.title })));
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    void fetch(`${API_ORIGIN}/api/streams/target`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload: { data?: StreamTargetApiDto } | null) => {
+        if (payload?.data?.moduleId) { setMode("module"); setModuleId(payload.data.moduleId); setMediaKind(payload.data.mediaKind === "QA" ? "QA" : "STREAM"); }
+        else if (payload?.data?.scheduleEventId) { setMode("event"); setScheduleEventId(payload.data.scheduleEventId); }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const save = async (body: { moduleId?: string; scheduleEventId?: string; mediaKind?: "STREAM" | "QA" }) => {
+    setSaving(true); setNotice("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/streams/target`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const payload = await response.json().catch(() => ({})) as { data?: StreamTargetApiDto; message?: string };
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось сохранить цель эфира");
+      setNotice("Сохранено — запись автоматически попадёт туда.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Не удалось сохранить цель эфира");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const applyMode = (nextMode: "none" | "module" | "event") => {
+    setMode(nextMode);
+    setNotice("");
+    if (nextMode === "none") { setModuleId(""); setScheduleEventId(""); void save({}); return; }
+    if (nextMode === "module") {
+      const id = moduleId || moduleOptions[0]?.id || "";
+      setModuleId(id);
+      if (id) void save({ moduleId: id, mediaKind });
+      return;
+    }
+    const id = scheduleEventId || upcoming[0]?.id || "";
+    setScheduleEventId(id);
+    if (id) void save({ scheduleEventId: id });
+  };
+
+  const moduleTitle = moduleOptions.find((module) => module.id === moduleId)?.title;
+  const summary = mode === "module" ? (moduleTitle ? `${moduleTitle} · ${mediaKind === "QA" ? "Q&A" : "Тематический"}` : undefined)
+    : mode === "event" ? upcoming.find((event) => event.id === scheduleEventId)?.title
+    : null;
+
+  return <section className="student-module-access-panel">
+    <button className="student-module-access-toggle" type="button" onClick={() => setExpanded((current) => !current)} aria-expanded={expanded}>
+      <div className="student-module-access-head"><span className="section-kicker">ЦЕЛЬ ЭФИРА</span><strong>Куда попадёт запись</strong><span>{summary ? `Автопубликация: ${summary}` : "Не выбрана — запись попадёт в Медиатеку черновиком"}</span></div>
+      <ChevronDown size={16} className={`student-module-access-chevron ${expanded ? "is-open" : ""}`} aria-hidden="true" />
+    </button>
+    {expanded && <div className="schedule-slot-settings-body">
+      <div className="form-grid">
+        <label className="form-field"><span>Привязать к</span><select value={mode} onChange={(event) => applyMode(event.target.value as "none" | "module" | "event")}><option value="none">Не привязывать</option><option value="module">Уроку</option><option value="event">Событию расписания</option></select></label>
+        {mode === "module" && <label className="form-field"><span>Урок</span><select value={moduleId} onChange={(event) => { setModuleId(event.target.value); void save({ moduleId: event.target.value, mediaKind }); }}>{moduleOptions.map((module) => <option value={module.id} key={module.id}>{module.title}</option>)}</select></label>}
+        {mode === "module" && <label className="form-field"><span>Тип записи</span><select value={mediaKind} onChange={(event) => { const nextKind = event.target.value as "STREAM" | "QA"; setMediaKind(nextKind); if (moduleId) void save({ moduleId, mediaKind: nextKind }); }}><option value="STREAM">Тематический</option><option value="QA">Q&A</option></select></label>}
+        {mode === "event" && <label className="form-field"><span>Событие</span><select value={scheduleEventId} onChange={(event) => { setScheduleEventId(event.target.value); void save({ scheduleEventId: event.target.value }); }}>{upcoming.map((event) => <option value={event.id} key={event.id}>{event.title} — {formatEventDate(event.date)}</option>)}</select></label>}
+      </div>
+      <small className="form-field-hint">Как только запись эфира будет готова, она сама опубликуется в выбранном месте — заходить в Медиатеку не нужно.</small>
+      {notice && <div className="form-action-feedback">{saving ? "Сохраняем…" : notice}</div>}
+    </div>}
+  </section>;
+}
+
 function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
   const [upcoming, setUpcoming] = useState<ScheduleEvent[]>([]);
   const [now, setNow] = useState(() => Date.now());
   const [isFullscreen, setIsFullscreen] = useState(false);
   const liveWrapRef = useRef<HTMLDivElement>(null);
-  const [liveInput, setLiveInput] = useState<LiveInputDto | null>(null);
+  const [liveInput, setLiveInput] = useState<IngressDto | null>(null);
   const [liveInputLoading, setLiveInputLoading] = useState(true);
   const [settingUp, setSettingUp] = useState(false);
   const [liveInputError, setLiveInputError] = useState<string | null>(null);
   const [keyVisible, setKeyVisible] = useState(false);
   const [copiedField, setCopiedField] = useState<"url" | "key" | null>(null);
+  const [status, setStatus] = useState<PlaybackStatusDto | null>(null);
   useEffect(() => {
     let cancelled = false;
     void fetch(`${API_ORIGIN}/api/schedule`, { credentials: "include", cache: "no-store" }).then(async (response) => {
@@ -3045,22 +3754,30 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
     try {
       const response = await fetch(`${API_ORIGIN}/api/streams/live-input`, { credentials: "include", cache: "no-store" });
       if (!response.ok) return;
-      const payload = await response.json() as { data?: LiveInputDto | null };
+      const payload = await response.json() as { data?: IngressDto | null };
       setLiveInput(payload.data ?? null);
+    } catch { /* keep last known state */ }
+  }, []);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/streams/status`, { credentials: "include", cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json() as { data?: PlaybackStatusDto };
+      if (payload.data) setStatus(payload.data);
     } catch { /* keep last known state */ }
   }, []);
 
   useEffect(() => {
     void fetch(`${API_ORIGIN}/api/streams/live-input`, { credentials: "include", cache: "no-store" }).then(async (response) => {
       if (!response.ok) return;
-      const payload = await response.json() as { data?: LiveInputDto | null };
+      const payload = await response.json() as { data?: IngressDto | null };
       setLiveInput(payload.data ?? null);
-      // An already-configured live input is re-applied (not just read) on every visit, so a
-      // setting added after it was first created (e.g. Low-Latency HLS) reaches it too —
-      // this never rotates the RTMP URL/key, so OBS keeps working unchanged.
+      // An already-configured ingress is idempotent — re-POSTing on every visit is a harmless
+      // no-op read (createIngress reuses the stored one); never rotates the RTMP URL/key.
       if (payload.data) {
         void fetch(`${API_ORIGIN}/api/streams/live-input`, { method: "POST", credentials: "include" })
-          .then((refreshResponse) => (refreshResponse.ok ? refreshResponse.json() as Promise<{ data?: LiveInputDto }> : null))
+          .then((refreshResponse) => (refreshResponse.ok ? refreshResponse.json() as Promise<{ data?: IngressDto }> : null))
           .then((refreshPayload) => { if (refreshPayload?.data) setLiveInput(refreshPayload.data); })
           .catch(() => undefined);
       }
@@ -3068,9 +3785,17 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
   }, []);
 
   useEffect(() => {
-    const poll = window.setInterval(() => { void refreshLiveInput(); }, 15_000);
+    void fetch(`${API_ORIGIN}/api/streams/status`, { credentials: "include", cache: "no-store" }).then(async (response) => {
+      if (!response.ok) return;
+      const payload = await response.json() as { data?: PlaybackStatusDto };
+      if (payload.data) setStatus(payload.data);
+    }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const poll = window.setInterval(() => { void refreshLiveInput(); void refreshStatus(); }, 15_000);
     return () => window.clearInterval(poll);
-  }, [refreshLiveInput]);
+  }, [refreshLiveInput, refreshStatus]);
 
   useEffect(() => {
     const tick = window.setInterval(() => setNow(Date.now()), 1000);
@@ -3083,6 +3808,9 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
     return () => document.removeEventListener("fullscreenchange", handleChange);
   }, []);
 
+  // Two independent fullscreen entry points: this one (theater mode — video + chat side by
+  // side) and the one on the video surface itself (video only). Some viewers want to keep chat
+  // visible while fullscreen, others don't — both are kept rather than picking one.
   const toggleFullscreen = () => {
     if (document.fullscreenElement) {
       void document.exitFullscreen();
@@ -3096,7 +3824,7 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
     setLiveInputError(null);
     try {
       const response = await fetch(`${API_ORIGIN}/api/streams/live-input`, { method: "POST", credentials: "include" });
-      const payload = await response.json() as { data?: LiveInputDto; message?: string };
+      const payload = await response.json() as { data?: IngressDto; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось настроить трансляцию");
       setLiveInput(payload.data);
     } catch (error) {
@@ -3137,18 +3865,20 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
       </div>
     </div>
 
+    <StreamTargetPicker upcoming={upcoming} />
+
     <div className="live-room-live" ref={liveWrapRef}>
       <section className="content-panel live-room-player">
         <div className="section-heading">
           <div><span className="section-kicker">ЭФИР</span><h2>Окно трансляции</h2></div>
           <div className="live-room-player-actions">
-            {liveInput?.isLive ? <span className="live-room-live-badge"><span className="live-dot" /> В эфире</span> : liveInput ? <span className="live-room-soon-badge">Офлайн</span> : null}
-            <button className="icon-button compact" type="button" aria-label={isFullscreen ? "Свернуть" : "На весь экран"} onClick={toggleFullscreen}>{isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
+            {status?.isLive ? <span className="live-room-live-badge"><span className="live-dot" /> В эфире</span> : liveInput ? <span className="live-room-soon-badge">Офлайн</span> : null}
+            <button className="icon-button compact" type="button" aria-label={isFullscreen ? "Свернуть" : "Видео + чат на весь экран"} onClick={toggleFullscreen}>{isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
           </div>
         </div>
-        {liveInput?.isLive && liveInput.playbackIframeUrl ? (
+        {status?.isLive && status.viewerToken && status.roomName ? (
           <div className="live-room-player-frame">
-            <iframe src={liveInput.playbackIframeUrl} allow="autoplay; fullscreen; encrypted-media" allowFullScreen title="Прямой эфир" />
+            <TrackedVideo livekit={{ token: status.viewerToken, roomName: status.roomName }} title="Прямой эфир" />
           </div>
         ) : (
           <div className="live-room-player-placeholder">
@@ -3158,14 +3888,14 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
               <div className="live-room-rtmp-box">
                 <div className="live-room-rtmp-row">
                   <span>Server URL</span>
-                  <code>{liveInput.rtmpsUrl}</code>
-                  <button type="button" className="icon-button compact" aria-label="Скопировать URL" onClick={() => liveInput.rtmpsUrl && void copyValue(liveInput.rtmpsUrl, "url")}>{copiedField === "url" ? <CheckCircle2 size={14} /> : <Copy size={14} />}</button>
+                  <code>{liveInput.rtmpUrl}</code>
+                  <button type="button" className="icon-button compact" aria-label="Скопировать URL" onClick={() => liveInput.rtmpUrl && void copyValue(liveInput.rtmpUrl, "url")}>{copiedField === "url" ? <CheckCircle2 size={14} /> : <Copy size={14} />}</button>
                 </div>
                 <div className="live-room-rtmp-row">
                   <span>Stream Key</span>
-                  <code>{keyVisible ? liveInput.rtmpsStreamKey : "••••••••••••••••••••"}</code>
+                  <code>{keyVisible ? liveInput.rtmpStreamKey : "••••••••••••••••••••"}</code>
                   <button type="button" className="icon-button compact" aria-label={keyVisible ? "Скрыть ключ" : "Показать ключ"} onClick={() => setKeyVisible((current) => !current)}>{keyVisible ? <EyeOff size={14} /> : <Eye size={14} />}</button>
-                  <button type="button" className="icon-button compact" aria-label="Скопировать ключ" onClick={() => liveInput.rtmpsStreamKey && void copyValue(liveInput.rtmpsStreamKey, "key")}>{copiedField === "key" ? <CheckCircle2 size={14} /> : <Copy size={14} />}</button>
+                  <button type="button" className="icon-button compact" aria-label="Скопировать ключ" onClick={() => liveInput.rtmpStreamKey && void copyValue(liveInput.rtmpStreamKey, "key")}>{copiedField === "key" ? <CheckCircle2 size={14} /> : <Copy size={14} />}</button>
                 </div>
               </div>
               {msToNextEvent !== null && msToNextEvent > 0 && <span className="live-room-countdown-inline">До эфира «{nextEvent.title}»: <strong>{formatCountdown(msToNextEvent)}</strong></span>}
@@ -3194,7 +3924,8 @@ const scheduleCoverOptions = [
   { label: "Backtest", path: "/event-covers/BACKTEST.png" },
   { label: "Morning", path: "/event-covers/MORNING.png" },
   { label: "Q&A", path: "/event-covers/QA.png" },
-  { label: "Pre-session", path: "/event-covers/pre-session-cover.jpg" },
+  { label: "Pre-session", path: "/event-covers/pre-session-cover.webp" },
+  { label: "Лекция", path: "/event-covers/LECTURE.png" },
 ] as const;
 
 function ScheduleEventForm({ initialDate = toDateKey(new Date()), initialEvent, onCreate, onCancel }: { initialDate?: string; initialEvent?: ScheduleEvent | null; onCreate: (event: ScheduleEvent) => void; onCancel: () => void }) {
@@ -3773,21 +4504,10 @@ function ModuleOverviewPage({ module, content: courseContent, onOpenAssignment, 
   const baseContent = modulePageContentFor(module);
   const assignments = courseContent?.assignments ?? [];
   const hasRealAssignments = assignments.length > 0;
-  const modalEmbedRef = useRef<HTMLDivElement>(null);
-  const [fullscreenMediaId, setFullscreenMediaId] = useState("");
   const [discussionOpened, setDiscussionOpened] = useState(false);
   const mediaEntries = (courseContent?.media ?? []).filter((media) => media.status === "PUBLISHED" && media.embedUrl);
   const thematicMediaEntries = mediaEntries.filter((media) => media.kind !== "QA");
   const qaMediaEntries = mediaEntries.filter((media) => media.kind === "QA");
-  const fullscreenMedia = [...thematicMediaEntries, ...qaMediaEntries].find((media) => media.id === fullscreenMediaId);
-  const openPlayer = (mediaId: string) => setFullscreenMediaId(mediaId);
-  const closePlayer = () => setFullscreenMediaId("");
-  const requestFullscreen = () => { const player = modalEmbedRef.current; if (!player) return; if (document.fullscreenElement) void document.exitFullscreen(); else void player.requestFullscreen(); };
-  useEffect(() => {
-    if (!fullscreenMediaId) return;
-    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") closePlayer(); };
-    window.addEventListener("keydown", handleKeyDown); return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [fullscreenMediaId]);
   useEffect(() => {
     if (!discussionOpened) return;
     onOpenDiscussion({ module: `${module.number} · ${module.title}`, coverPath: module.coverPath, moduleId: module.id });
@@ -3797,11 +4517,10 @@ function ModuleOverviewPage({ module, content: courseContent, onOpenAssignment, 
     <div className="module-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Вернуться к структуре</button><span className="module-page-breadcrumb">{module.section} / {module.title}</span></div>
     <header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> УРОК {module.number}</span><h2>{module.title}</h2><p>{module.description}</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header>
     <div className="module-resource-grid">
-      <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMediaEntries.length} {thematicMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{thematicMediaEntries.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических записей пока нет</strong><span>Куратор опубликует их по ходу этого урока.</span></div> : <div className="module-video-stack">{thematicMediaEntries.map((media) => <div className="module-video-stage" key={media.id}>{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? module.title} />}<span className="module-video-label">{media.title ?? module.title}</span><button className="play-button" aria-label="Открыть на весь экран" onClick={() => openPlayer(media.id)}><Play size={18} fill="currentColor" /></button><span className="stream-duration">{formatDuration(media.durationSec)}</span></div>)}</div>}</section>
+      <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMediaEntries.length} {thematicMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{thematicMediaEntries.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических записей пока нет</strong><span>Куратор опубликует их по ходу этого урока.</span></div> : <div className="module-video-stack">{thematicMediaEntries.map((media) => <div className="module-video-item" key={media.id}><div className="module-video-stage">{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? module.title} />}<span className="module-video-label">{media.title ?? module.title}</span><span className="stream-duration">{formatDuration(media.durationSec)}</span></div><ArchivedChatPanel mediaId={media.id} /></div>)}</div>}</section>
       <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{hasRealAssignments ? (assignments.length === 1 ? "1 задание" : `${assignments.length} задания`) : `${baseContent.homework.length} пункта`}</span></div>{hasRealAssignments ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}<button className="primary-button resource-action-button" onClick={() => onOpenAssignment(assignment.id)}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></article>)}</div> : <><ol>{baseContent.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button resource-action-button" onClick={() => onOpenAssignment("")}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></>}</section>
-      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMediaEntries.length} {qaMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{qaMediaEntries.length > 0 && <div className="module-video-stack">{qaMediaEntries.map((media) => <div className="module-qa-video-stage" key={media.id}>{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? "Q&A с куратором"} />}<span>{media.title ?? "Q&A с куратором"}</span></div>)}</div>}<ul>{baseContent.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button resource-action-button" onClick={() => setDiscussionOpened((current) => !current)}><span>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"}</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button>{qaMediaEntries.length === 0 && <div className="module-action-feedback">Здесь появится Q&A-запись, когда куратор добавит её к этому уроку.</div>}</section>
+      <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMediaEntries.length} {qaMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{qaMediaEntries.length > 0 && <div className="module-video-stack">{qaMediaEntries.map((media) => <div className="module-video-item" key={media.id}><div className="module-qa-video-stage">{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? "Q&A с куратором"} />}<span>{media.title ?? "Q&A с куратором"}</span></div><ArchivedChatPanel mediaId={media.id} /></div>)}</div>}<ul>{baseContent.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button resource-action-button" onClick={() => setDiscussionOpened((current) => !current)}><span>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"}</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button>{qaMediaEntries.length === 0 && <div className="module-action-feedback">Здесь появится Q&A-запись, когда куратор добавит её к этому уроку.</div>}</section>
     </div>
-    {fullscreenMedia?.embedUrl && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${fullscreenMedia.title ?? module.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">ЗАПИСЬ</span><strong>{fullscreenMedia.title ?? module.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div><TrackedVideo ref={modalEmbedRef} mediaId={fullscreenMedia.id} src={fullscreenMedia.embedUrl} title={fullscreenMedia.title ?? module.title} /><div className="video-modal-foot"><span>Запись доступна внутри урока</span><button className="secondary-button" onClick={requestFullscreen}><Maximize2 size={15} /> На весь экран</button></div></div></div>}
   </div>;
 }
 
@@ -3882,21 +4601,13 @@ function scheduleUiTypeToApi(type: ScheduleEvent["type"]): "PRACTICE" | "QA" | "
   return "PRACTICE";
 }
 
-function isEventLiveNow(event: ScheduleEvent, now: number): boolean {
-  const [startLabel, endLabel] = event.time.split(/\s*[—–-]\s*/);
-  if (!startLabel) return false;
-  const start = new Date(`${event.date}T${startLabel.trim()}:00`).getTime();
-  const end = endLabel ? new Date(`${event.date}T${endLabel.trim()}:00`).getTime() : start + 60 * 60 * 1000;
-  if (Number.isNaN(start) || Number.isNaN(end)) return false;
-  return now >= start && now <= end;
-}
-
 function ScheduleView({ onOpenStreams, onJoinLive }: { onOpenStreams: (recordingId?: string) => void; onJoinLive: () => void }) {
   const [events, setEvents] = useState<ScheduleEvent[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [detailsId, setDetailsId] = useState<string | null>(null);
   const [bookingEventId, setBookingEventId] = useState("");
   const [bookingError, setBookingError] = useState("");
+  const [liveScheduleEventId, setLiveScheduleEventId] = useState<string | null>(null);
   const selectedEvent = events.find((event) => event.id === selectedId) ?? events[0];
   const detailsEvent = events.find((event) => event.id === detailsId);
   const hasReachedSlotLimit = (type: ScheduleEvent["type"]) => {
@@ -3904,11 +4615,12 @@ function ScheduleView({ onOpenStreams, onJoinLive }: { onOpenStreams: (recording
     if (limit === null) return false;
     return events.filter((event) => event.type === type && event.isBookedByActor).length >= limit;
   };
-  // Slots someone else has already taken clutter the "Участие" list for every other student —
-  // the calendar grid still shows them (colored, so a day's availability is visible at a
-  // glance), but this side list only surfaces slots that are still open, or that the viewer
-  // holds themselves.
-  const visibleEvents = events.filter((event) => !isBookableSlotType(event.type) || !event.bookedByStudentId || event.isBookedByActor);
+  // Slots someone else has already taken, and events whose day has already passed, clutter
+  // the "Участие" list — the calendar grid still shows them (so a day's own history stays
+  // browsable: click a past day's event for details and a link to the recording), but this
+  // side list only surfaces what's still upcoming, or a taken slot the viewer holds themselves.
+  const todayKey = toDateKey(new Date());
+  const visibleEvents = events.filter((event) => (!isBookableSlotType(event.type) || !event.bookedByStudentId || event.isBookedByActor) && event.date >= todayKey);
   useEffect(() => {
     const load = async () => {
       const response = await fetch(`${API_ORIGIN}/api/schedule`, { credentials: "include", cache: "no-store" });
@@ -3917,6 +4629,19 @@ function ScheduleView({ onOpenStreams, onJoinLive }: { onOpenStreams: (recording
       if (Array.isArray(payload.data)) setEvents(payload.data.map(scheduleApiToUi));
     };
     void load().catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    const refreshLiveStatus = async () => {
+      try {
+        const response = await fetch(`${API_ORIGIN}/api/streams/status`, { credentials: "include", cache: "no-store" });
+        if (!response.ok) return;
+        const payload = await response.json() as { data?: { liveScheduleEventId: string | null } };
+        setLiveScheduleEventId(payload.data?.liveScheduleEventId ?? null);
+      } catch { /* keep last known state */ }
+    };
+    void refreshLiveStatus();
+    const poll = window.setInterval(() => { void refreshLiveStatus(); }, 15_000);
+    return () => window.clearInterval(poll);
   }, []);
   const openEvent = (eventId: string) => { setSelectedId(eventId); setDetailsId(eventId); };
   const runBooking = async (eventId: string, action: "book" | "cancel-booking") => {
@@ -3936,7 +4661,7 @@ function ScheduleView({ onOpenStreams, onJoinLive }: { onOpenStreams: (recording
     }
   };
 
-  return <>{<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedId} onSelect={openEvent} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">СОБЫТИЯ</span><h2>Участие</h2></div><CalendarDays size={18} className="heading-icon" /></div>{bookingError && <div className="file-error" role="alert">{bookingError}</div>}{visibleEvents.length > 0 ? visibleEvents.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} onOpen={() => openEvent(event.id)} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(event.id, "book")} onCancelBooking={() => void runBooking(event.id, "cancel-booking")} bookingBusy={bookingEventId === event.id} hasReachedSlotLimit={hasReachedSlotLimit(event.type)} key={event.id} />) : <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Куратор ещё не опубликовал встречи потока — они появятся здесь.</span></div>}</section></div>}{detailsEvent && <RichScheduleEventDetails event={detailsEvent} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(detailsEvent.id, "book")} onCancelBooking={() => void runBooking(detailsEvent.id, "cancel-booking")} bookingBusy={bookingEventId === detailsEvent.id} hasReachedSlotLimit={hasReachedSlotLimit(detailsEvent.type)} onClose={() => setDetailsId(null)} />}</>;
+  return <>{<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedId} onSelect={openEvent} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">СОБЫТИЯ</span><h2>Участие</h2></div><CalendarDays size={18} className="heading-icon" /></div>{bookingError && <div className="file-error" role="alert">{bookingError}</div>}{visibleEvents.length > 0 ? visibleEvents.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} liveNow={event.id === liveScheduleEventId} onOpen={() => openEvent(event.id)} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(event.id, "book")} onCancelBooking={() => void runBooking(event.id, "cancel-booking")} bookingBusy={bookingEventId === event.id} hasReachedSlotLimit={hasReachedSlotLimit(event.type)} key={event.id} />) : <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Куратор ещё не опубликовал встречи потока — они появятся здесь.</span></div>}</section></div>}{detailsEvent && <RichScheduleEventDetails event={detailsEvent} liveNow={detailsEvent.id === liveScheduleEventId} onOpenStreams={onOpenStreams} onJoinLive={onJoinLive} onBook={() => void runBooking(detailsEvent.id, "book")} onCancelBooking={() => void runBooking(detailsEvent.id, "cancel-booking")} bookingBusy={bookingEventId === detailsEvent.id} hasReachedSlotLimit={hasReachedSlotLimit(detailsEvent.type)} onClose={() => setDetailsId(null)} />}</>;
 }
 
 function CalendarGrid({ events, selectedId, onSelect, onDateSelect }: { events: readonly ScheduleEvent[]; selectedId: string; onSelect: (eventId: string) => void; onDateSelect?: (date: string) => void }) {
@@ -3950,12 +4675,10 @@ function CalendarGrid({ events, selectedId, onSelect, onDateSelect }: { events: 
   return <><div className="calendar-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><h2>{formatCalendarMonth(currentMonth)}</h2></div><div className="calendar-controls"><button className="icon-button compact" aria-label="Предыдущий месяц" onClick={() => shiftMonth(-1)}><ChevronRight size={16} className="rotate-left" /></button><button className="today-button" onClick={() => setCurrentMonth(startOfMonth(new Date()))}>Сегодня</button><button className="icon-button compact" aria-label="Следующий месяц" onClick={() => shiftMonth(1)}><ChevronRight size={16} /></button></div></div><div className="calendar-weekdays"><span>ПН</span><span>ВТ</span><span>СР</span><span>ЧТ</span><span>ПТ</span><span>СБ</span><span>ВС</span></div><div className="calendar-grid">{days.map(({ date, isOutside }) => { const dateKey = toDateKey(date); const dayEvents = eventsByDate.get(dateKey) ?? []; const isToday = dateKey === todayKey; return <div className={`calendar-day ${isToday ? "today" : ""} ${isOutside ? "outside" : ""} ${dayEvents.length > 0 ? "has-event" : ""}`} key={dateKey} aria-label={dayEvents.length > 0 ? `${formatEventDate(dateKey)}: ${dayEvents.map((event) => event.title).join(", ")}` : formatEventDate(dateKey)} onClick={() => onDateSelect?.(dateKey)}><span className="calendar-day-number">{date.getDate()}</span>{dayEvents.map((event) => { const bookingClass = isBookableSlotType(event.type) ? (event.bookedByStudentId ? "is-booked" : "is-open") : ""; return <button className={`calendar-event ${eventTone(event)} ${bookingClass} ${event.id === selectedId ? "selected" : ""}`} key={event.id} onClick={(clickEvent) => { clickEvent.stopPropagation(); onSelect(event.id); }}><span>{event.type}</span><strong>{event.title}</strong></button>; })}</div>; })}</div></>;
 }
 
-function RichScheduleEventDetails({ event, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy, hasReachedSlotLimit, onClose }: { event: ScheduleEvent; onOpenStreams: (recordingId?: string) => void; onJoinLive: () => void; onBook: () => void; onCancelBooking: () => void; bookingBusy: boolean; hasReachedSlotLimit: boolean; onClose: () => void }) {
+function RichScheduleEventDetails({ event, liveNow, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy, hasReachedSlotLimit, onClose }: { event: ScheduleEvent; liveNow: boolean; onOpenStreams: (recordingId?: string) => void; onJoinLive: () => void; onBook: () => void; onCancelBooking: () => void; bookingBusy: boolean; hasReachedSlotLimit: boolean; onClose: () => void }) {
   const formattedDate = formatEventDate(event.date);
   const coverPath = eventCoverPath(event);
   const isBookable = isBookableSlotType(event.type);
-  const [now] = useState(() => Date.now());
-  const liveNow = isEventLiveNow(event, now);
   const onOpenStreams = () => {
     const recordingId = event.recordingIds?.[0];
     if (recordingId && typeof window !== "undefined") window.sessionStorage.setItem("fix-target-stream", recordingId);
@@ -4003,9 +4726,10 @@ function buildCalendarDays(month: Date) {
   });
 }
 
-function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy = false, hasReachedSlotLimit = false }: {
+function ScheduleEventCard({ event, selected, liveNow = false, mode = "student", onOpen, onOpenStreams: navigateToStreams, onJoinLive, onBook, onCancelBooking, bookingBusy = false, hasReachedSlotLimit = false }: {
   event: ScheduleEvent;
   selected: boolean;
+  liveNow?: boolean;
   mode?: "student" | "curator";
   onOpen: () => void;
   onOpenStreams?: (recordingId?: string) => void;
@@ -4023,8 +4747,6 @@ function ScheduleEventCard({ event, selected, mode = "student", onOpen, onOpenSt
     navigateToStreams(recordingId);
   } : undefined;
   const isBookable = isBookableSlotType(event.type);
-  const [now] = useState(() => Date.now());
-  const liveNow = isEventLiveNow(event, now);
   const stop = (handler?: () => void) => (clickEvent: ReactMouseEvent<HTMLButtonElement>) => { clickEvent.stopPropagation(); handler?.(); };
 
   let actionButton: ReactNode;
@@ -4048,7 +4770,8 @@ function eventCoverPath(event: ScheduleEvent): string | undefined {
   if (event.coverPath) return event.coverPath;
   if (event.type === "Q&A") return "/event-covers/QA.png";
   if (event.type === "Бэктест") return "/event-covers/BACKTEST.png";
-  if (event.type === "Практическая часть") return "/event-covers/pre-session-cover.jpg";
+  if (event.type === "Практическая часть") return "/event-covers/pre-session-cover.webp";
+  if (event.type === "Лекция") return "/event-covers/LECTURE.png";
   return undefined;
 }
 
@@ -4065,7 +4788,7 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
   const [now, setNow] = useState(() => Date.now());
   const [isFullscreen, setIsFullscreen] = useState(false);
   const liveWrapRef = useRef<HTMLDivElement>(null);
-  const [status, setStatus] = useState<{ isLive: boolean; playbackIframeUrl: string | null } | null>(null);
+  const [status, setStatus] = useState<PlaybackStatusDto | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   useEffect(() => {
     let cancelled = false;
@@ -4086,7 +4809,7 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
     try {
       const response = await fetch(`${API_ORIGIN}/api/streams/status`, { credentials: "include", cache: "no-store" });
       if (!response.ok) return;
-      const payload = await response.json() as { data?: { isLive: boolean; playbackIframeUrl: string | null } };
+      const payload = await response.json() as { data?: PlaybackStatusDto };
       if (payload.data) setStatus(payload.data);
     } catch { /* keep last known state */ }
   }, []);
@@ -4094,7 +4817,7 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
   useEffect(() => {
     void fetch(`${API_ORIGIN}/api/streams/status`, { credentials: "include", cache: "no-store" }).then(async (response) => {
       if (!response.ok) return;
-      const payload = await response.json() as { data?: { isLive: boolean; playbackIframeUrl: string | null } };
+      const payload = await response.json() as { data?: PlaybackStatusDto };
       if (payload.data) setStatus(payload.data);
     }).catch(() => undefined).finally(() => setStatusLoading(false));
   }, []);
@@ -4115,6 +4838,9 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
     return () => document.removeEventListener("fullscreenchange", handleChange);
   }, []);
 
+  // Two independent fullscreen entry points: this one (theater mode — video + chat side by
+  // side) and the one on the video surface itself (video only). Some viewers want to keep chat
+  // visible while fullscreen, others don't — both are kept rather than picking one.
   const toggleFullscreen = () => {
     if (document.fullscreenElement) {
       void document.exitFullscreen();
@@ -4137,12 +4863,12 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
           <div><span className="section-kicker">ЭФИР</span><h2>Окно трансляции</h2></div>
           <div className="live-room-player-actions">
             {status?.isLive ? <span className="live-room-live-badge"><span className="live-dot" /> В эфире</span> : <span className="live-room-soon-badge">Офлайн</span>}
-            <button className="icon-button compact" type="button" aria-label={isFullscreen ? "Свернуть" : "На весь экран"} onClick={toggleFullscreen}>{isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
+            <button className="icon-button compact" type="button" aria-label={isFullscreen ? "Свернуть" : "Видео + чат на весь экран"} onClick={toggleFullscreen}>{isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
           </div>
         </div>
-        {status?.isLive && status.playbackIframeUrl ? (
+        {status?.isLive && status.viewerToken && status.roomName ? (
           <div className="live-room-player-frame">
-            <TrackedVideo src={status.playbackIframeUrl} title="Прямой эфир" />
+            <TrackedVideo livekit={{ token: status.viewerToken, roomName: status.roomName }} title="Прямой эфир" />
           </div>
         ) : (
           <div className="live-room-player-placeholder">
@@ -4181,12 +4907,13 @@ function StreamsView() {
       if (cancelled) return;
       if (!response.ok) { setStreamsLoadError("Не удалось загрузить записи. Показаны демонстрационные данные."); return; }
        const payload = await response.json() as { data?: { modules?: CourseApiModule[]; media?: CourseLessonMedia[]; scheduleEvents?: CourseScheduleEvent[] } };
-       const lessonStreams: StreamItem[] = (payload.data?.modules ?? []).flatMap((module) => module.media.filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
+       const lessonStreams: Array<StreamItem & { sortAt: number }> = (payload.data?.modules ?? []).flatMap((module) => module.media.filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
          id: media.id,
          title: media.title ?? module.title,
          kind: (media.kind === "BREAKDOWN" ? "Разбор" : media.kind === "TALKS" ? "Talks" : "Стрим") as StreamKind,
         module: `${String(module.position).padStart(2, "0")} · ${module.title}`,
         date: media.publishedAt ? new Date(media.publishedAt).toLocaleDateString("ru-RU") : "Опубликовано",
+        sortAt: media.publishedAt ? new Date(media.publishedAt).getTime() : 0,
         duration: formatDuration(media.durationSec),
         progress: 0,
         description: media.description ?? `Запись урока «${module.title}».`,
@@ -4194,12 +4921,13 @@ function StreamsView() {
         isNew: Boolean(media.publishedAt && Date.now() - new Date(media.publishedAt).getTime() < 7 * 24 * 60 * 60 * 1000),
         embedUrl: media.embedUrl,
        })));
-       const globalStreams: StreamItem[] = (payload.data?.media ?? []).filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
+       const globalStreams: Array<StreamItem & { sortAt: number }> = (payload.data?.media ?? []).filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
          id: media.id,
          title: media.title ?? "Talks",
          kind: "Talks",
          module: "Общая медиатека",
          date: media.publishedAt ? new Date(media.publishedAt).toLocaleDateString("ru-RU") : "Опубликовано",
+         sortAt: media.publishedAt ? new Date(media.publishedAt).getTime() : 0,
          duration: formatDuration(media.durationSec),
          progress: 0,
          description: media.description ?? "Свободная встреча и общение с командой.",
@@ -4207,12 +4935,13 @@ function StreamsView() {
          isNew: Boolean(media.publishedAt && Date.now() - new Date(media.publishedAt).getTime() < 7 * 24 * 60 * 60 * 1000),
          embedUrl: media.embedUrl,
        }));
-       const scheduleStreams: StreamItem[] = (payload.data?.scheduleEvents ?? []).flatMap((event) => event.recordings.filter((recording) => recording.status === "PUBLISHED" && recording.embedUrl).map((recording) => ({
+       const scheduleStreams: Array<StreamItem & { sortAt: number }> = (payload.data?.scheduleEvents ?? []).flatMap((event) => event.recordings.filter((recording) => recording.status === "PUBLISHED" && recording.embedUrl).map((recording) => ({
          id: recording.id,
          title: recording.title ?? event.title,
          kind: (event.type === "BREAKDOWN" ? "Разбор" : "Стрим") as StreamKind,
          module: "Расписание",
          date: new Date(`${event.date}T12:00:00`).toLocaleDateString("ru-RU"),
+         sortAt: new Date(`${event.date}T12:00:00`).getTime(),
          duration: "Видео",
          progress: 0,
          description: event.description || `Запись события «${event.title}».`,
@@ -4220,7 +4949,11 @@ function StreamsView() {
          isNew: false,
          embedUrl: recording.embedUrl,
        })));
-       const nextStreams = [...lessonStreams, ...globalStreams, ...scheduleStreams];
+       // Newest first, independent of the filter chips above — matches the curator's expectation
+       // that a just-published recording appears at the top of the grid, not buried at the end.
+       const nextStreams = [...lessonStreams, ...globalStreams, ...scheduleStreams]
+         .sort((a, b) => b.sortAt - a.sortAt)
+         .map((stream): StreamItem => stream);
       setStreamsLoadError("");
       setCourseStreams(nextStreams);
     }).catch(() => { if (!cancelled) setStreamsLoadError("Не удалось загрузить записи. Показаны демонстрационные данные."); });
@@ -4250,7 +4983,7 @@ function StreamsView() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [playerOpen]);
 
-  return <div className="stream-library">{streamsLoadError && <div className="file-error" role="alert">{streamsLoadError}</div>}<div className="stream-library-toolbar"><div className="assignment-filter"><button className={`filter-chip ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>Все <span>{allStreams.length}</span></button><button className={`filter-chip ${filter === "Разбор" ? "active" : ""}`} onClick={() => setFilter("Разбор")}>Разборы <span>{allStreams.filter((stream) => stream.kind === "Разбор").length}</span></button><button className={`filter-chip ${filter === "Стрим" ? "active" : ""}`} onClick={() => setFilter("Стрим")}>Стримы <span>{allStreams.filter((stream) => stream.kind === "Стрим").length}</span></button><button className={`filter-chip ${filter === "Talks" ? "active" : ""}`} onClick={() => setFilter("Talks")}>Talks <span>{allStreams.filter((stream) => stream.kind === "Talks").length}</span></button></div><label className="stream-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map((module) => <option value={module} key={module}>{module}</option>)}</select></label><span className="stream-count">{streams.length} записи</span></div><section className="stream-grid">{streams.length > 0 ? streams.map((stream) => <StreamCard stream={stream} selected={stream.id === selectedStream?.id} key={stream.id} onOpen={() => openStream(stream.id)} />) : <div className="empty-state"><Play size={22} /><strong>В этом уроке пока нет записей</strong><span>Выбери другой урок или сбрось фильтр.</span></div>}</section>{playerOpen && selectedStream && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${selectedStream.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">{selectedStream.kind.toUpperCase()} · {selectedStream.module}</span><strong>{selectedStream.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{selectedStream.embedUrl ? <TrackedVideo mediaId={selectedStream.id} src={selectedStream.embedUrl} title={selectedStream.title} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}<div className="video-modal-foot"><span>{selectedStream.description}</span></div></div></div>}</div>;
+  return <div className="stream-library">{streamsLoadError && <div className="file-error" role="alert">{streamsLoadError}</div>}<div className="stream-library-toolbar"><div className="assignment-filter"><button className={`filter-chip ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>Все <span>{allStreams.length}</span></button><button className={`filter-chip ${filter === "Разбор" ? "active" : ""}`} onClick={() => setFilter("Разбор")}>Разборы <span>{allStreams.filter((stream) => stream.kind === "Разбор").length}</span></button><button className={`filter-chip ${filter === "Стрим" ? "active" : ""}`} onClick={() => setFilter("Стрим")}>Стримы <span>{allStreams.filter((stream) => stream.kind === "Стрим").length}</span></button><button className={`filter-chip ${filter === "Talks" ? "active" : ""}`} onClick={() => setFilter("Talks")}>Talks <span>{allStreams.filter((stream) => stream.kind === "Talks").length}</span></button></div><label className="stream-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map((module) => <option value={module} key={module}>{module}</option>)}</select></label><span className="stream-count">{streams.length} записи</span></div><section className="stream-grid">{streams.length > 0 ? streams.map((stream) => <StreamCard stream={stream} selected={stream.id === selectedStream?.id} key={stream.id} onOpen={() => openStream(stream.id)} />) : <div className="empty-state"><Play size={22} /><strong>В этом уроке пока нет записей</strong><span>Выбери другой урок или сбрось фильтр.</span></div>}</section>{playerOpen && selectedStream && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${selectedStream.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">{selectedStream.kind.toUpperCase()} · {selectedStream.module}</span><strong>{selectedStream.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{selectedStream.embedUrl ? <TrackedVideo mediaId={selectedStream.id} src={selectedStream.embedUrl} title={selectedStream.title} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}<div className="video-modal-foot"><span>{selectedStream.description}</span><ArchivedChatPanel mediaId={selectedStream.id} /></div></div></div>}</div>;
 }
 
 function StreamCard({ stream, selected, onOpen }: { stream: StreamItem; selected: boolean; onOpen: () => void }) {
@@ -4261,16 +4994,16 @@ function discussionCoverForModule(position?: number, coverPath?: string | null):
   if (coverPath) return coverPath;
   const number = typeof position === "number" ? String(position).padStart(2, "0") : "01";
   const covers: Record<string, string> = {
-    "00": "/welcome-cover.png",
-    "01": "/market-logic-cover.png",
-    "02": "/eq-point-narrative-cover.png",
-    "03": "/delivery-ab-part-12-cover.png",
-    "04": "/delivery-ab-part-3-cover.png",
-    "05": "/entry-models-qa-cover.png",
-    "06": "/qa-cover.png",
-    "07": "/pre-session-cover.jpg",
+    "00": "/welcome-cover.webp",
+    "01": "/market-logic-cover.webp",
+    "02": "/eq-point-narrative-cover.webp",
+    "03": "/delivery-ab-part-12-cover.webp",
+    "04": "/delivery-ab-part-3-cover.webp",
+    "05": "/entry-models-qa-cover.webp",
+    "06": "/qa-cover.webp",
+    "07": "/pre-session-cover.webp",
   };
-  return covers[number] ?? "/market-logic-cover.png";
+  return covers[number] ?? "/market-logic-cover.webp";
 }
 
 function discussionCoverForContext(context: DiscussionContext): string {
@@ -4429,6 +5162,7 @@ function CohortDiscussionFeed() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [openId, setOpenId] = useState("");
+  const [moduleFilter, setModuleFilter] = useState("all");
 
   useEffect(() => {
     let cancelled = false;
@@ -4443,12 +5177,16 @@ function CohortDiscussionFeed() {
   }, []);
 
   if (!loading && !error && threads.length === 0) return null;
+  const moduleOptions = Array.from(new Map(threads.map((thread) => [thread.module, thread.module] as const)).entries());
+  const filteredThreads = moduleFilter === "all" ? threads : threads.filter((thread) => thread.module === moduleFilter);
 
   return <section className="content-panel cohort-discussion-panel">
-    <div className="section-heading discussion-answered-heading"><h2>Отвечено ранее</h2><span className="progress-inline">{threads.length} тем</span></div>
+    <div className="section-heading discussion-answered-heading"><h2>Отвечено ранее</h2><span className="progress-inline">{filteredThreads.length} тем</span></div>
+    {!loading && !error && moduleOptions.length > 1 && <label className="stream-module-filter cohort-discussion-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>}
     {loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем вопросы потока…</strong></div>
       : error ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить</strong><span>{error}</span></div>
-      : <div className="discussion-list cohort-discussion-list">{threads.map((thread) => {
+      : filteredThreads.length === 0 ? <div className="empty-state"><MessageSquareText size={22} /><strong>Ничего не нашлось</strong><span>В этом уроке пока нет отвеченных вопросов.</span></div>
+      : <div className="discussion-list cohort-discussion-list">{filteredThreads.map((thread) => {
           const isOpen = thread.id === openId;
           return <div className="cohort-discussion-item" key={thread.id}>
             <button className="discussion-row student-discussion-row" type="button" onClick={() => setOpenId((current) => current === thread.id ? "" : thread.id)} aria-expanded={isOpen}>
@@ -4466,11 +5204,10 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
   const [reply, setReply] = useState("");
   const [replyOpen, setReplyOpen] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [closing, setClosing] = useState(false);
   const [error, setError] = useState("");
   const sendReply = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!reply.trim() || saving || closing || thread.status === "CLOSED") return;
+    if (!reply.trim() || saving || thread.status === "CLOSED") return;
     setSaving(true);
     setError("");
     try {
@@ -4486,27 +5223,11 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
       setSaving(false);
     }
   };
-  const closeThread = async () => {
-    if (closing || saving || thread.status === "CLOSED") return;
-    setClosing(true);
-    setError("");
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/discussions/${thread.id}/close`, { method: "POST", credentials: "include" });
-      const payload = await response.json().catch(() => ({})) as { data?: DiscussionApiThread; message?: string };
-      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось закрыть вопрос.");
-      onUpdate(mapDiscussionApiThread(payload.data));
-      setReplyOpen(false);
-    } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : "Не удалось закрыть вопрос.");
-    } finally {
-      setClosing(false);
-    }
-  };
   return <section className="content-panel student-discussion-detail">
     <div className="student-discussion-detail-head"><div><span className="section-kicker">{thread.module}</span><h2>{thread.title}</h2><p>{thread.updatedAt}</p></div><button className="icon-button compact" type="button" aria-label="Закрыть историю вопроса" onClick={onClose}><X size={17} /></button></div>
     <div className="student-discussion-messages">{thread.messages.map((message) => <article className={`student-discussion-message ${message.author}`} key={message.id}><div className="student-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{message.body}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
-    <div className="student-discussion-status-note"><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</span><span>{thread.status === "CLOSED" ? "Вопрос закрыт. Для нового обращения создай отдельную тему." : "История сохраняется, а диалог можно продолжить или закрыть."}</span></div>
-    {thread.status !== "CLOSED" && <div className="student-discussion-actions"><button className="secondary-button danger-button" type="button" onClick={() => void closeThread()} disabled={closing || saving}>{closing ? "Закрываем…" : "Закрыть вопрос"}</button><button className="primary-button" type="button" onClick={() => setReplyOpen((current) => !current)}>{replyOpen ? "Скрыть ответ" : "Ответить ещё"}</button></div>}
+    <div className="student-discussion-status-note"><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</span><span>{thread.status === "CLOSED" ? "Вопрос закрыт. Для нового обращения создай отдельную тему." : "История сохраняется, а диалог можно продолжить в любой момент."}</span></div>
+    {thread.status !== "CLOSED" && <div className="student-discussion-actions"><button className="primary-button" type="button" onClick={() => setReplyOpen((current) => !current)}>{replyOpen ? "Скрыть ответ" : "Ответить ещё"}</button></div>}
     {replyOpen && thread.status !== "CLOSED" && <form className="student-discussion-reply" onSubmit={sendReply}><label htmlFor="student-discussion-reply">ОТВЕТ В ЭТОЙ ТЕМЕ</label><textarea id="student-discussion-reply" value={reply} onChange={(event) => setReply(event.target.value)} rows={4} placeholder="Напиши уточнение или следующий вопрос куратору…" /><div><span>Ответ добавится в историю и снова передаст тему куратору.</span><button className="primary-button" type="submit" disabled={!reply.trim() || saving}>{saving ? "Отправляем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div></form>}
     {error && <div className="file-error student-discussion-error" role="alert">{error}</div>}
   </section>;

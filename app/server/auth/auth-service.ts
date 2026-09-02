@@ -3,6 +3,7 @@ import {
   IdentityProvider,
   InvitationStatus,
   LoginEventOutcome,
+  NotificationType,
   SessionStatus,
   UserRole,
   UserStatus,
@@ -14,6 +15,7 @@ import { hasReachedDeviceLimit } from "./device-policy";
 import { enrichAuthRequestContext, normalizeAuthRequestContext } from "./geoip";
 import { isDiscordUserId } from "@/app/domain/discord";
 import { sendEmailVerificationNotification, sendInvitationNotification } from "@/app/server/notifications/email-service";
+import { getActivePracticumId } from "@/app/server/course/practicum-service";
 import type {
   AcceptInvitationInput,
   AuthRequestContext,
@@ -147,15 +149,17 @@ export class AuthService {
     const expiresAt = getInvitationExpiry(input.expiresInHours, now);
     const token = createOpaqueToken("invite");
 
-    if (input.practicumId) {
-      const practicum = await prisma.practicum.findUnique({
-        where: { id: input.practicumId },
-        select: { id: true },
-      });
+    // Pinned to whichever practicum is active right now, at creation time — not resolved lazily
+    // when the invite is accepted. With practicums switchable back and forth (see
+    // practicum-admin-service.ts#setActivePracticum), the active one at accept-time could differ
+    // from the one the curator meant when they generated the link.
+    const practicum = await prisma.practicum.findUnique({
+      where: { id: input.practicumId ?? (await getActivePracticumId()) ?? "" },
+      select: { id: true, title: true },
+    });
 
-      if (!practicum) {
-        throw new AuthServiceError("INVALID_INPUT", "Practicum does not exist");
-      }
+    if (!practicum) {
+      throw new AuthServiceError("INVALID_INPUT", "Practicum does not exist");
     }
 
     const invitation = await prisma.$transaction(async (tx) => {
@@ -166,7 +170,7 @@ export class AuthService {
           tokenHash: hashOpaqueToken(token),
           targetProvider: input.targetProvider,
           targetSubject,
-          practicumId: input.practicumId,
+          practicumId: practicum.id,
           expiresAt,
           createdById: input.actorId,
         },
@@ -189,7 +193,7 @@ export class AuthService {
           metadata: {
             role: input.role,
             targetProvider: input.targetProvider,
-            practicumId: input.practicumId,
+            practicumId: practicum.id,
           },
         },
       });
@@ -348,10 +352,10 @@ export class AuthService {
           // course-service requires an ACTIVE Enrollment for every STUDENT dashboard load
           // ("Student is not enrolled in a practicum") — without this, a student who just
           // accepted an invitation is locked out on their first visit. The invitation UI has
-          // no practicum picker today, so practicumId is normally null; fall back to the
-          // earliest-created practicum, mirroring the same default course-service.ts#getForUser
-          // already uses for curators/owners with no explicit practicum context.
-          const targetPracticumId = invitation.practicumId ?? (await tx.practicum.findFirst({ orderBy: { createdAt: "asc" }, select: { id: true } }))?.id;
+          // no practicum picker today, so practicumId is normally null; fall back to whichever
+          // practicum is currently active (the cohort the curator is actually running) —
+          // see practicum-service.ts#getActivePracticumId.
+          const targetPracticumId = invitation.practicumId ?? (await getActivePracticumId(tx));
           if (userRole === UserRole.STUDENT && targetPracticumId) {
             const studentEnrollment = await tx.enrollment.upsert({
               where: { studentId_practicumId: { studentId: userId, practicumId: targetPracticumId } },
@@ -1178,6 +1182,51 @@ export class AuthService {
     }
   }
 
+  /**
+   * Mirrors the "active sessions have different network signatures" heuristic the curator's
+   * student-security tab already computes client-side (unusualActivity in page.tsx), but
+   * server-side and event-driven — so the assigned curator (or an owner, if nobody's claimed the
+   * student yet) hears about it via the notification bell instead of only finding out by opening
+   * that student's profile. Fires once, exactly on the login that actually tips the account into
+   * that state — a student who's already flagged doesn't generate a fresh alert on every
+   * subsequent login from the same second device.
+   */
+  private async flagUnusualAccessIfNew(
+    tx: DatabaseClient,
+    studentId: string,
+    priorSessions: ReadonlyArray<{ countryCode: string | null; city: string | null; ipAddress: string | null }>,
+    newSession: { countryCode: string | null; city: string | null; ipAddress: string | null },
+  ): Promise<void> {
+    const signatureOf = (session: { countryCode: string | null; city: string | null; ipAddress: string | null }) => session.countryCode ?? session.city ?? session.ipAddress;
+    const newSignature = signatureOf(newSession);
+    if (!newSignature) return;
+    const priorSignatures = new Set(priorSessions.map(signatureOf).filter((value): value is string => Boolean(value)));
+    if (priorSignatures.size > 1) return; // already flagged on an earlier login
+    if (new Set([...priorSignatures, newSignature]).size <= 1) return; // still consistent
+
+    const student = await tx.user.findUnique({ where: { id: studentId }, select: { role: true } });
+    if (student?.role !== UserRole.STUDENT) return;
+
+    const assignment = await tx.curatorAssignment.findFirst({ where: { studentId }, select: { curatorId: true } });
+    const recipientIds = assignment
+      ? [assignment.curatorId]
+      : (await tx.user.findMany({ where: { role: UserRole.OWNER, status: UserStatus.ACTIVE }, select: { id: true } })).map((owner) => owner.id);
+    if (recipientIds.length === 0) return;
+
+    const identity = await tx.externalIdentity.findFirst({ where: { userId: studentId }, select: { displayName: true, username: true } });
+    const studentLabel = identity?.displayName ?? identity?.username ?? "Ученик";
+
+    await tx.notification.createMany({
+      data: recipientIds.map((userId) => ({
+        userId,
+        type: NotificationType.SECURITY_ALERT,
+        title: `Подозрительный вход: ${studentLabel}`,
+        body: "Активные сессии этого ученика используют разные сетевые признаки — проверьте вкладку «Безопасность» в его профиле.",
+        entityId: studentId,
+      })),
+    });
+  }
+
   private async createSessionInTransaction(
     tx: DatabaseClient,
     input: CreateSessionInput,
@@ -1194,7 +1243,7 @@ export class AuthService {
         status: SessionStatus.ACTIVE,
         expiresAt: { gt: now },
       },
-      select: { id: true, deviceKeyHash: true },
+      select: { id: true, deviceKeyHash: true, countryCode: true, city: true, ipAddress: true },
     });
 
     const existingDevice = activeSessions.some((session) => session.deviceKeyHash === deviceKeyHash);
@@ -1254,6 +1303,14 @@ export class AuthService {
         reasonCode: requiresApproval ? "DEVICE_APPROVAL_REQUIRED" : undefined,
       },
     });
+
+    if (!requiresApproval) {
+      await this.flagUnusualAccessIfNew(tx, input.userId, activeSessions, {
+        countryCode: optionalText(input.countryCode, 10) ?? null,
+        city: optionalText(input.city, 100) ?? null,
+        ipAddress: optionalText(input.ipAddress, 100) ?? null,
+      });
+    }
 
     return {
       sessionToken,

@@ -13,3 +13,6 @@ dist/
 /playwright-report/
 /e2e/.auth/
 !.env.staging.example
+
+# local release/deploy archives
+*.tar.gz
