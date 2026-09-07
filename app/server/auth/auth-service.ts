@@ -1,5 +1,6 @@
 import { Prisma } from "@/app/generated/prisma/client";
 import {
+  EnrollmentStatus,
   IdentityProvider,
   InvitationStatus,
   LoginEventOutcome,
@@ -15,7 +16,7 @@ import { hasReachedDeviceLimit } from "./device-policy";
 import { enrichAuthRequestContext, normalizeAuthRequestContext } from "./geoip";
 import { isDiscordUserId } from "@/app/domain/discord";
 import { sendEmailVerificationNotification, sendInvitationNotification } from "@/app/server/notifications/email-service";
-import { getActivePracticumId } from "@/app/server/course/practicum-service";
+import { getActivePracticumId, getWorkingPracticumId } from "@/app/server/course/practicum-service";
 import type {
   AcceptInvitationInput,
   AuthRequestContext,
@@ -24,9 +25,9 @@ import type {
   InvitationCredentials,
   LoginWithIdentityInput,
   SessionCredentials,
-  CuratorDirectoryRecord,
   StudentDirectoryRecord,
   StudentSecurityOverview,
+  TeamMemberDirectoryRecord,
 } from "./types";
 
 type DatabaseClient = typeof prisma | Prisma.TransactionClient;
@@ -149,12 +150,11 @@ export class AuthService {
     const expiresAt = getInvitationExpiry(input.expiresInHours, now);
     const token = createOpaqueToken("invite");
 
-    // Pinned to whichever practicum is active right now, at creation time — not resolved lazily
-    // when the invite is accepted. With practicums switchable back and forth (see
-    // practicum-admin-service.ts#setActivePracticum), the active one at accept-time could differ
-    // from the one the curator meant when they generated the link.
+    // Pinned to a concrete practicum at creation time — not resolved lazily when the invite is
+    // accepted. Defaults to the inviting curator's own working practicum (see
+    // practicum-service.ts#getWorkingPracticumId) when they didn't pick one explicitly in the UI.
     const practicum = await prisma.practicum.findUnique({
-      where: { id: input.practicumId ?? (await getActivePracticumId()) ?? "" },
+      where: { id: input.practicumId ?? (await getWorkingPracticumId(input.actorId)) ?? "" },
       select: { id: true, title: true },
     });
 
@@ -205,8 +205,8 @@ export class AuthService {
       ...invitation,
       token,
     };
-    const emailSent = email ? await sendInvitationNotification({ to: email, token, expiresAt, role: input.role }) : false;
-    return { ...credentials, emailSent };
+    const emailResult = email ? await sendInvitationNotification({ to: email, token, expiresAt, role: input.role }) : { sent: false };
+    return { ...credentials, emailSent: emailResult.sent, emailError: emailResult.error };
   }
 
   public async acceptInvitation(input: AcceptInvitationInput): Promise<{
@@ -332,23 +332,6 @@ export class AuthService {
             throw new AuthServiceError("AUTH_CONFLICT", "Invitation was accepted concurrently");
           }
 
-          // A student with no CuratorAssignment row falls through discussion routing
-          // as an unassigned (curatorId: null) thread, which only an OWNER can see.
-          // Default the inviting curator as the assignment so new students are never orphaned.
-          if (userRole === UserRole.STUDENT && invitation.createdById) {
-            const inviter = await tx.user.findUnique({
-              where: { id: invitation.createdById },
-              select: { role: true, status: true },
-            });
-            if (inviter && inviter.status === UserStatus.ACTIVE && (inviter.role === UserRole.CURATOR || inviter.role === UserRole.OWNER)) {
-              await tx.curatorAssignment.upsert({
-                where: { curatorId_studentId: { curatorId: invitation.createdById, studentId: userId } },
-                update: {},
-                create: { curatorId: invitation.createdById, studentId: userId },
-              });
-            }
-          }
-
           // course-service requires an ACTIVE Enrollment for every STUDENT dashboard load
           // ("Student is not enrolled in a practicum") — without this, a student who just
           // accepted an invitation is locked out on their first visit. The invitation UI has
@@ -405,6 +388,7 @@ export class AuthService {
     sessionId: string;
     userId: string;
     role: UserRole;
+    workingPracticumId: string | null;
     profile: {
       email: string | null;
       emailVerifiedAt: Date | null;
@@ -431,6 +415,7 @@ export class AuthService {
             status: true,
             email: true,
             emailVerifiedAt: true,
+            workingPracticumId: true,
             externalIdentities: {
               orderBy: { createdAt: "asc" },
               select: { provider: true, displayName: true, username: true, avatarUrl: true },
@@ -465,6 +450,7 @@ export class AuthService {
       sessionId: session.id,
       userId: session.user.id,
       role: session.user.role,
+      workingPracticumId: session.user.workingPracticumId,
       profile: {
         email: session.user.email,
         emailVerifiedAt: session.user.emailVerifiedAt,
@@ -546,24 +532,6 @@ export class AuthService {
       throw new AuthServiceError("INVALID_INPUT", "Local test account is not available");
     }
 
-    if (role === UserRole.CURATOR) {
-      const localStudent = await prisma.user.findFirst({
-        where: {
-          role: UserRole.STUDENT,
-          status: UserStatus.ACTIVE,
-          externalIdentities: { some: { provider: IdentityProvider.LOCAL, providerSubject: "local-student" } },
-        },
-        select: { id: true },
-      });
-      if (localStudent) {
-        await prisma.curatorAssignment.upsert({
-          where: { curatorId_studentId: { curatorId: identity.userId, studentId: localStudent.id } },
-          update: {},
-          create: { curatorId: identity.userId, studentId: localStudent.id },
-        });
-      }
-    }
-
     const session = await this.createSession({
       ...input,
       userId: identity.userId,
@@ -605,9 +573,8 @@ export class AuthService {
       throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can view security data");
     }
 
-    // Any active curator can view any student's security data — curators are no longer
-    // partitioned by CuratorAssignment (that field now only records who a student's
-    // discussions default to when unclaimed, not who may see or act on them).
+    // Any active curator can view any student's security data — students aren't
+    // partitioned by curator.
 
     const student = await prisma.user.findUnique({
       where: { id: studentId },
@@ -626,6 +593,45 @@ export class AuthService {
       throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
     }
 
+    return this.buildSecurityOverview(student);
+  }
+
+  /**
+   * Mirror of getStudentSecurityOverview for a curator's (or owner's) own account — needed so a
+   * staff member's device list has somewhere to live once they're no longer listed under
+   * "Ученики". Viewing is open to any active curator or owner, same as a student's card; the
+   * actions on it (approve/revoke/change role) stay owner-only — see
+   * assertCanManageDeviceSecurity and setUserRole.
+   */
+  public async getTeamMemberSecurityOverview(actorId: string, memberId: string): Promise<StudentSecurityOverview> {
+    await this.assertOwnerOrCurator(actorId);
+
+    const member = await prisma.user.findUnique({
+      where: { id: memberId },
+      select: {
+        id: true,
+        role: true,
+        status: true,
+        createdAt: true,
+        externalIdentities: {
+          select: { provider: true, username: true, displayName: true, avatarUrl: true },
+        },
+      },
+    });
+
+    if (!member || (member.role !== UserRole.CURATOR && member.role !== UserRole.OWNER)) {
+      throw new AuthServiceError("INVALID_INPUT", "Team member does not exist");
+    }
+
+    return this.buildSecurityOverview(member);
+  }
+
+  private async buildSecurityOverview(user: {
+    id: string;
+    status: UserStatus;
+    createdAt: Date;
+    externalIdentities: Array<{ provider: IdentityProvider; username: string | null; displayName: string | null; avatarUrl: string | null }>;
+  }): Promise<StudentSecurityOverview> {
     // Keep the security view truthful even when no request has touched an
     // expired session recently. Expiry is enforced on every protected request,
     // but this page is also an audit surface and must not show stale devices as
@@ -633,7 +639,7 @@ export class AuthService {
     const now = new Date();
     await prisma.session.updateMany({
       where: {
-        userId: studentId,
+        userId: user.id,
         status: { in: [SessionStatus.ACTIVE, SessionStatus.PENDING] },
         expiresAt: { lte: now },
       },
@@ -642,7 +648,7 @@ export class AuthService {
 
     const [sessions, loginEvents] = await Promise.all([
       prisma.session.findMany({
-        where: { userId: studentId },
+        where: { userId: user.id },
         orderBy: { createdAt: "desc" },
         take: 50,
         select: {
@@ -660,7 +666,7 @@ export class AuthService {
         },
       }),
       prisma.loginEvent.findMany({
-        where: { userId: studentId },
+        where: { userId: user.id },
         orderBy: { createdAt: "desc" },
         take: 100,
         select: {
@@ -680,17 +686,119 @@ export class AuthService {
 
     return {
       student: {
-        id: student.id,
-        status: student.status,
-        createdAt: student.createdAt,
-        identities: student.externalIdentities,
+        id: user.id,
+        status: user.status,
+        createdAt: user.createdAt,
+        identities: user.externalIdentities,
       },
       sessions,
       loginEvents,
     };
   }
 
-  public async getStudentDirectory(actorId: string): Promise<StudentDirectoryRecord[]> {
+  /** Roster of curator accounts and their device/session signal, visible to any active curator
+    * or owner — the staff-side counterpart to getStudentDirectory, needed once a tester (or
+    * anyone) is promoted to curator and stops appearing under "Ученики". */
+  public async getTeamDirectory(actorId: string): Promise<TeamMemberDirectoryRecord[]> {
+    await this.assertOwnerOrCurator(actorId);
+
+    const now = new Date();
+    const members = await prisma.user.findMany({
+      where: { role: UserRole.CURATOR, status: { not: UserStatus.DELETED } },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        role: true,
+        email: true,
+        status: true,
+        createdAt: true,
+        externalIdentities: {
+          select: { provider: true, username: true, displayName: true, avatarUrl: true },
+        },
+        sessions: {
+          where: { status: SessionStatus.ACTIVE, expiresAt: { gt: now } },
+          orderBy: { lastActiveAt: "desc" },
+          take: 1,
+          select: { lastActiveAt: true, deviceName: true, ipAddress: true, countryCode: true, city: true },
+        },
+        _count: {
+          select: {
+            sessions: { where: { status: SessionStatus.ACTIVE, expiresAt: { gt: now } } },
+            loginEvents: true,
+          },
+        },
+      },
+    });
+
+    return members.map((member) => ({
+      id: member.id,
+      role: member.role,
+      email: member.email,
+      status: member.status,
+      createdAt: member.createdAt,
+      identities: member.externalIdentities,
+      activeSessionCount: member._count.sessions,
+      loginEventCount: member._count.loginEvents,
+      lastSession: member.sessions[0] ?? null,
+    }));
+  }
+
+  /**
+   * Owner-only student <-> curator role switch, for test accounts that need to move back and
+   * forth without a fresh Discord identity each time (a real invitation only ever sets a role
+   * once). Does the same bookkeeping accept-invitation/promotion would:
+   *  - to CURATOR: drops the Enrollment — a curator doesn't have student-side data.
+   *  - to STUDENT: enrolls in the active practicum and seeds default-open module access, exactly
+   *    like a fresh invitation accept.
+   * Deliberately can't target or produce OWNER — that's a manual, one-off change.
+   */
+  public async setUserRole(actorId: string, targetId: string, nextRole: "STUDENT" | "CURATOR"): Promise<{ id: string; role: UserRole }> {
+    await this.assertOwner(actorId);
+
+    const target = await prisma.user.findUnique({ where: { id: targetId }, select: { id: true, role: true, status: true } });
+    if (!target || target.status === UserStatus.DELETED) {
+      throw new AuthServiceError("INVALID_INPUT", "Account does not exist");
+    }
+    if (target.role !== UserRole.STUDENT && target.role !== UserRole.CURATOR) {
+      throw new AuthServiceError("INVALID_INPUT", "Only a student or curator role can be changed here");
+    }
+
+    const targetRole = nextRole === "CURATOR" ? UserRole.CURATOR : UserRole.STUDENT;
+    if (target.role === targetRole) return { id: target.id, role: target.role };
+
+    return prisma.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: targetId }, data: { role: targetRole } });
+
+      if (targetRole === UserRole.CURATOR) {
+        await tx.enrollment.deleteMany({ where: { studentId: targetId } });
+      } else {
+        const practicumId = await getWorkingPracticumId(actorId, tx);
+        if (practicumId) {
+          const enrollment = await tx.enrollment.upsert({
+            where: { studentId_practicumId: { studentId: targetId, practicumId } },
+            update: { status: EnrollmentStatus.ACTIVE },
+            create: { studentId: targetId, practicumId, status: EnrollmentStatus.ACTIVE },
+            select: { id: true },
+          });
+          await seedOpenModuleAccess(tx, enrollment.id, practicumId);
+        }
+      }
+
+      await tx.auditLog.create({
+        data: {
+          actorId,
+          action: "security.user_role_changed",
+          objectType: "User",
+          objectId: targetId,
+          metadata: { from: target.role, to: targetRole },
+        },
+      });
+
+      return { id: targetId, role: targetRole };
+    });
+  }
+
+  public async getStudentDirectory(actorId: string, options?: { practicumId?: string }): Promise<StudentDirectoryRecord[]> {
     const actor = await prisma.user.findUnique({
       where: { id: actorId },
       select: { role: true, status: true },
@@ -705,13 +813,16 @@ export class AuthService {
     }
 
     const now = new Date();
+    // Same "active, unexpired" test course-service.ts#getForUser uses to resolve a student's own
+    // practicum — keeps the badge/filter here consistent with what the student's own dashboard shows.
+    const activeEnrollmentFilter = { status: EnrollmentStatus.ACTIVE, OR: [{ accessUntil: null }, { accessUntil: { gt: now } }] };
     const students = await prisma.user.findMany({
       where: {
         role: UserRole.STUDENT,
         status: { not: UserStatus.DELETED },
-        // Curators can see the cohort roster so an unassigned student can be
-        // claimed from the same screen. Security details remain restricted by
-        // `canViewDetails` and getStudentSecurityOverview below.
+        // Omitting practicumId (the "Все потоки" view) keeps the historical behaviour: every
+        // student ever enrolled, so a former student who reaches out can still be found.
+        ...(options?.practicumId ? { enrollments: { some: { practicumId: options.practicumId, ...activeEnrollmentFilter } } } : {}),
       },
       orderBy: { createdAt: "desc" },
       select: {
@@ -722,22 +833,11 @@ export class AuthService {
         externalIdentities: {
           select: { provider: true, username: true, displayName: true, avatarUrl: true },
         },
-        studentAssignments: {
+        enrollments: {
+          where: activeEnrollmentFilter,
           orderBy: { createdAt: "asc" },
           take: 1,
-          select: {
-            curator: {
-              select: {
-                id: true,
-                email: true,
-                externalIdentities: {
-                  orderBy: { createdAt: "asc" },
-                  take: 1,
-                  select: { displayName: true, username: true },
-                },
-              },
-            },
-          },
+          select: { practicum: { select: { id: true, title: true } } },
         },
         sessions: {
           where: { status: SessionStatus.ACTIVE, expiresAt: { gt: now } },
@@ -755,11 +855,7 @@ export class AuthService {
       },
     });
 
-    return students.map((student) => {
-      const assignedCurator = student.studentAssignments[0]?.curator ?? null;
-      const isAssignedToActor = assignedCurator?.id === actorId;
-
-      return {
+    return students.map((student) => ({
       id: student.id,
       email: student.email,
       status: student.status,
@@ -771,144 +867,10 @@ export class AuthService {
       activeSessionCount: student._count.sessions,
       loginEventCount: student._count.loginEvents,
       submissionCount: student._count.submissions,
-      assignedCurator: assignedCurator
-        ? {
-            id: assignedCurator.id,
-            name: assignedCurator.externalIdentities[0]?.displayName
-              ?? assignedCurator.externalIdentities[0]?.username
-              ?? assignedCurator.email
-              ?? "Куратор",
-          }
-        : null,
-      isAssignedToActor,
-      canClaim: actor.role === UserRole.OWNER || assignedCurator === null,
-      canTransfer: actor.role === UserRole.OWNER,
-      // Every active curator can see every student's details — CuratorAssignment is no
-      // longer a visibility partition, just the default "who this student's discussions
-      // route to" record (see discussion-service.ts).
+      practicum: student.enrollments[0]?.practicum ?? null,
       canViewDetails: true,
       lastSession: student.sessions[0] ?? null,
-      };
-    });
-  }
-
-  public async getCuratorDirectory(actorId: string): Promise<CuratorDirectoryRecord[]> {
-    await this.assertOwner(actorId);
-
-    const curators = await prisma.user.findMany({
-      where: { role: UserRole.CURATOR, status: UserStatus.ACTIVE },
-      orderBy: { createdAt: "asc" },
-      select: {
-        id: true,
-        email: true,
-        externalIdentities: {
-          orderBy: { createdAt: "asc" },
-          take: 1,
-          select: { displayName: true, username: true },
-        },
-      },
-    });
-
-    return curators.map((curator) => ({
-      id: curator.id,
-      email: curator.email,
-      name: curator.externalIdentities[0]?.displayName
-        ?? curator.externalIdentities[0]?.username
-        ?? curator.email
-        ?? "Куратор",
     }));
-  }
-
-  public async transferStudent(actorId: string, studentId: string, targetCuratorId: string) {
-    await this.assertOwner(actorId);
-    const normalizedStudentId = requireNonEmpty(studentId, "studentId");
-    const normalizedTargetCuratorId = requireNonEmpty(targetCuratorId, "curatorId");
-
-    try {
-      return await prisma.$transaction(async (tx) => {
-        const [student, targetCurator, currentAssignments] = await Promise.all([
-          tx.user.findUnique({ where: { id: normalizedStudentId }, select: { id: true, role: true, status: true } }),
-          tx.user.findUnique({ where: { id: normalizedTargetCuratorId }, select: { id: true, role: true, status: true } }),
-          tx.curatorAssignment.findMany({ where: { studentId: normalizedStudentId }, orderBy: { createdAt: "asc" }, select: { curatorId: true } }),
-        ]);
-
-        if (!student || student.role !== UserRole.STUDENT || student.status === UserStatus.DELETED) {
-          throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
-        }
-        if (!targetCurator || targetCurator.role !== UserRole.CURATOR || targetCurator.status !== UserStatus.ACTIVE) {
-          throw new AuthServiceError("INVALID_INPUT", "Target curator is not active");
-        }
-
-        const previousCuratorId = currentAssignments[0]?.curatorId ?? null;
-        if (previousCuratorId === normalizedTargetCuratorId && currentAssignments.length === 1) {
-          return { studentId: normalizedStudentId, curatorId: normalizedTargetCuratorId, previousCuratorId, changed: false };
-        }
-
-        await tx.curatorAssignment.deleteMany({ where: { studentId: normalizedStudentId } });
-        await tx.curatorAssignment.create({ data: { curatorId: normalizedTargetCuratorId, studentId: normalizedStudentId } });
-        await tx.auditLog.create({
-          data: {
-            actorId,
-            action: "security.student_transferred",
-            objectType: "User",
-            objectId: normalizedStudentId,
-            metadata: { previousCuratorId, targetCuratorId: normalizedTargetCuratorId },
-          },
-        });
-
-        return { studentId: normalizedStudentId, curatorId: normalizedTargetCuratorId, previousCuratorId, changed: true };
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-    } catch (error) {
-      if (error instanceof AuthServiceError) throw error;
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
-        throw new AuthServiceError("AUTH_CONFLICT", "Student assignment changed concurrently. Refresh and try again");
-      }
-      throw error;
-    }
-  }
-
-  public async claimStudent(actorId: string, studentId: string) {
-    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { id: true, role: true, status: true } });
-    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) {
-      throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can claim a student");
-    }
-
-    try {
-      return await prisma.$transaction(async (tx) => {
-        const student = await tx.user.findUnique({ where: { id: studentId }, select: { id: true, role: true, status: true } });
-        if (!student || student.role !== UserRole.STUDENT || student.status === UserStatus.DELETED) {
-          throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
-        }
-
-        const current = await tx.curatorAssignment.findMany({
-          where: { studentId },
-          orderBy: { createdAt: "asc" },
-          select: { id: true, curatorId: true },
-        });
-        const occupiedByAnother = current.some((assignment) => assignment.curatorId !== actorId);
-        if (occupiedByAnother && actor.role !== UserRole.OWNER) {
-          throw new AuthServiceError("AUTH_CONFLICT", "Student is already assigned to another curator");
-        }
-
-        if (actor.role === UserRole.OWNER && occupiedByAnother) {
-          await tx.curatorAssignment.deleteMany({ where: { studentId } });
-        }
-
-        await tx.curatorAssignment.upsert({
-          where: { curatorId_studentId: { curatorId: actorId, studentId } },
-          update: {},
-          create: { curatorId: actorId, studentId },
-        });
-
-        return { studentId, curatorId: actorId, reassigned: occupiedByAnother };
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-    } catch (error) {
-      if (error instanceof AuthServiceError) throw error;
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
-        throw new AuthServiceError("AUTH_CONFLICT", "Student was claimed by another curator. Refresh and try again");
-      }
-      throw error;
-    }
   }
 
   public async updateStudentEmail(actorId: string, studentId: string, rawEmail: string): Promise<string | null> {
@@ -1012,7 +974,7 @@ export class AuthService {
 
   public async revokeUserSessions(actorId: string, userId: string, reason: string): Promise<number> {
     await this.assertOwner(actorId);
-    await this.assertStudentTarget(userId);
+    await this.assertDeviceTargetExists(userId);
     const normalizedReason = requireNonEmpty(reason, "reason");
 
     return prisma.$transaction(async (tx) => {
@@ -1036,7 +998,7 @@ export class AuthService {
   }
 
   public async revokeUserSession(actorId: string, userId: string, sessionId: string, reason: string): Promise<void> {
-    await this.assertCanManageStudentSecurity(actorId, userId);
+    await this.assertCanManageDeviceSecurity(actorId, userId);
     const normalizedReason = requireNonEmpty(reason, "reason");
     await prisma.$transaction(async (tx) => {
       const result = await tx.session.updateMany({
@@ -1051,13 +1013,13 @@ export class AuthService {
   }
 
   public async approveUserSession(actorId: string, userId: string, sessionId: string, reason: string): Promise<void> {
-    await this.assertCanManageStudentSecurity(actorId, userId);
+    await this.assertCanManageDeviceSecurity(actorId, userId);
     const normalizedReason = requireNonEmpty(reason, "reason");
 
     await prisma.$transaction(async (tx) => {
-      const student = await tx.user.findUnique({ where: { id: userId }, select: { status: true } });
-      if (!student || student.status !== UserStatus.ACTIVE) {
-        throw new AuthServiceError("INVALID_INPUT", "Student account is not active");
+      const targetUser = await tx.user.findUnique({ where: { id: userId }, select: { status: true } });
+      if (!targetUser || targetUser.status !== UserStatus.ACTIVE) {
+        throw new AuthServiceError("INVALID_INPUT", "Account is not active");
       }
 
       const pending = await tx.session.findUnique({
@@ -1074,7 +1036,7 @@ export class AuthService {
       });
       const incoming = await tx.session.findUnique({ where: { id: sessionId }, select: { deviceKeyHash: true } });
       if (!incoming?.deviceKeyHash || hasReachedDeviceLimit(activeSessions, incoming.deviceKeyHash, MAX_DEVICES)) {
-        throw new AuthServiceError("AUTH_CONFLICT", "The student already has the maximum number of active devices");
+        throw new AuthServiceError("AUTH_CONFLICT", "The account already has the maximum number of active devices");
       }
 
       const updated = await tx.session.updateMany({
@@ -1116,6 +1078,61 @@ export class AuthService {
     });
   }
 
+  /**
+   * Owner or curator — permanently erases a student and everything tied to them (ДЗ,
+   * submissions/feedback, discussion threads, stream chat messages, sessions, login history).
+   * Unlike suspendUser this is not reversible, so the caller is expected to have confirmed with
+   * the actual human first (a confirm dialog on the client) — there's no server-side "are you
+   * sure" step.
+   *
+   * Most of the schema cascades or SetNulls automatically once the User row is gone, but three
+   * FKs are `onDelete: Restrict` and reachable from a student's own data: DiscussionMessage.author
+   * and StreamMessage.author (a student's own messages), and SubmissionAttachment.file (files a
+   * student uploaded to their own ДЗ, referenced via StoredFile which cascades off the same User
+   * row). Rather than rely on how Postgres orders cascades across multiple FK paths converging on
+   * one row in a single statement, those three are deleted explicitly first — by the time
+   * user.delete() runs, nothing is left that could hit a Restrict.
+   */
+  public async deleteStudent(actorId: string, studentId: string): Promise<void> {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, status: true } });
+    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) {
+      throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can delete a student");
+    }
+
+    const student = await prisma.user.findUnique({
+      where: { id: studentId },
+      select: {
+        role: true,
+        email: true,
+        externalIdentities: { orderBy: { createdAt: "asc" }, take: 1, select: { displayName: true, username: true } },
+      },
+    });
+    if (!student || student.role !== UserRole.STUDENT) {
+      throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
+    }
+    const label = student.externalIdentities[0]?.displayName ?? student.externalIdentities[0]?.username ?? student.email ?? studentId;
+
+    await prisma.$transaction(async (tx) => {
+      await tx.discussionMessage.deleteMany({ where: { authorId: studentId } });
+      await tx.streamMessage.deleteMany({ where: { authorId: studentId } });
+      await tx.submissionAttachment.deleteMany({ where: { file: { ownerId: studentId } } });
+
+      await tx.user.delete({ where: { id: studentId } });
+
+      // objectId is a plain string, not an FK — safe to record after the row is gone. The
+      // metadata snapshot exists precisely because it won't be, so this stays traceable.
+      await tx.auditLog.create({
+        data: {
+          actorId,
+          action: "security.student_deleted",
+          objectType: "User",
+          objectId: studentId,
+          metadata: { label, email: student.email },
+        },
+      });
+    });
+  }
+
   public async recordLoginEvent(input: {
     userId?: string;
     provider?: IdentityProvider;
@@ -1152,22 +1169,43 @@ export class AuthService {
     }
   }
 
-  private async assertCanManageStudentSecurity(actorId: string, studentId: string): Promise<void> {
-    const [actor, student] = await Promise.all([
+  private async assertOwnerOrCurator(actorId: string): Promise<void> {
+    const actor = await prisma.user.findUnique({
+      where: { id: actorId },
+      select: { role: true, status: true },
+    });
+
+    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.OWNER && actor.role !== UserRole.CURATOR)) {
+      throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can perform this action");
+    }
+  }
+
+  /**
+   * Gates device management (approve / revoke one session): a student's devices are manageable
+   * by any active curator or owner, same as before. A curator's or owner's own devices are staff
+   * security — only the owner may touch those, never a peer curator. Without this split, once a
+   * tester's account is promoted to curator (see practicum-admin-service.ts-adjacent role
+   * changes), a legitimate third-device approval would have nobody left who could grant it.
+   */
+  private async assertCanManageDeviceSecurity(actorId: string, targetId: string): Promise<void> {
+    const [actor, target] = await Promise.all([
       prisma.user.findUnique({
         where: { id: actorId },
         select: { role: true, status: true },
       }),
       prisma.user.findUnique({
-        where: { id: studentId },
+        where: { id: targetId },
         select: { role: true, status: true },
       }),
     ]);
     if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.OWNER && actor.role !== UserRole.CURATOR)) {
-      throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can manage student devices");
+      throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can manage devices");
     }
-    if (!student || student.role !== UserRole.STUDENT || student.status === UserStatus.DELETED) {
-      throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
+    if (!target || target.status === UserStatus.DELETED) {
+      throw new AuthServiceError("INVALID_INPUT", "Account does not exist");
+    }
+    if (target.role !== UserRole.STUDENT && actor.role !== UserRole.OWNER) {
+      throw new AuthServiceError("FORBIDDEN", "Only the active owner can manage a staff member's devices");
     }
   }
 
@@ -1182,14 +1220,22 @@ export class AuthService {
     }
   }
 
+  /** Bulk "revoke all sessions" is already owner-gated at the controller — any active account
+    * (student or staff) is a valid target, unlike the single-session approve/revoke split above. */
+  private async assertDeviceTargetExists(userId: string): Promise<void> {
+    const target = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
+    if (!target || target.status === UserStatus.DELETED) {
+      throw new AuthServiceError("INVALID_INPUT", "Account does not exist");
+    }
+  }
+
   /**
    * Mirrors the "active sessions have different network signatures" heuristic the curator's
    * student-security tab already computes client-side (unusualActivity in page.tsx), but
-   * server-side and event-driven — so the assigned curator (or an owner, if nobody's claimed the
-   * student yet) hears about it via the notification bell instead of only finding out by opening
-   * that student's profile. Fires once, exactly on the login that actually tips the account into
-   * that state — a student who's already flagged doesn't generate a fresh alert on every
-   * subsequent login from the same second device.
+   * server-side and event-driven — so every active curator/owner hears about it via the
+   * notification bell instead of only finding out by opening that student's profile. Fires once,
+   * exactly on the login that actually tips the account into that state — a student who's already
+   * flagged doesn't generate a fresh alert on every subsequent login from the same second device.
    */
   private async flagUnusualAccessIfNew(
     tx: DatabaseClient,
@@ -1207,10 +1253,10 @@ export class AuthService {
     const student = await tx.user.findUnique({ where: { id: studentId }, select: { role: true } });
     if (student?.role !== UserRole.STUDENT) return;
 
-    const assignment = await tx.curatorAssignment.findFirst({ where: { studentId }, select: { curatorId: true } });
-    const recipientIds = assignment
-      ? [assignment.curatorId]
-      : (await tx.user.findMany({ where: { role: UserRole.OWNER, status: UserStatus.ACTIVE }, select: { id: true } })).map((owner) => owner.id);
+    const recipientIds = (await tx.user.findMany({
+      where: { role: { in: [UserRole.CURATOR, UserRole.OWNER] }, status: UserStatus.ACTIVE },
+      select: { id: true },
+    })).map((staff) => staff.id);
     if (recipientIds.length === 0) return;
 
     const identity = await tx.externalIdentity.findFirst({ where: { userId: studentId }, select: { displayName: true, username: true } });
@@ -1247,11 +1293,17 @@ export class AuthService {
     });
 
     const existingDevice = activeSessions.some((session) => session.deviceKeyHash === deviceKeyHash);
-    // Local test identities are deliberately exempt from device approval. They
-    // are available only through the guarded dev-login endpoint and must allow
-    // a developer to switch between the student and curator flows freely.
-    // Real Discord sessions still use the normal device limit.
+    // The 2-device cap exists to stop a paid student seat being shared around — it isn't a
+    // meaningful protection for staff, who legitimately run several browsers/profiles at once
+    // (testing both the student and curator side, home vs. work, etc.) and have nobody but the
+    // owner who could ever approve a 3rd device for them anyway. So it only applies to students;
+    // curators and owners get unlimited devices.
+    const actor = await tx.user.findUnique({ where: { id: input.userId }, select: { role: true } });
+    // Local test identities are also deliberately exempt from device approval. They are
+    // available only through the guarded dev-login endpoint and must allow a developer to
+    // switch between the student and curator flows freely.
     const requiresApproval = input.provider !== IdentityProvider.LOCAL
+      && actor?.role === UserRole.STUDENT
       && !existingDevice
       && hasReachedDeviceLimit(activeSessions, deviceKeyHash, MAX_DEVICES);
 

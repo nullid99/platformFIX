@@ -129,6 +129,8 @@ enum NotificationType {
   NEW_ASSIGNMENT
   NEW_MEDIA
   NEW_EVENT
+  NEW_MODULE
+  MODULE_OPENED
   DISCUSSION_REPLY
   REVIEW_DECISION
   STREAM_LIVE
@@ -137,90 +139,95 @@ enum NotificationType {
 }
 
 model User {
-  id                 String               @id @default(cuid())
-  email              String?              @unique
-  passwordHash       String?
-  role               UserRole
-  status             UserStatus           @default(INVITED)
-  emailVerifiedAt    DateTime?
-  twoFactorEnabled   Boolean              @default(false)
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
-  externalIdentities ExternalIdentity[]
-  sessions           Session[]
-  sentInvitations    Invitation[]         @relation("InvitationSender")
-  acceptedInvitations Invitation[]        @relation("InvitationAcceptedBy")
-  enrollments        Enrollment[]
-  curatorAssignments CuratorAssignment[]  @relation("CuratorAssignments")
-  studentAssignments CuratorAssignment[]  @relation("StudentAssignments")
-  submissions        Submission[]
-  reviewClaims       Submission[]        @relation("SubmissionReviewer")
-  storedFiles         StoredFile[]
-  feedback           Feedback[]           @relation("FeedbackAuthor")
-  studentDiscussionThreads DiscussionThread[] @relation("DiscussionStudentThreads")
-  curatorDiscussionThreads DiscussionThread[] @relation("DiscussionCuratorThreads")
-  discussionMessages DiscussionMessage[]
-  auditLogs          AuditLog[]
-  loginEvents        LoginEvent[]
-  emailVerificationTokens EmailVerificationToken[]
-  streamMessages     StreamMessage[]
-  streamMessageReactions StreamMessageReaction[]
-  mediaPlaybackEvents MediaPlaybackEvent[]
-  notifications      Notification[]
-  backtestBookings   ScheduleEvent[]      @relation("ScheduleEventBooking")
-  scheduleBookingsAsStudent ScheduleBooking[] @relation("ScheduleBookingStudent")
-  scheduleBookingsAsActor   ScheduleBooking[] @relation("ScheduleBookingActor")
+  id                        String                   @id @default(cuid())
+  email                     String?                  @unique
+  passwordHash              String?
+  role                      UserRole
+  status                    UserStatus               @default(INVITED)
+  emailVerifiedAt           DateTime?
+  twoFactorEnabled          Boolean                  @default(false)
+  createdAt                 DateTime                 @default(now())
+  updatedAt                 DateTime                 @updatedAt
+  externalIdentities        ExternalIdentity[]
+  sessions                  Session[]
+  sentInvitations           Invitation[]             @relation("InvitationSender")
+  acceptedInvitations       Invitation[]             @relation("InvitationAcceptedBy")
+  enrollments               Enrollment[]
+  submissions               Submission[]
+  reviewClaims              Submission[]             @relation("SubmissionReviewer")
+  storedFiles               StoredFile[]
+  feedback                  Feedback[]               @relation("FeedbackAuthor")
+  studentDiscussionThreads  DiscussionThread[]       @relation("DiscussionStudentThreads")
+  curatorDiscussionThreads  DiscussionThread[]       @relation("DiscussionCuratorThreads")
+  discussionMessages        DiscussionMessage[]
+  auditLogs                 AuditLog[]
+  loginEvents               LoginEvent[]
+  emailVerificationTokens   EmailVerificationToken[]
+  streamMessages            StreamMessage[]
+  streamMessageReactions    StreamMessageReaction[]
+  mediaPlaybackEvents       MediaPlaybackEvent[]
+  notifications             Notification[]
+  backtestBookings          ScheduleEvent[]          @relation("ScheduleEventBooking")
+  scheduleBookingsAsStudent ScheduleBooking[]        @relation("ScheduleBookingStudent")
+  scheduleBookingsAsActor   ScheduleBooking[]        @relation("ScheduleBookingActor")
+  // A curator/owner's personal "which practicum am I creating content in right now" pointer —
+  // independent from Practicum.isActive (which only targets live streaming, unchanged). Null
+  // means "no personal pick yet", so every resolver falls back to the active practicum — see
+  // practicum-service.ts#getWorkingPracticumId. Two staff members can point at different
+  // practicums at the same time without affecting each other or the live-stream target.
+  workingPracticumId        String?
+  workingPracticum          Practicum?               @relation("UserWorkingPracticum", fields: [workingPracticumId], references: [id], onDelete: SetNull)
 
   @@index([role, status])
 }
 
 model EmailVerificationToken {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String
   email     String
-  tokenHash String   @unique
+  tokenHash String    @unique
   expiresAt DateTime
   usedAt    DateTime?
-  createdAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([expiresAt, usedAt])
 }
 
 model ExternalIdentity {
-  id             String           @id @default(cuid())
-  userId         String
-  provider       IdentityProvider
+  id              String           @id @default(cuid())
+  userId          String
+  provider        IdentityProvider
   providerSubject String
-  username       String?
-  displayName    String?
-  avatarUrl      String?
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
-  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  username        String?
+  displayName     String?
+  avatarUrl       String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([provider, providerSubject])
   @@index([userId])
 }
 
 model Invitation {
-  id             String           @id @default(cuid())
+  id             String            @id @default(cuid())
   email          String?
   role           UserRole
-  tokenHash      String           @unique
-  status         InvitationStatus @default(PENDING)
+  tokenHash      String            @unique
+  status         InvitationStatus  @default(PENDING)
   targetProvider IdentityProvider?
   targetSubject  String?
   practicumId    String?
   expiresAt      DateTime
   acceptedAt     DateTime?
-  createdAt      DateTime         @default(now())
+  createdAt      DateTime          @default(now())
   createdById    String?
   acceptedById   String?
-  createdBy      User?            @relation("InvitationSender", fields: [createdById], references: [id], onDelete: SetNull)
-  acceptedBy     User?            @relation("InvitationAcceptedBy", fields: [acceptedById], references: [id], onDelete: SetNull)
-  practicum      Practicum?       @relation(fields: [practicumId], references: [id], onDelete: SetNull)
+  createdBy      User?             @relation("InvitationSender", fields: [createdById], references: [id], onDelete: SetNull)
+  acceptedBy     User?             @relation("InvitationAcceptedBy", fields: [acceptedById], references: [id], onDelete: SetNull)
+  practicum      Practicum?        @relation(fields: [practicumId], references: [id], onDelete: SetNull)
 
   @@index([email, status])
   @@index([targetProvider, targetSubject, status])
@@ -229,24 +236,24 @@ model Invitation {
 }
 
 model Session {
-  id             String        @id @default(cuid())
-  userId         String
-  tokenHash      String        @unique
-  deviceKeyHash  String?
-  status         SessionStatus @default(ACTIVE)
-  deviceName     String?
-  userAgent      String?
-  ipAddress      String?
-  ipHash         String?
-  countryCode    String?
-  city           String?
-  riskScore      Int?
-  riskReason     String?
-  lastActiveAt   DateTime      @default(now())
-  expiresAt      DateTime
-  revokedAt      DateTime?
-  createdAt      DateTime      @default(now())
-  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id            String        @id @default(cuid())
+  userId        String
+  tokenHash     String        @unique
+  deviceKeyHash String?
+  status        SessionStatus @default(ACTIVE)
+  deviceName    String?
+  userAgent     String?
+  ipAddress     String?
+  ipHash        String?
+  countryCode   String?
+  city          String?
+  riskScore     Int?
+  riskReason    String?
+  lastActiveAt  DateTime      @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime      @default(now())
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, status, lastActiveAt])
   @@index([deviceKeyHash, status])
@@ -255,7 +262,7 @@ model Session {
 }
 
 model LoginEvent {
-  id              String           @id @default(cuid())
+  id              String            @id @default(cuid())
   userId          String?
   provider        IdentityProvider?
   providerSubject String?
@@ -268,8 +275,8 @@ model LoginEvent {
   city            String?
   riskScore       Int?
   reasonCode      String?
-  createdAt       DateTime         @default(now())
-  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt       DateTime          @default(now())
+  user            User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt])
   @@index([outcome, createdAt])
@@ -277,71 +284,78 @@ model LoginEvent {
 }
 
 model DiscordAuthChallenge {
-  id                       String   @id @default(cuid())
-  stateHash                String   @unique
-  codeVerifierCiphertext   String
+  id                        String    @id @default(cuid())
+  stateHash                 String    @unique
+  codeVerifierCiphertext    String
   invitationTokenCiphertext String?
-  redirectUri              String
-  expiresAt                DateTime
-  usedAt                   DateTime?
-  createdAt                DateTime @default(now())
+  redirectUri               String
+  expiresAt                 DateTime
+  usedAt                    DateTime?
+  createdAt                 DateTime  @default(now())
 
   @@index([expiresAt, usedAt])
 }
 
 model Practicum {
-  id           String       @id @default(cuid())
-  title        String
-  description  String?
-  accessUntil  DateTime?
-  // The one practicum new curator-side content (modules, streams, schedule events, invitations)
-  // targets by default — see app/server/course/practicum-service.ts#getActivePracticumId. A
-  // finished cohort's own enrollments/modules/media keep pointing at its (now inactive) row
-  // forever, so its students keep seeing exactly what they always saw.
-  isActive     Boolean      @default(false)
-  liveKitIngressId String?
-  isCurrentlyLive Boolean @default(false)
+  id                            String            @id @default(cuid())
+  title                         String
+  description                   String?
+  accessUntil                   DateTime?
+  // The practicum live streaming targets (LiveKit ingress, "Стримы") and the fallback every
+  // resolver uses when a curator/owner has no personal workingPracticumId set yet — see
+  // app/server/course/practicum-service.ts#getActivePracticumId. Content creation itself (module,
+  // schedule event, standalone media, invitation default) instead follows each staff member's own
+  // User.workingPracticumId — see #getWorkingPracticumId — so two people can work in different
+  // practicums at once without touching which one is "active". A finished cohort's own
+  // enrollments/modules/media keep pointing at its (now inactive) row forever, so its students
+  // keep seeing exactly what they always saw.
+  isActive                      Boolean           @default(false)
+  liveKitIngressId              String?
+  isCurrentlyLive               Boolean           @default(false)
   currentStreamSessionStartedAt DateTime?
-  backtestSlotLimit   Int @default(1)
-  preSessionSlotLimit Int @default(1)
+  backtestSlotLimit             Int               @default(1)
+  preSessionSlotLimit           Int               @default(1)
   // What the curator picked as the target for the NEXT/current broadcast on the "Стримы"
   // page — consumed (and cleared) by StreamService.createMediaAssetFromRecording once the
   // LiveKit egress completes, so it auto-attaches + auto-publishes there instead of landing as an
   // unassigned draft. Mutually exclusive by convention, same as MediaAsset.moduleId/scheduleEventId.
-  pendingStreamModuleId        String?
-  pendingStreamScheduleEventId String?
+  pendingStreamModuleId         String?
+  pendingStreamScheduleEventId  String?
   // Only meaningful alongside pendingStreamModuleId — a module's stream recordings split into
   // the "Тематические записи" (STREAM) and "Q&A с куратором" (QA) blocks, so the curator picks
   // which one this broadcast is for. Null/unset defaults to STREAM in createMediaAssetFromRecording.
-  pendingStreamMediaKind       MediaAssetKind?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
-  enrollments  Enrollment[]
-  modules      Module[]
-  invitations  Invitation[]
-  mediaAssets  MediaAsset[]
-  scheduleEvents ScheduleEvent[]
-  streamMessages StreamMessage[]
-  scheduleBookings ScheduleBooking[]
+  pendingStreamMediaKind        MediaAssetKind?
+  createdAt                     DateTime          @default(now())
+  updatedAt                     DateTime          @updatedAt
+  enrollments                   Enrollment[]
+  modules                       Module[]
+  invitations                   Invitation[]
+  mediaAssets                   MediaAsset[]
+  scheduleEvents                ScheduleEvent[]
+  streamMessages                StreamMessage[]
+  scheduleBookings              ScheduleBooking[]
+  workingForUsers               User[]            @relation("UserWorkingPracticum")
 }
 
 model StreamMessage {
-  id          String     @id @default(cuid())
+  id          String                  @id @default(cuid())
   practicumId String
   authorId    String
   body        String
   fileId      String?
   replyToId   String?
-  /** { title, imageUrl, siteName, sourceUrl } — populated at send time for a recognized TradingView chart-snapshot link in the body. */
+  /**
+   * { title, imageUrl, siteName, sourceUrl } — populated at send time for a recognized TradingView chart-snapshot link in the body.
+   */
   linkPreview Json?
-  createdAt   DateTime   @default(now())
-  practicum   Practicum  @relation(fields: [practicumId], references: [id], onDelete: Cascade)
-  author      User       @relation(fields: [authorId], references: [id], onDelete: Restrict)
-  file        StoredFile? @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  createdAt   DateTime                @default(now())
+  practicum   Practicum               @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  author      User                    @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  file        StoredFile?             @relation(fields: [fileId], references: [id], onDelete: SetNull)
   // SetNull (not Cascade) — deleting the original leaves replies in place, just without a
   // quoted preview, same as Discord "Original message was deleted".
-  replyTo     StreamMessage? @relation("StreamMessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
-  replies     StreamMessage[] @relation("StreamMessageReplies")
+  replyTo     StreamMessage?          @relation("StreamMessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies     StreamMessage[]         @relation("StreamMessageReplies")
   reactions   StreamMessageReaction[]
 
   @@index([practicumId, createdAt])
@@ -363,53 +377,41 @@ model StreamMessageReaction {
 }
 
 model Enrollment {
-  id          String           @id @default(cuid())
-  studentId   String
-  practicumId String
-  status      EnrollmentStatus @default(ACTIVE)
-  accessUntil DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-  student     User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  practicum   Practicum        @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  id             String                   @id @default(cuid())
+  studentId      String
+  practicumId    String
+  status         EnrollmentStatus         @default(ACTIVE)
+  accessUntil    DateTime?
+  createdAt      DateTime                 @default(now())
+  updatedAt      DateTime                 @updatedAt
+  student        User                     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  practicum      Practicum                @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   moduleAccesses EnrollmentModuleAccess[]
 
   @@unique([studentId, practicumId])
   @@index([practicumId, status])
 }
 
-model CuratorAssignment {
-  id        String   @id @default(cuid())
-  curatorId String
-  studentId String
-  createdAt DateTime @default(now())
-  curator   User     @relation("CuratorAssignments", fields: [curatorId], references: [id], onDelete: Cascade)
-  student   User     @relation("StudentAssignments", fields: [studentId], references: [id], onDelete: Cascade)
-
-  @@unique([curatorId, studentId])
-  @@index([studentId])
-}
-
 model Module {
-  id          String     @id @default(cuid())
-  practicumId String
-  title       String
-  description String?
-  section     String     @default("Education")
-  coverPath   String?
-  position    Int
+  id                String                   @id @default(cuid())
+  practicumId       String
+  title             String
+  description       String?
+  section           String                   @default("Education")
+  coverPath         String?
+  position          Int
   // Source of truth for "is this module open to the whole cohort" — set by the curator's
   // module-wide toggle. A student's own EnrollmentModuleAccess row still decides what THEY
   // see; this only decides what a newly-enrolling student inherits and what the curator's
   // admin screen reports (previously that screen just guessed from one arbitrary student's
   // row, which is what caused open-looking-but-actually-locked modules).
-  defaultAccess ModuleAccessStatus @default(LOCKED)
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
-  practicum   Practicum  @relation(fields: [practicumId], references: [id], onDelete: Cascade)
-  mediaAssets MediaAsset[]
-  assignments Assignment[]
-  accessRecords EnrollmentModuleAccess[]
+  defaultAccess     ModuleAccessStatus       @default(LOCKED)
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  practicum         Practicum                @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  mediaAssets       MediaAsset[]
+  assignments       Assignment[]
+  accessRecords     EnrollmentModuleAccess[]
   discussionThreads DiscussionThread[]
 
   @@unique([practicumId, position])
@@ -438,33 +440,37 @@ model EnrollmentModuleAccess {
 }
 
 model MediaAsset {
-  id          String           @id @default(cuid())
-  practicumId String
-  moduleId    String?
-  scheduleEventId String?
-  provider    String
-  providerKey String
-  kind        MediaAssetKind   @default(STREAM)
-  status      MediaAssetStatus @default(DRAFT)
-  title       String?
-  description String?
-  mimeType    String?
-  durationSec Int?
-  position    Int              @default(0)
-  publishedAt DateTime?
+  id                   String               @id @default(cuid())
+  practicumId          String
+  moduleId             String?
+  scheduleEventId      String?
+  provider             String
+  providerKey          String
+  kind                 MediaAssetKind       @default(STREAM)
+  status               MediaAssetStatus     @default(DRAFT)
+  title                String?
+  description          String?
+  mimeType             String?
+  durationSec          Int?
+  // Int overflows past 2GB, which a single-segment 1440p recording clears well within an hour —
+  // see stream-service.ts#finishRecording, which reads this straight off the LiveKit webhook's
+  // own FileInfo instead of asking S3/MinIO for it separately.
+  byteSize             BigInt?
+  position             Int                  @default(0)
+  publishedAt          DateTime?
   // Snapshot of the live-chat time window at the moment this asset was auto-created from a
   // stream recording — lets StreamChatService.getArchivedMessages find "the chat that
   // happened during this broadcast" without needing a session id on StreamMessage itself.
   // Null for anything not auto-created from a live recording (manual Vimeo uploads etc).
   chatSessionStartedAt DateTime?
   chatSessionEndedAt   DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-  practicum   Practicum        @relation(fields: [practicumId], references: [id], onDelete: Cascade)
-  module      Module?          @relation(fields: [moduleId], references: [id], onDelete: SetNull)
-  scheduleEvent ScheduleEvent? @relation(fields: [scheduleEventId], references: [id], onDelete: SetNull)
-  feedback    Feedback[]
-  playbackEvents MediaPlaybackEvent[]
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+  practicum            Practicum            @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  module               Module?              @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+  scheduleEvent        ScheduleEvent?       @relation(fields: [scheduleEventId], references: [id], onDelete: SetNull)
+  feedback             Feedback[]
+  playbackEvents       MediaPlaybackEvent[]
 
   @@unique([provider, providerKey, moduleId])
   @@index([moduleId, status, position])
@@ -477,7 +483,9 @@ model MediaAsset {
  * audit trail behind the on-screen watermark. If a recording leaks, cross-referencing
  * who opened that exact media around the leaked timestamp narrows down the source.
  */
-/** Backs the in-app notification bell — real per-user events, not the static demo list it replaced. */
+/**
+ * Backs the in-app notification bell — real per-user events, not the static demo list it replaced.
+ */
 model Notification {
   id        String           @id @default(cuid())
   userId    String
@@ -491,6 +499,22 @@ model Notification {
 
   @@index([userId, createdAt])
   @@index([userId, read])
+}
+
+/**
+ * A single global row (id is always "singleton") — not tied to any Practicum, deliberately, so
+ * flipping it off doesn't get reset by starting a new cohort. Exists for exactly one workflow:
+ * a curator migrating recordings off the LiveKit box between cohorts triggers a burst of
+ * content-change events that would otherwise spam students/curators with irrelevant
+ * notifications. Gated centrally (NotificationService.create/createMany, email-service's
+ * sendMutableEmail) rather than at each of the many call sites that fire a notification, so a
+ * future notification type respects this automatically. Security alerts and account emails
+ * (invitations, email verification) intentionally bypass it — see notification-settings.ts.
+ */
+model PlatformSettings {
+  id                   String   @id @default("singleton")
+  notificationsEnabled Boolean  @default(true)
+  updatedAt            DateTime @updatedAt
 }
 
 model MediaPlaybackEvent {
@@ -508,19 +532,19 @@ model MediaPlaybackEvent {
 }
 
 model ScheduleEvent {
-  id          String            @id @default(cuid())
-  practicumId String
-  type        ScheduleEventType
-  title       String
-  date        DateTime          @db.Date
-  time        String
-  description String
-  live        Boolean           @default(false)
-  coverPath   String?
-  createdAt   DateTime          @default(now())
-  updatedAt   DateTime          @updatedAt
-  practicum   Practicum         @relation(fields: [practicumId], references: [id], onDelete: Cascade)
-  mediaAssets MediaAsset[]
+  id                String            @id @default(cuid())
+  practicumId       String
+  type              ScheduleEventType
+  title             String
+  date              DateTime          @db.Date
+  time              String
+  description       String
+  live              Boolean           @default(false)
+  coverPath         String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  practicum         Practicum         @relation(fields: [practicumId], references: [id], onDelete: Cascade)
+  mediaAssets       MediaAsset[]
   // Individual BACKTEST/PRE_SESSION slots: one event = one bookable time, claimed by at
   // most one student. ScheduleService.book() enforces a per-student, per-type limit read
   // from Practicum.backtestSlotLimit/preSessionSlotLimit (default 1) — a count against the
@@ -534,10 +558,12 @@ model ScheduleEvent {
   @@index([bookedByStudentId])
 }
 
-/** Append-only log of book/cancel actions — ScheduleEvent.bookedByStudentId only holds the
-  * CURRENT booking (nulled out on cancel), so this is the only place booking history lives.
-  * Stores a snapshot of the event's title/date/time so history stays readable even if the
-  * original event is later edited or deleted; eventId is a plain reference, not an FK. */
+/**
+ * Append-only log of book/cancel actions — ScheduleEvent.bookedByStudentId only holds the
+ * CURRENT booking (nulled out on cancel), so this is the only place booking history lives.
+ * Stores a snapshot of the event's title/date/time so history stays readable even if the
+ * original event is later edited or deleted; eventId is a plain reference, not an FK.
+ */
 model ScheduleBooking {
   id          String                @id @default(cuid())
   practicumId String
@@ -559,47 +585,47 @@ model ScheduleBooking {
 }
 
 model Assignment {
-  id          String           @id @default(cuid())
-  moduleId    String
-  title       String
-  description String
-  requirements Json?
-  allowedFormats Json?
-  status      AssignmentStatus @default(DRAFT)
-  deadline    DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-  module      Module           @relation(fields: [moduleId], references: [id], onDelete: Cascade)
-  submissions Submission[]
-  materials   AssignmentMaterial[]
+  id                String               @id @default(cuid())
+  moduleId          String
+  title             String
+  description       String
+  requirements      Json?
+  allowedFormats    Json?
+  status            AssignmentStatus     @default(DRAFT)
+  deadline          DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  module            Module               @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  submissions       Submission[]
+  materials         AssignmentMaterial[]
   discussionThreads DiscussionThread[]
 
   @@index([moduleId, status])
 }
 
 model Submission {
-  id           String           @id @default(cuid())
-  assignmentId String
-  studentId    String
-  attempt      Int              @default(1)
-  status       SubmissionStatus @default(DRAFT)
-  answerText   String?
-  attachments  Json?
-  submittedAt  DateTime?
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
-  reviewerId   String?
-  claimedAt    DateTime?
+  id                  String                 @id @default(cuid())
+  assignmentId        String
+  studentId           String
+  attempt             Int                    @default(1)
+  status              SubmissionStatus       @default(DRAFT)
+  answerText          String?
+  attachments         Json?
+  submittedAt         DateTime?
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+  reviewerId          String?
+  claimedAt           DateTime?
   // Snapshot (requirement text, not index — the assignment's own list can change later) of
   // which criteria the curator had checked off at the moment they decided. Criteria are
   // advisory, not a hard gate for acceptance — this is what lets the student/curator see
   // later that a submission was accepted even though not every box was ticked.
   checkedRequirements Json?
-  assignment   Assignment       @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
-  student      User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  reviewer     User?            @relation("SubmissionReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
-  fileAttachments SubmissionAttachment[]
-  feedback     Feedback[]
+  assignment          Assignment             @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  student             User                   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  reviewer            User?                  @relation("SubmissionReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  fileAttachments     SubmissionAttachment[]
+  feedback            Feedback[]
 
   @@unique([assignmentId, studentId, attempt])
   @@index([studentId, status])
@@ -608,21 +634,21 @@ model Submission {
 }
 
 model StoredFile {
-  id             String          @id @default(cuid())
-  ownerId        String
-  storageKey     String          @unique
-  originalName   String
-  mimeType       String
-  byteSize       Int
-  status         StoredFileStatus @default(PENDING)
-  createdAt      DateTime        @default(now())
-  updatedAt      DateTime        @updatedAt
-  owner          User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
-  submissions    SubmissionAttachment[]
-  assignmentMaterials AssignmentMaterial[]
+  id                    String                 @id @default(cuid())
+  ownerId               String
+  storageKey            String                 @unique
+  originalName          String
+  mimeType              String
+  byteSize              Int
+  status                StoredFileStatus       @default(PENDING)
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  owner                 User                   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  submissions           SubmissionAttachment[]
+  assignmentMaterials   AssignmentMaterial[]
   discussionAttachments DiscussionAttachment[]
-  feedbackAttachments FeedbackAttachment[]
-  streamMessages StreamMessage[]
+  feedbackAttachments   FeedbackAttachment[]
+  streamMessages        StreamMessage[]
 
   @@index([ownerId, status])
 }
@@ -659,15 +685,15 @@ model SubmissionAttachment {
 }
 
 model Feedback {
-  id           String      @id @default(cuid())
+  id           String               @id @default(cuid())
   submissionId String
   authorId     String
   text         String
   mediaAssetId String?
-  createdAt    DateTime    @default(now())
-  submission   Submission  @relation(fields: [submissionId], references: [id], onDelete: Cascade)
-  author       User        @relation("FeedbackAuthor", fields: [authorId], references: [id], onDelete: Restrict)
-  mediaAsset   MediaAsset? @relation(fields: [mediaAssetId], references: [id], onDelete: SetNull)
+  createdAt    DateTime             @default(now())
+  submission   Submission           @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  author       User                 @relation("FeedbackAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+  mediaAsset   MediaAsset?          @relation(fields: [mediaAssetId], references: [id], onDelete: SetNull)
   attachments  FeedbackAttachment[]
 
   @@index([submissionId, createdAt])
@@ -689,22 +715,22 @@ model FeedbackAttachment {
 }
 
 model DiscussionThread {
-  id           String              @id @default(cuid())
-  studentId    String
-  curatorId    String?
-  moduleId     String?
-  assignmentId String?
-  title        String
-  status       DiscussionStatus    @default(NEW)
-  visibility   DiscussionVisibility @default(PRIVATE)
-  lastMessageAt DateTime           @default(now())
-  createdAt    DateTime             @default(now())
-  updatedAt    DateTime             @updatedAt
-  student      User                @relation("DiscussionStudentThreads", fields: [studentId], references: [id], onDelete: Cascade)
-  curator      User?               @relation("DiscussionCuratorThreads", fields: [curatorId], references: [id], onDelete: SetNull)
-  module       Module?             @relation(fields: [moduleId], references: [id], onDelete: SetNull)
-  assignment   Assignment?         @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
-  messages     DiscussionMessage[]
+  id            String               @id @default(cuid())
+  studentId     String
+  curatorId     String?
+  moduleId      String?
+  assignmentId  String?
+  title         String
+  status        DiscussionStatus     @default(NEW)
+  visibility    DiscussionVisibility @default(PRIVATE)
+  lastMessageAt DateTime             @default(now())
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+  student       User                 @relation("DiscussionStudentThreads", fields: [studentId], references: [id], onDelete: Cascade)
+  curator       User?                @relation("DiscussionCuratorThreads", fields: [curatorId], references: [id], onDelete: SetNull)
+  module        Module?              @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+  assignment    Assignment?          @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  messages      DiscussionMessage[]
 
   @@index([studentId, lastMessageAt])
   @@index([curatorId, status, lastMessageAt])
@@ -726,16 +752,16 @@ model DiscussionMessage {
 }
 
 model DiscussionAttachment {
-  id           String             @id @default(cuid())
+  id           String            @id @default(cuid())
   messageId    String
   fileId       String?
   sourceUrl    String?
   originalName String
   mimeType     String
   byteSize     Int
-  createdAt    DateTime           @default(now())
-  message      DiscussionMessage  @relation(fields: [messageId], references: [id], onDelete: Cascade)
-  file         StoredFile?        @relation(fields: [fileId], references: [id], onDelete: Restrict)
+  createdAt    DateTime          @default(now())
+  message      DiscussionMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  file         StoredFile?       @relation(fields: [fileId], references: [id], onDelete: Restrict)
 
   @@index([messageId, createdAt])
   @@index([fileId])

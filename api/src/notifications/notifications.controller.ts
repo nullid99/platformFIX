@@ -1,4 +1,4 @@
-import { Controller, Get, InternalServerErrorException, Param, Post, Req, UnauthorizedException, ForbiddenException } from "@nestjs/common";
+import { Body, Controller, Get, InternalServerErrorException, Param, Post, Put, Req, UnauthorizedException, ForbiddenException, BadRequestException } from "@nestjs/common";
 import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { notificationService } from "@/app/server/notifications/notification-service";
@@ -36,5 +36,17 @@ export class NotificationsController {
     const userId = await sessionUser(request);
     await notificationService.markAllRead(userId);
     return { data: { status: "READ" } };
+  }
+
+  /** The one global switch — see PlatformSettings in schema.prisma for why it isn't per-practicum. */
+  @Get("settings")
+  public async getSettings(@Req() request: RequestWithCookies) {
+    try { return { data: await notificationService.getGlobalSettings(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  @Put("settings")
+  public async updateSettings(@Req() request: RequestWithCookies, @Body() body: { notificationsEnabled?: unknown }) {
+    if (typeof body?.notificationsEnabled !== "boolean") throw new BadRequestException("notificationsEnabled must be a boolean");
+    try { return { data: await notificationService.updateGlobalSettings(await sessionUser(request), body.notificationsEnabled) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 }

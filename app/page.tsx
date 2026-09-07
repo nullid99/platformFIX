@@ -53,6 +53,7 @@ import { curatorDashboard, type CuratorNav, type ReviewQueueItem } from "./data/
 import { practicumModules, studentDashboard, type Assignment, type AssignmentStatus, type AssignmentTone, type DashboardNav, type PracticumModule, type PracticumSection, type ScheduleEvent, type StreamItem, type StreamKind } from "./data/student-dashboard";
 import { calculatePracticumProgress } from "./domain/progress";
 import { isDiscordUserId } from "./domain/discord";
+import { zonedTimeToUtc } from "./domain/schedule-time";
 import AuthPage from "./auth/page";
 
 // All browser requests use the same-origin Next.js proxy. This keeps private media
@@ -161,6 +162,15 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
   const [quality, setQuality] = useState<VideoQuality | "auto">("auto");
   const tokenRef = useRef(token);
   useEffect(() => { tokenRef.current = token; }, [token]);
+  // livekit-client's own attach() forces element.muted = (no audio track yet) every time it
+  // (re)builds the element's srcObject — see attachToElement() in livekit-client. That fires once
+  // per subscribed track (video, then audio, arrival order isn't guaranteed), so whichever one
+  // attaches once BOTH are present always snaps the element back to unmuted behind React's back —
+  // the mute button and the actual audio state silently disagree until the viewer happens to
+  // toggle it twice. Track the desired state in a ref (not a TrackSubscribed dependency, so the
+  // listener doesn't need to be re-registered on every toggle) and reassert it after each attach.
+  const mutedRef = useRef(muted);
+  useEffect(() => { mutedRef.current = muted; }, [muted]);
 
   useEffect(() => {
     const handleFullscreenChange = () => setFullscreen(document.fullscreenElement === fullscreenRef.current);
@@ -177,7 +187,12 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
     const room = new Room({ adaptiveStream: true, dynacast: true });
     room.on(RoomEvent.TrackSubscribed, (track, publication) => {
       if (track.kind === Track.Kind.Video) videoPublicationRef.current = publication;
-      if ((track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) && videoElRef.current) track.attach(videoElRef.current);
+      if ((track.kind === Track.Kind.Video || track.kind === Track.Kind.Audio) && videoElRef.current) {
+        track.attach(videoElRef.current);
+        // Undo attachToElement's own muted heuristic (see mutedRef comment above) so the element
+        // always matches what the mute button is actually showing.
+        videoElRef.current.muted = mutedRef.current;
+      }
     });
     void room.connect(LIVEKIT_URL, tokenRef.current).catch((error: unknown) => console.error("LiveKit connect failed", error));
     return () => { void room.disconnect(); };
@@ -186,6 +201,17 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
   const toggleFullscreen = () => {
     if (document.fullscreenElement) { void document.exitFullscreen(); return; }
     void fullscreenRef.current?.requestFullscreen();
+  };
+
+  // Separate from the one-shot "Включить звук" overlay above (which exists only to satisfy the
+  // browser's unmuted-autoplay gesture requirement) — this is the ongoing toggle a curator uses to
+  // mute their own broadcast's playback mid-stream (avoiding mic/speaker feedback) while still
+  // watching the video and reading chat, then unmute again without needing to reload anything.
+  const toggleMute = () => {
+    const video = videoElRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    setMuted(video.muted);
   };
 
   // "Авто" hands control back to adaptiveStream's own resize-driven quality selection; picking a
@@ -213,6 +239,7 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
           {QUALITY_OPTIONS.map((option) => <button type="button" key={option.label} role="menuitemradio" aria-checked={quality === option.value} className={quality === option.value ? "active" : ""} onClick={() => selectQuality(option.value)}>{option.label}</button>)}
         </div>}
       </div>
+      <button type="button" className="livekit-video-control-button" aria-label={muted ? "Включить звук" : "Выключить звук"} onClick={toggleMute}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
       <button type="button" className="livekit-video-control-button" aria-label={fullscreen ? "Свернуть" : "На весь экран"} onClick={toggleFullscreen}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
     </div>
   </>;
@@ -366,6 +393,7 @@ function relativeTimeFromNow(iso: string): string {
 
 type SessionProfile = {
   role: "STUDENT" | "CURATOR" | "OWNER";
+  workingPracticumId: string | null;
   profile: {
     email: string | null;
     emailVerifiedAt: string | null;
@@ -391,6 +419,7 @@ type CourseLessonMedia = {
   title: string | null;
   description: string | null;
   durationSec: number | null;
+  byteSize: number | null;
   position: number;
   publishedAt: string | null;
   embedUrl: string | null;
@@ -404,6 +433,7 @@ type CourseAssignmentSummary = {
   requirements: string[];
   allowedFormats: string[];
   deadline: string | null;
+  materials: NonNullable<Assignment["materials"]>;
 };
 
 type CourseApiModule = {
@@ -461,6 +491,14 @@ function formatDuration(seconds: number | null): string {
   return hours > 0 ? `${hours}:${minutes}:${remainingSeconds}` : `${minutes}:${remainingSeconds}`;
 }
 
+function formatFileSize(bytes: number | null): string {
+  if (!bytes || bytes < 1) return "";
+  const gb = bytes / 1_000_000_000;
+  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 0 : 1)} ГБ`;
+  const mb = bytes / 1_000_000;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} МБ`;
+}
+
 type NavItem = {
   label: AppNav;
   icon: typeof LayoutDashboard;
@@ -487,6 +525,7 @@ const curatorNavItems: NavItem[] = [
   { label: "Стримы", icon: Radio },
   { label: "Медиатека", icon: Play },
   { label: "Обсуждения", icon: MessageSquareText },
+  { label: "Команда", icon: ShieldCheck },
 ];
 
 // What each section is called in the address bar (`?tab=…`). Short Latin slugs instead of the
@@ -510,6 +549,7 @@ const NAV_SLUGS: Record<AppNav, string> = {
   "Стримы": "streams",
   "Медиатека": "media",
   "Обсуждения": "discussions",
+  "Команда": "team",
   "Профиль": "profile",
   "Обзор": "overview",
 };
@@ -537,6 +577,10 @@ function HomeContent() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [sessionProfile, setSessionProfile] = useState<SessionProfile | null>(null);
   const [role, setRole] = useState<UserRole>("student");
+  // Curator-only: which practicum's title to show next to the breadcrumb, so a curator never has
+  // to guess or remember where new content is actually landing — see PracticumManagerCard for the
+  // same "workingPracticumId set → that one, else the active one" resolution done server-side.
+  const [headerPracticums, setHeaderPracticums] = useState<PracticumSummary[]>([]);
   const [activeNav, setActiveNav] = useState<AppNav>("Мой практикум");
   // The sidebar tabs never changed the URL, so the browser's Back button had nothing of
   // ours to step through — it jumped straight past the whole app to whatever page the user
@@ -604,7 +648,15 @@ function HomeContent() {
   // "Обсуждения"/"Очередь проверки" badges above already use their own dedicated polls,
   // not the notification feed). Clearing happens on tab visit, same as "Задания" below.
   const unreadNotificationsByType = (type: AppNotification["type"]) => notifications.filter((notification) => notification.type === type && !notification.read).length;
-  const currentNavItems = (role === "student" ? navItems : curatorNavItems).map((item) => {
+  const isOwner = sessionProfile?.role === "OWNER";
+  // Same fallback as getWorkingPracticumId server-side: personal pick if set, else whichever
+  // practicum is active — so this always names where a curator's next click actually lands.
+  const headerPracticumTitle = role === "curator"
+    ? (headerPracticums.find((practicum) => practicum.id === sessionProfile?.workingPracticumId)
+      ?? headerPracticums.find((practicum) => practicum.isActive))?.title ?? null
+    : null;
+  const currentNavItems = (role === "student" ? navItems : curatorNavItems)
+    .map((item) => {
     if (item.label === "Обсуждения" && pendingDiscussionCount > 0) return { ...item, badge: String(pendingDiscussionCount) };
     if (item.label === "Очередь проверки" && pendingReviewCount > 0) return { ...item, badge: String(pendingReviewCount) };
     if (item.label === "Задания" && pendingRevisionCount > 0) return { ...item, badge: String(pendingRevisionCount) };
@@ -618,7 +670,11 @@ function HomeContent() {
   // for both roles now. It used to only replace the student fixture's name; the curator
   // side kept the static "Мария К." fixture regardless of who was actually logged in.
   const liveDisplayName = sessionProfile?.profile.displayName ?? sessionProfile?.profile.username ?? (role === "student" ? "Ученик" : "Куратор");
-  const viewerWatermarkLabel = sessionProfile
+  // Gated to actual STUDENT accounts (not the curator/owner "preview as student" view-mode
+  // toggle) — the watermark exists to trace a leaked recording back to a viewer, which only
+  // makes sense for students. Showing a curator their own email back at themselves just leaks
+  // it into whatever they're screen-recording (OBS, etc.) while hosting.
+  const viewerWatermarkLabel = sessionProfile && sessionProfile.role === "STUDENT"
     ? [liveDisplayName, sessionProfile.profile.email].filter(Boolean).join(" · ")
     : "";
   const currentProfile = role === "student"
@@ -691,6 +747,18 @@ function HomeContent() {
     }, 0);
     return () => window.clearTimeout(checkSession);
   }, []);
+
+  useEffect(() => {
+    if (!authenticated || role !== "curator") { setHeaderPracticums([]); return; }
+    let cancelled = false;
+    void fetch(`${API_ORIGIN}/api/course/practicums`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ data?: PracticumSummary[] }> : null)
+      .then((payload) => { if (!cancelled && payload?.data) setHeaderPracticums(payload.data); })
+      .catch(() => { /* breadcrumb just omits the poток name if this fails */ });
+    return () => { cancelled = true; };
+    // Re-fetches when workingPracticumId changes too — covers both switching (title already
+    // known) and creating a brand-new practicum (title not in the list yet until this refetch).
+  }, [authenticated, role, sessionProfile?.workingPracticumId]);
 
   useEffect(() => {
     if (!authenticated) return;
@@ -900,7 +968,7 @@ function HomeContent() {
       <section className="content-area">
         <header className="topbar">
           <button className="icon-button menu-button" aria-label="Открыть меню" onClick={() => setMenuOpen(true)}><Menu size={20} /></button>
-          <div className="breadcrumbs"><strong>{activeNav}</strong></div>
+          <div className="breadcrumbs"><strong>{activeNav}</strong>{headerPracticumTitle && <span className="breadcrumb-practicum">· {headerPracticumTitle}</span>}</div>
           <div className="topbar-actions">
             <div className="notification-wrap" ref={notificationWrapRef}>
               <button className="icon-button notification-button" aria-label="Уведомления" onClick={() => setShowNotifications((value) => !value)}>
@@ -936,7 +1004,7 @@ function HomeContent() {
         <div className={`page-content ${activeNav === "Мой практикум" ? "course-page-shell" : ""}`}>
           {activeNav === "Профиль" && sessionProfile && <ProfileView profile={sessionProfile.profile} name={currentProfile.name} initials={currentProfile.initials} role={role} onProfileUpdated={(profile) => setSessionProfile((current) => current ? { ...current, profile: { ...current.profile, ...profile } } : current)} onLogout={logout} />}
           {role === "student" && activeNav !== "Обзор" && activeNav !== "Профиль" && <SectionView activeNav={activeNav as DashboardNav} unlockedModuleIds={unlockedModuleIds} requestedAssignmentId={requestedAssignmentId} requestedDiscussionContext={requestedDiscussionContext} onNavigate={(nextNav) => setActiveNav(nextNav)} onOpenAssignment={(assignmentId) => { setRequestedAssignmentId(assignmentId); setActiveNav("Задания"); }} onOpenDiscussion={(context) => { setRequestedDiscussionContext(context); setActiveNav("Обсуждение"); }} onCloseDiscussionContext={() => setRequestedDiscussionContext(null)} />}
-          {role === "curator" && activeNav !== "Профиль" && <CuratorSectionView activeNav={activeNav as CuratorNav} requestedStudentId={requestedStudentId} isOwner={sessionProfile?.role === "OWNER"} onNavigate={(nextNav) => setActiveNav(nextNav)} />}
+          {role === "curator" && activeNav !== "Профиль" && <CuratorSectionView activeNav={activeNav as CuratorNav} requestedStudentId={requestedStudentId} isOwner={isOwner} workingPracticumId={sessionProfile?.workingPracticumId ?? null} onWorkingPracticumChange={(nextId) => setSessionProfile((current) => current ? { ...current, workingPracticumId: nextId } : current)} onNavigate={(nextNav) => setActiveNav(nextNav)} />}
           <div className={role === "student" && activeNav === "Обзор" ? "dashboard-view" : "dashboard-view is-hidden"}>
           <div className="welcome-row">
             <div>
@@ -997,6 +1065,7 @@ function ProfileView({ profile, name, initials, role, onProfileUpdated, onLogout
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [backtestBooking, setBacktestBooking] = useState<ScheduleEvent | null | undefined>(undefined);
+  const [preSessionBooking, setPreSessionBooking] = useState<ScheduleEvent | null | undefined>(undefined);
   const connectedIdentity = profile.identities.find((identity) => identity.provider === "DISCORD") ?? profile.identities[0];
 
   useEffect(() => {
@@ -1008,7 +1077,8 @@ function ProfileView({ profile, name, initials, role, onProfileUpdated, onLogout
       if (cancelled || !Array.isArray(payload.data)) return;
       const events = payload.data.map(scheduleApiToUi);
       setBacktestBooking(events.find((event) => event.type === "Бэктест" && event.isBookedByActor) ?? null);
-    }).catch(() => { if (!cancelled) setBacktestBooking(null); });
+      setPreSessionBooking(events.find((event) => event.type === "Пресессия" && event.isBookedByActor) ?? null);
+    }).catch(() => { if (!cancelled) { setBacktestBooking(null); setPreSessionBooking(null); } });
     return () => { cancelled = true; };
   }, [role]);
 
@@ -1110,6 +1180,24 @@ function ProfileView({ profile, name, initials, role, onProfileUpdated, onLogout
             <p className="profile-help">На весь практикум доступен один индивидуальный разбор бэктеста с куратором.</p>
           </section>
         )}
+
+        {role === "student" && preSessionBooking !== undefined && (
+          <section className="content-panel profile-card">
+            <div className="section-heading">
+              <div><span className="section-kicker">ИНДИВИДУАЛЬНЫЙ ЗВОНОК</span><h2>Пресессия с куратором</h2></div>
+              <Target size={19} className="profile-card-icon" />
+            </div>
+            <div className="identity-row">
+              <div className="identity-mark">{preSessionBooking ? "1" : "0"}</div>
+              <div className="identity-copy">
+                <strong>{preSessionBooking ? "1 из 1 использовано" : "0 из 1 использовано"}</strong>
+                <span>{preSessionBooking ? `Записан на ${formatEventDate(preSessionBooking.date)}, ${preSessionBooking.time}` : "Свободный слот можно выбрать в разделе «Расписание»."}</span>
+              </div>
+              <span className={`profile-status ${preSessionBooking ? "success" : ""}`}>{preSessionBooking ? "Забронировано" : "Не использован"}</span>
+            </div>
+            <p className="profile-help">На весь практикум доступна одна индивидуальная пресессия с куратором.</p>
+          </section>
+        )}
       </div>
 
       <div className="profile-actions"><button className="secondary-button" type="button" onClick={onLogout}>Выйти из аккаунта <ArrowUpRight size={16} /></button></div>
@@ -1162,7 +1250,17 @@ function SectionView({ activeNav, unlockedModuleIds, requestedAssignmentId, requ
   </div>;
 }
 
-function CuratorSectionView({ activeNav, requestedStudentId, isOwner, onNavigate }: { activeNav: CuratorNav; requestedStudentId: string; isOwner: boolean; onNavigate: (nextNav: CuratorNav) => void }) {
+function CuratorSectionView({ activeNav, requestedStudentId, isOwner, workingPracticumId, onWorkingPracticumChange, onNavigate }: { activeNav: CuratorNav; requestedStudentId: string; isOwner: boolean; workingPracticumId: string | null; onWorkingPracticumChange: (nextId: string | null) => void; onNavigate: (nextNav: CuratorNav) => void }) {
+  // Owner-only "просмотр архива": browse a non-active practicum's Программа/Медиатека/Расписание
+  // read-only, without ever touching which one is active — see PracticumManagerCard#onView and
+  // course-service.ts/schedule-service.ts's viewPracticumId option. Deliberately lives here (not
+  // lifted to HomeContent) so leaving the curator section at all — role toggle, logout — resets
+  // it; there's no reason a stale "viewing an old stream" flag should survive that.
+  const [viewingPracticum, setViewingPracticum] = useState<{ id: string; title: string } | null>(null);
+  const viewPracticum = (practicum: { id: string; title: string }) => {
+    setViewingPracticum(practicum);
+    onNavigate("Программа");
+  };
   const headings: Record<CuratorNav, { kicker: string; title: string; description: string }> = {
     "Кабинет куратора": { kicker: "РАБОЧИЙ ЦЕНТР", title: "Кабинет куратора", description: "Все работы, ученики и обратная связь по потоку собраны в одном рабочем контуре." },
     "Очередь проверки": { kicker: "ПРОВЕРКА ДЗ", title: "Очередь проверки", description: "" },
@@ -1174,11 +1272,15 @@ function CuratorSectionView({ activeNav, requestedStudentId, isOwner, onNavigate
     "Стримы": { kicker: "ЭФИРЫ ПОТОКА", title: "Стримы", description: "Ближайшие эфиры и записи, которые видят ученики этого потока." },
     "Медиатека": { kicker: "МАТЕРИАЛЫ", title: "Медиатека", description: "Записи эфиров и видеоразборы, привязанные к урокам и работам учеников." },
     "Обсуждения": { kicker: "ОБРАТНАЯ СВЯЗЬ", title: "Обсуждения", description: "Вопросы учеников, ответы куратора и контекст уроков собраны в одном рабочем inbox." },
+    "Команда": { kicker: "БЕЗОПАСНОСТЬ КОМАНДЫ", title: "Команда", description: "Устройства и входы кураторов — здесь же одобряется третье устройство, которое некому подтвердить со стороны ученика." },
   };
   const heading = headings[activeNav] ?? headings["Кабинет куратора"];
 
-  const headingClass = activeNav === "Обсуждения" ? "curator-discussion-page-heading" : activeNav === "Медиатека" ? "media-page-heading" : activeNav === "Расписание" ? "schedule-page-heading" : activeNav === "Стримы" ? "curator-streams-page-heading" : activeNav === "Кабинет куратора" ? "curator-dashboard-page-heading" : activeNav === "Очередь проверки" ? "curator-queue-page-heading" : activeNav === "Создать задание" ? "curator-create-page-heading" : activeNav === "Ученики" ? "curator-students-page-heading" : activeNav === "Приглашения" ? "curator-invite-page-heading" : activeNav === "Программа" ? "curator-program-page-heading" : "";
-  return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1>{heading.description && <p>{heading.description}</p>}</div></div>{activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} isOwner={isOwner} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView requestedStudentId={requestedStudentId} onInvite={() => onNavigate("Приглашения")} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} />} {activeNav === "Приглашения" && <CuratorInvitationsView />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && <CuratorPlaceholder title={heading.title} />}</div>;
+  const headingClass = activeNav === "Обсуждения" ? "curator-discussion-page-heading" : activeNav === "Медиатека" ? "media-page-heading" : activeNav === "Расписание" ? "schedule-page-heading" : activeNav === "Стримы" ? "curator-streams-page-heading" : activeNav === "Кабинет куратора" ? "curator-dashboard-page-heading" : activeNav === "Очередь проверки" ? "curator-queue-page-heading" : activeNav === "Создать задание" ? "curator-create-page-heading" : activeNav === "Ученики" ? "curator-students-page-heading" : activeNav === "Команда" ? "curator-students-page-heading" : activeNav === "Приглашения" ? "curator-invite-page-heading" : activeNav === "Программа" ? "curator-program-page-heading" : "";
+  const archivedNavs: CuratorNav[] = ["Программа", "Медиатека", "Расписание"];
+  return <div className="workspace-view learner-course-view"><div className={`workspace-view-heading ${headingClass}`}><div><span className="eyebrow"><Sparkles size={14} /> {heading.kicker}</span><h1>{heading.title}</h1>{heading.description && <p>{heading.description}</p>}</div></div>
+    {viewingPracticum && archivedNavs.includes(activeNav) && <div className="archive-view-banner"><div className="archive-view-banner-copy"><ShieldCheck size={16} /><span>Вы просматриваете архив: <strong>{viewingPracticum.title}</strong>. Новый урок, событие или приглашение отсюда не создать — это всегда уходит в ваш рабочий поток.</span></div><button className="secondary-button" type="button" onClick={() => setViewingPracticum(null)}>Закрыть просмотр</button></div>}
+    {activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} isOwner={isOwner} onViewPracticum={viewPracticum} workingPracticumId={workingPracticumId} onWorkingPracticumChange={onWorkingPracticumChange} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView requestedStudentId={requestedStudentId} onInvite={() => onNavigate("Приглашения")} isOwner={isOwner} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} viewingPracticumId={viewingPracticum?.id ?? null} />} {activeNav === "Приглашения" && <CuratorInvitationsView workingPracticumId={workingPracticumId} />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} viewingPracticumId={viewingPracticum?.id ?? null} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView viewingPracticumId={viewingPracticum?.id ?? null} />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav === "Команда" && <CuratorTeamView isOwner={isOwner} />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && activeNav !== "Команда" && <CuratorPlaceholder title={heading.title} />}</div>;
 }
 
 async function fetchReviewQueue(): Promise<ReviewQueueItem[]> {
@@ -1190,17 +1292,21 @@ async function fetchReviewQueue(): Promise<ReviewQueueItem[]> {
 
 type CuratorDiscussionStatus = "NEW" | "WAITING" | "ANSWERED" | "CLOSED";
 
+type CuratorDiscussionMessageAttachment = {
+  originalName: string;
+  mimeType: string;
+  contentUrl?: string;
+  sourceUrl?: string;
+  embedUrl?: string;
+};
+
 type CuratorDiscussionMessage = {
   id: string;
   author: "student" | "curator";
   name: string;
   time: string;
   body: string;
-  attachment?: string;
-  attachmentPreview?: string;
-  attachmentContentUrl?: string;
-  attachmentSourceUrl?: string;
-  attachmentEmbedUrl?: string;
+  attachments: CuratorDiscussionMessageAttachment[];
 };
 
 type CuratorDiscussion = {
@@ -1244,23 +1350,20 @@ function mapDiscussionApiThread(thread: DiscussionApiThread): CuratorDiscussion 
     assignment: thread.assignment?.title,
     status: mapDiscussionApiStatus(thread.status),
     updatedAt: thread.messages[thread.messages.length - 1]?.createdAt ? new Date(thread.messages[thread.messages.length - 1].createdAt).toLocaleString("ru-RU") : "только что",
-    messages: thread.messages.map((message) => {
-      const imageAttachment = message.attachments.find((attachment) => attachment.mimeType.startsWith("image/") && attachment.contentUrl);
-      const linkAttachment = message.attachments.find((attachment) => attachment.sourceUrl);
-      const firstAttachment = message.attachments[0];
-      return {
-        id: message.id,
-        author: message.authorRole === "STUDENT" ? "student" : "curator",
-        name: message.authorName ?? (message.authorRole === "STUDENT" ? "Ученик" : "Куратор"),
-        time: new Date(message.createdAt).toLocaleString("ru-RU"),
-        body: message.body,
-        attachment: firstAttachment?.originalName,
-        attachmentPreview: imageAttachment?.contentUrl ?? undefined,
-        attachmentContentUrl: firstAttachment?.contentUrl ?? undefined,
-        attachmentSourceUrl: linkAttachment?.sourceUrl ?? undefined,
-        attachmentEmbedUrl: linkAttachment?.sourceUrl ? assignmentMaterialEmbed(linkAttachment.sourceUrl) ?? undefined : undefined,
-      };
-    }),
+    messages: thread.messages.map((message) => ({
+      id: message.id,
+      author: message.authorRole === "STUDENT" ? "student" : "curator",
+      name: message.authorName ?? (message.authorRole === "STUDENT" ? "Ученик" : "Куратор"),
+      time: new Date(message.createdAt).toLocaleString("ru-RU"),
+      body: message.body,
+      attachments: message.attachments.map((attachment) => ({
+        originalName: attachment.originalName,
+        mimeType: attachment.mimeType,
+        contentUrl: attachment.contentUrl ?? undefined,
+        sourceUrl: attachment.sourceUrl ?? undefined,
+        embedUrl: attachment.sourceUrl ? assignmentMaterialEmbed(attachment.sourceUrl) ?? undefined : undefined,
+      })),
+    })),
   };
 }
 
@@ -1270,12 +1373,135 @@ function discussionBodyEmbedUrl(body: string): string | undefined {
 }
 
 function DiscussionMessageAttachments({ message }: { message: CuratorDiscussionMessage }) {
-  const embedUrl = message.attachmentEmbedUrl ?? discussionBodyEmbedUrl(message.body);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const lightboxPortalTarget = useLightboxPortalTarget(Boolean(lightboxUrl));
+  useEffect(() => {
+    if (!lightboxUrl) return;
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setLightboxUrl(null); };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [lightboxUrl]);
+
+  const imageAttachments = message.attachments.filter((attachment): attachment is CuratorDiscussionMessageAttachment & { contentUrl: string } => Boolean(attachment.contentUrl) && attachment.mimeType.startsWith("image/"));
+  const otherAttachments = message.attachments.filter((attachment) => !(attachment.contentUrl && attachment.mimeType.startsWith("image/")));
+  const attachmentEmbedUrl = message.attachments.find((attachment) => attachment.embedUrl)?.embedUrl;
+  const fallbackEmbedUrl = attachmentEmbedUrl ?? discussionBodyEmbedUrl(message.body);
+
   return <>
-    {message.attachmentPreview && <div className="discussion-message-image" role="group" aria-label={`Предпросмотр вложения ${message.attachment ?? "изображение"}`}><Image src={message.attachmentPreview} alt={message.attachment ?? "Вложенное изображение"} fill sizes="(max-width: 700px) 100vw, 640px" unoptimized /></div>}
-    {embedUrl && <div className="discussion-message-video"><iframe src={embedUrl} title="Видео в ответе куратора" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div>}
-    {message.attachmentSourceUrl && !embedUrl && <a className="discussion-message-link" href={message.attachmentSourceUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={15} /><span>Открыть ссылку на материал</span></a>}
-    {message.attachment && <div className="discussion-message-attachment"><FileCheck2 size={15} /><span>{message.attachment}</span><ArrowUpRight size={14} /></div>}
+    {imageAttachments.length > 0 && <div className="discussion-message-image-grid">{imageAttachments.map((attachment, index) => <button type="button" className="discussion-message-image" key={index} onClick={() => setLightboxUrl(attachment.contentUrl)} aria-label={`Открыть вложение ${attachment.originalName}`}><Image src={attachment.contentUrl} alt={attachment.originalName} fill sizes="140px" unoptimized /></button>)}</div>}
+    {otherAttachments.map((attachment, index) => {
+      if (attachment.sourceUrl) {
+        return <a className="discussion-message-link" key={index} href={attachment.sourceUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={15} /><span>Открыть ссылку на материал</span></a>;
+      }
+      return attachment.contentUrl
+        ? <a className="discussion-message-attachment" key={index} href={attachment.contentUrl} target="_blank" rel="noreferrer"><FileCheck2 size={15} /><span>{attachment.originalName}</span><ArrowUpRight size={14} /></a>
+        : <div className="discussion-message-attachment" key={index}><FileCheck2 size={15} /><span>{attachment.originalName}</span></div>;
+    })}
+    {fallbackEmbedUrl && <div className="discussion-message-video"><iframe src={fallbackEmbedUrl} title="Видео в ответе куратора" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div>}
+    {lightboxUrl && lightboxPortalTarget && createPortal(
+      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxUrl(null); }}>
+        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxUrl(null)}><X size={22} /></button>
+        <img className="chat-image-lightbox-image" src={lightboxUrl} alt="Просмотр изображения" />
+      </div>,
+      lightboxPortalTarget,
+    )}
+  </>;
+}
+
+type PendingDiscussionAttachment = { file: File; previewUrl: string; kind: "image" | "video" | "file" };
+type DiscussionAttachmentPayload = { fileId: string; originalName: string; mimeType: string; byteSize: number };
+const MAX_DISCUSSION_ATTACHMENTS = 5;
+
+// Shared across every multi-file attach point (discussion composers, assignment submission) —
+// all need the same select-many/preview/remove/upload behavior; only the surrounding JSX differs.
+function useDiscussionAttachments() {
+  const [attachments, setAttachments] = useState<PendingDiscussionAttachment[]>([]);
+  const [error, setError] = useState("");
+  const attachmentsRef = useRef<PendingDiscussionAttachment[]>([]);
+  useEffect(() => { attachmentsRef.current = attachments; }, [attachments]);
+  useEffect(() => () => { attachmentsRef.current.forEach((attachment) => URL.revokeObjectURL(attachment.previewUrl)); }, []);
+
+  const addFiles = (fileList: FileList | File[] | null | undefined) => {
+    if (!fileList) return;
+    const incoming = Array.from(fileList);
+    if (incoming.length === 0) return;
+    let nextError = "";
+    const accepted: PendingDiscussionAttachment[] = [];
+    for (const file of incoming) {
+      if (attachments.length + accepted.length >= MAX_DISCUSSION_ATTACHMENTS) { nextError = `Можно прикрепить не более ${MAX_DISCUSSION_ATTACHMENTS} файлов за раз.`; break; }
+      if (file.size > 10 * 1024 * 1024) { nextError = "Файл слишком большой. Максимальный размер — 10 МБ."; continue; }
+      accepted.push({ file, previewUrl: URL.createObjectURL(file), kind: file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "file" });
+    }
+    setError(nextError);
+    if (accepted.length) setAttachments((current) => [...current, ...accepted]);
+  };
+
+  const removeAt = (index: number) => {
+    setAttachments((current) => {
+      const target = current[index];
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return current.filter((_, itemIndex) => itemIndex !== index);
+    });
+  };
+
+  const clear = () => {
+    setAttachments((current) => {
+      current.forEach((attachment) => URL.revokeObjectURL(attachment.previewUrl));
+      return [];
+    });
+    setError("");
+  };
+
+  const uploadAll = async (): Promise<{ payload: DiscussionAttachmentPayload[]; uploadedFileIds: string[] }> => {
+    const payload: DiscussionAttachmentPayload[] = [];
+    const uploadedFileIds: string[] = [];
+    for (const attachment of attachments) {
+      const file = attachment.file;
+      const createResponse = await fetch(`${API_ORIGIN}/api/files`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalName: file.name, mimeType: file.type, byteSize: file.size }) });
+      const createPayload = await createResponse.json().catch(() => ({})) as { message?: string; data?: { id: string; uploadUrl: string } };
+      if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) {
+        for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
+        throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
+      }
+      uploadedFileIds.push(createPayload.data.id);
+      const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": file.type }, body: file });
+      if (!uploadResponse.ok) {
+        for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
+        throw new Error("Не удалось загрузить файл.");
+      }
+      payload.push({ fileId: createPayload.data.id, originalName: file.name, mimeType: file.type, byteSize: file.size });
+    }
+    return { payload, uploadedFileIds };
+  };
+
+  return { attachments, error, addFiles, removeAt, clear, uploadAll };
+}
+
+function DiscussionAttachmentPreviewList({ attachments, onRemove }: { attachments: PendingDiscussionAttachment[]; onRemove: (index: number) => void }) {
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const lightboxPortalTarget = useLightboxPortalTarget(Boolean(lightboxUrl));
+  useEffect(() => {
+    if (!lightboxUrl) return;
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setLightboxUrl(null); };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [lightboxUrl]);
+
+  if (attachments.length === 0) return null;
+  return <>
+    <div className="discussion-selected-preview-list">{attachments.map((attachment, index) => <div className="discussion-selected-preview" key={`${attachment.file.name}-${index}`}>
+      <button type="button" className="discussion-selected-remove" onClick={() => onRemove(index)} aria-label={`Убрать файл ${attachment.file.name}`}><X size={13} /></button>
+      {attachment.kind === "image" && <button type="button" className="discussion-selected-image" aria-label={`Увеличить фото ${attachment.file.name}`} onClick={() => setLightboxUrl(attachment.previewUrl)} style={{ backgroundImage: `url("${attachment.previewUrl}")` }} />}
+      {attachment.kind === "video" && <video src={attachment.previewUrl} controls playsInline preload="metadata" />}
+      {attachment.kind === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{attachment.file.name}</span></div>}
+    </div>)}</div>
+    {lightboxUrl && lightboxPortalTarget && createPortal(
+      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxUrl(null); }}>
+        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxUrl(null)}><X size={22} /></button>
+        <img className="chat-image-lightbox-image" src={lightboxUrl} alt="Просмотр изображения" />
+      </div>,
+      lightboxPortalTarget,
+    )}
   </>;
 }
 
@@ -1289,7 +1515,7 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
     status: "NEW",
     updatedAt: "18 минут назад",
     messages: [
-      { id: "discussion-1-message-1", author: "student", name: "Алексей К.", time: "Сегодня, 12:06", body: "Подскажите, правильно ли я отметил возврат в зону на графике? Не понимаю, где заканчивается реакция и начинается ложный пробой.", attachment: "EURUSD-уровни.png", attachmentPreview: "/market-logic-cover.webp" },
+      { id: "discussion-1-message-1", author: "student", name: "Алексей К.", time: "Сегодня, 12:06", body: "Подскажите, правильно ли я отметил возврат в зону на графике? Не понимаю, где заканчивается реакция и начинается ложный пробой.", attachments: [{ originalName: "EURUSD-уровни.png", mimeType: "image/png", contentUrl: "/market-logic-cover.webp" }] },
     ],
   },
   {
@@ -1302,8 +1528,8 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
     status: "WAITING",
     updatedAt: "вчера",
     messages: [
-      { id: "discussion-2-message-1", author: "student", name: "Мария К.", time: "Вчера, 17:42", body: "Я отправила работу повторно после комментария. Можно уточнить, нужно ли дополнительно описать сценарий отмены?" },
-      { id: "discussion-2-message-2", author: "curator", name: "Мария · куратор", time: "Вчера, 18:01", body: "Да, добавь один короткий пример отмены сценария и отправь новую попытку. Вопрос оставляю открытым до проверки." },
+      { id: "discussion-2-message-1", author: "student", name: "Мария К.", time: "Вчера, 17:42", body: "Я отправила работу повторно после комментария. Можно уточнить, нужно ли дополнительно описать сценарий отмены?", attachments: [] },
+      { id: "discussion-2-message-2", author: "curator", name: "Мария · куратор", time: "Вчера, 18:01", body: "Да, добавь один короткий пример отмены сценария и отправь новую попытку. Вопрос оставляю открытым до проверки.", attachments: [] },
     ],
   },
   {
@@ -1315,8 +1541,8 @@ const demoCuratorDiscussions: CuratorDiscussion[] = [
     status: "ANSWERED",
     updatedAt: "2 дня назад",
     messages: [
-      { id: "discussion-3-message-1", author: "student", name: "Елена С.", time: "2 дня назад, 15:20", body: "Прикрепляю разметку, которую хочу разобрать на завтрашнем стриме." , attachment: "разметка-сценария.pdf" },
-      { id: "discussion-3-message-2", author: "curator", name: "Мария · куратор", time: "2 дня назад, 15:45", body: "Получила. Добавлю этот пример в план разбора и отмечу его во время трансляции." },
+      { id: "discussion-3-message-1", author: "student", name: "Елена С.", time: "2 дня назад, 15:20", body: "Прикрепляю разметку, которую хочу разобрать на завтрашнем стриме." , attachments: [{ originalName: "разметка-сценария.pdf", mimeType: "application/pdf" }] },
+      { id: "discussion-3-message-2", author: "curator", name: "Мария · куратор", time: "2 дня назад, 15:45", body: "Получила. Добавлю этот пример в план разбора и отмечу его во время трансляции.", attachments: [] },
     ],
   },
 ];
@@ -1335,11 +1561,7 @@ function CuratorDiscussionsView() {
   const [reply, setReply] = useState("");
   const [replySaving, setReplySaving] = useState(false);
   const [replyError, setReplyError] = useState("");
-  const [replyAttachmentName, setReplyAttachmentName] = useState("");
-  const [replySelectedFile, setReplySelectedFile] = useState<File | null>(null);
-  const [replyAttachmentPreviewUrl, setReplyAttachmentPreviewUrl] = useState("");
-  const [replyAttachmentType, setReplyAttachmentType] = useState<"image" | "video" | "file" | "">("");
-  const [replyAttachmentError, setReplyAttachmentError] = useState("");
+  const replyAttachments = useDiscussionAttachments();
   // Derived only from real threads — the old seed also mixed in `defaultPracticumModules`
   // (static demo data), which drifts out of sync with the actual course structure and
   // cluttered the filter with modules that no longer exist.
@@ -1360,74 +1582,43 @@ function CuratorDiscussionsView() {
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => () => {
-    if (replyAttachmentPreviewUrl) URL.revokeObjectURL(replyAttachmentPreviewUrl);
-  }, [replyAttachmentPreviewUrl]);
-
-  const selectReplyAttachment = (file: File | undefined) => {
-    if (!file) return;
-    if (file.size > 10 * 1024 * 1024) {
-      setReplyAttachmentError("Файл слишком большой. Максимальный размер — 10 МБ.");
-      return;
-    }
-    setReplyAttachmentError("");
-    setReplyAttachmentName(file.name);
-    setReplySelectedFile(file);
-    setReplyAttachmentType(file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "file");
-    setReplyAttachmentPreviewUrl(URL.createObjectURL(file));
-  };
-
-  const clearReplyAttachment = () => {
-    setReplyAttachmentName("");
-    setReplySelectedFile(null);
-    setReplyAttachmentPreviewUrl("");
-    setReplyAttachmentType("");
-    setReplyAttachmentError("");
-  };
-
   const handleReplyPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const imageItem = Array.from(event.clipboardData.items).find((item) => item.type.startsWith("image/"));
-    if (!imageItem) return;
-    const file = imageItem.getAsFile();
-    if (!file) return;
+    const imageItems = Array.from(event.clipboardData.items).filter((item) => item.type.startsWith("image/"));
+    if (imageItems.length === 0) return;
     event.preventDefault();
-    const extension = imageItem.type.split("/")[1] || "png";
-    selectReplyAttachment(new File([file], `screenshot-${Date.now()}.${extension}`, { type: imageItem.type }));
+    const files = imageItems.map((item, index) => {
+      const file = item.getAsFile();
+      if (!file) return null;
+      const extension = item.type.split("/")[1] || "png";
+      return new File([file], `screenshot-${Date.now()}-${index}.${extension}`, { type: item.type });
+    }).filter((file): file is File => file !== null);
+    replyAttachments.addFiles(files);
   };
 
   const sendReply = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const body = reply.trim();
-    if ((!body && !replySelectedFile) || !selectedThread || replySaving) return;
+    if ((!body && replyAttachments.attachments.length === 0) || !selectedThread || replySaving) return;
     setReplySaving(true);
     setReplyError("");
-    let uploadedFileId = "";
+    let uploadedFileIds: string[] = [];
     try {
-      if (replySelectedFile) {
-        const createResponse = await fetch(`${API_ORIGIN}/api/files`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalName: replySelectedFile.name, mimeType: replySelectedFile.type, byteSize: replySelectedFile.size }) });
-        const createPayload = await createResponse.json().catch(() => ({})) as { message?: string; data?: { id: string; uploadUrl: string } };
-        if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
-        uploadedFileId = createPayload.data.id;
-        const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": replySelectedFile.type }, body: replySelectedFile });
-        if (!uploadResponse.ok) throw new Error("Не удалось загрузить файл.");
-      }
+      const uploaded = await replyAttachments.uploadAll();
+      uploadedFileIds = uploaded.uploadedFileIds;
       const response = await fetch(`${API_ORIGIN}/api/discussions/${selectedThread.id}/messages`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body, attachments: replySelectedFile && uploadedFileId ? [{ fileId: uploadedFileId, originalName: replySelectedFile.name, mimeType: replySelectedFile.type, byteSize: replySelectedFile.size }] : [] }),
+        body: JSON.stringify({ body, attachments: uploaded.payload }),
       });
       const payload = await response.json().catch(() => ({})) as { data?: DiscussionApiThread; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось сохранить ответ.");
       const nextThread = mapDiscussionApiThread(payload.data);
       setThreads((current) => current.map((thread) => thread.id === nextThread.id ? nextThread : thread));
       setReply("");
-      setReplyAttachmentName("");
-      setReplySelectedFile(null);
-      setReplyAttachmentPreviewUrl("");
-      setReplyAttachmentType("");
+      replyAttachments.clear();
     } catch (error: unknown) {
-      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
+      for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
       setReplyError(error instanceof Error ? error.message : "Не удалось сохранить ответ.");
     } finally {
       setReplySaving(false);
@@ -1457,13 +1648,13 @@ function CuratorDiscussionsView() {
         <div className="curator-discussion-module-cover" role="img" aria-label={`Обложка ${selectedThread.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(4,7,12,.94), rgba(4,7,12,.72)), url("${selectedThread.coverPath ?? discussionCoverForContext({ module: selectedThread.module })}")` }}><strong>{selectedThread.module}</strong></div>
         <div className="curator-discussion-context">{selectedThread.assignment && <span><FileCheck2 size={14} /> {selectedThread.assignment}</span>}<span><MessageSquareText size={14} /> Личная тема ученика</span></div>
         <div className="curator-discussion-messages">{selectedThread.messages.map((message) => <article className={`curator-discussion-message ${message.author}`} key={message.id}><div className="curator-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{message.body}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
-        <form className="curator-discussion-reply" onSubmit={sendReply}><label htmlFor="curator-discussion-reply">ОТВЕТ КУРАТОРА</label><div className="curator-discussion-input-wrap"><textarea id="curator-discussion-reply" value={reply} onChange={(event) => setReply(event.target.value)} onPaste={handleReplyPaste} placeholder="Напишите ответ…" rows={4} /><label className="discussion-reply-attach-button" htmlFor="curator-discussion-reply-attachment" title="Прикрепить файл" aria-label="Прикрепить файл"><Plus size={18} /><input id="curator-discussion-reply-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectReplyAttachment(event.target.files?.[0])} /></label></div>{replyAttachmentName && <div className="discussion-reply-attach-chip"><FileCheck2 size={14} /><span>{replyAttachmentName}</span><button type="button" onClick={clearReplyAttachment} aria-label="Убрать вложение"><X size={12} /></button></div>}{replyAttachmentError && <div className="file-error" role="alert">{replyAttachmentError}</div>}{replyAttachmentPreviewUrl && <div className="discussion-selected-preview">{replyAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${replyAttachmentName}`} style={{ backgroundImage: `url("${replyAttachmentPreviewUrl}")` }} />}{replyAttachmentType === "video" && <video src={replyAttachmentPreviewUrl} controls playsInline preload="metadata" />}{replyAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{replyAttachmentName}</span></div>}</div>}<div><span className="curator-discussion-draft-note"><FileCheck2 size={14} /> Ответ сохранится в истории этой темы</span><button className="primary-button" type="submit" disabled={(!reply.trim() && !replySelectedFile) || replySaving}>{replySaving ? "Сохраняем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div>{replyError && <div className="file-error" role="alert">{replyError}</div>}</form>
+        <form className="curator-discussion-reply" onSubmit={sendReply}><label htmlFor="curator-discussion-reply">ОТВЕТ КУРАТОРА</label><div className="curator-discussion-input-wrap"><textarea id="curator-discussion-reply" value={reply} onChange={(event) => setReply(event.target.value)} onPaste={handleReplyPaste} placeholder="Напишите ответ…" rows={4} /><label className="discussion-reply-attach-button" htmlFor="curator-discussion-reply-attachment" title="Прикрепить файлы" aria-label="Прикрепить файлы"><Plus size={18} /><input id="curator-discussion-reply-attachment" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { replyAttachments.addFiles(event.target.files); event.target.value = ""; }} /></label></div>{replyAttachments.error && <div className="file-error" role="alert">{replyAttachments.error}</div>}<DiscussionAttachmentPreviewList attachments={replyAttachments.attachments} onRemove={replyAttachments.removeAt} /><div><span className="curator-discussion-draft-note"><FileCheck2 size={14} /> Ответ сохранится в истории этой темы</span><button className="primary-button" type="submit" disabled={(!reply.trim() && replyAttachments.attachments.length === 0) || replySaving}>{replySaving ? "Сохраняем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div>{replyError && <div className="file-error" role="alert">{replyError}</div>}</form>
       </section> : <section className="content-panel curator-discussion-empty empty-state"><MessageSquareText size={22} /><strong>Выбери тему</strong><span>Справа появится история вопроса и форма ответа.</span></section>}
     </div>
   </div>;
 }
 
-function CuratorDashboardOverview({ onNavigate, isOwner }: { onNavigate: (nextNav: CuratorNav) => void; isOwner: boolean }) {
+function CuratorDashboardOverview({ onNavigate, isOwner, onViewPracticum, workingPracticumId, onWorkingPracticumChange }: { onNavigate: (nextNav: CuratorNav) => void; isOwner: boolean; onViewPracticum: (practicum: PracticumSummary) => void; workingPracticumId: string | null; onWorkingPracticumChange: (nextId: string | null) => void }) {
   const [localQueue, setLocalQueue] = useState<ReviewQueueItem[]>([]);
   const [studentCount, setStudentCount] = useState<number | null>(null);
   const [discussions, setDiscussions] = useState<CuratorDiscussion[]>([]);
@@ -1579,26 +1770,91 @@ function CuratorDashboardOverview({ onNavigate, isOwner }: { onNavigate: (nextNa
         <button className="support-card" type="button" onClick={() => onNavigate("Расписание")}><span className="support-card-label">Открыть расписание</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button>
       </section>
     </div>
-    {isOwner && <PracticumManagerCard />}
+    <NotificationSettingsCard />
+    <PracticumManagerCard onView={onViewPracticum} isOwner={isOwner} workingPracticumId={workingPracticumId} onWorkingPracticumChange={onWorkingPracticumChange} />
   </>;
+}
+
+/**
+ * One global switch (not per-practicum — see PlatformSettings in schema.prisma), for exactly one
+ * workflow: a curator migrating recordings off the LiveKit box between cohorts would otherwise
+ * spam students/curators with a burst of irrelevant new-content notifications. Invitations and
+ * email verification bypass this entirely (see email-service.ts) — those can't go dark just
+ * because a migration is in progress.
+ */
+function NotificationSettingsCard() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${API_ORIGIN}/api/notifications/settings`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ data?: { notificationsEnabled: boolean } }> : null)
+      .then((payload) => { if (!cancelled && payload?.data) setEnabled(payload.data.notificationsEnabled); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  const toggle = async () => {
+    if (enabled === null || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/notifications/settings`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notificationsEnabled: !enabled }),
+      });
+      const payload = await response.json().catch(() => ({})) as { data?: { notificationsEnabled: boolean }; message?: string };
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось сохранить настройку.");
+      setEnabled(payload.data.notificationsEnabled);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Не удалось сохранить настройку.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <section className="content-panel notification-settings-card">
+    <div className="notification-settings-head">
+      <div>
+        <h2>Уведомления ученикам и кураторам</h2>
+        <p className="section-heading-note">Колокольчик и письма о новых уроках, ДЗ, записях и обсуждениях. Выключите на время переноса записей между потоками — приглашения и подтверждение почты продолжат работать в любом случае.</p>
+      </div>
+      <button type="button" className={`notification-settings-switch ${enabled ? "on" : ""}`} role="switch" aria-checked={enabled ?? false} aria-label="Уведомления ученикам и кураторам" disabled={enabled === null || saving} onClick={() => void toggle()}>
+        <span className="notification-settings-switch-knob" />
+      </button>
+    </div>
+    <span className="notification-settings-status">{enabled === null ? "Загрузка…" : enabled ? "Включены" : "Выключены — новые уроки, ДЗ и записи никого не потревожат"}</span>
+    {error && <div className="file-error" role="alert">{error}</div>}
+  </section>;
 }
 
 type PracticumSummary = { id: string; title: string; description: string | null; isActive: boolean; createdAt: string };
 
 /**
- * Owner-only — lists every practicum (current and past) and lets the owner switch which one is
- * active, or start a brand-new one. Every curator-side "current practicum" resolver reads the
- * active flag live (see practicum-service.ts#getActivePracticumId), so switching here alone moves
- * all new lessons/streams/schedule/invitations — nothing else needs touching, and it's reversible
- * (switching back to an earlier practicum is just another click here, not a one-way door).
- * A finished practicum's own students keep seeing exactly what they always saw regardless of
- * which practicum is currently active.
+ * Lists every practicum (current and past) — visible to any curator. Two independent, decoupled
+ * things happen here:
+ *  - "Работать здесь" — a personal pick (User.workingPracticumId), available to any curator/owner.
+ *    Drives where THEIR new content (modules/schedule/media/invitations) gets created — see
+ *    practicum-service.ts#getWorkingPracticumId. Two staff members can point at different
+ *    practicums at once; switching is instant, no confirmation, fully reversible.
+ *  - "Назначить для эфиров" — owner-only, flips Practicum.isActive. Only affects live-streaming
+ *    targeting (LiveKit ingress, "Стримы") — unrelated to content creation, deliberately untouched
+ *    by this feature.
+ * "Просмотреть" (any curator) opens a non-working practicum's Программа/Медиатека/Расписание
+ * read-only — see PracticumManagerCard#onView and course-service.ts/schedule-service.ts's
+ * viewPracticumId option. A finished practicum's own students keep seeing exactly what they
+ * always saw, regardless of anyone's working pick or the live-stream target.
  */
-function PracticumManagerCard() {
+function PracticumManagerCard({ onView, isOwner, workingPracticumId, onWorkingPracticumChange }: { onView: (practicum: PracticumSummary) => void; isOwner: boolean; workingPracticumId: string | null; onWorkingPracticumChange: (nextId: string | null) => void }) {
   const [practicums, setPracticums] = useState<PracticumSummary[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [title, setTitle] = useState("");
   const [saving, setSaving] = useState(false);
+  const [switchingWorkId, setSwitchingWorkId] = useState("");
   const [notice, setNotice] = useState("");
 
   const loadPracticums = useCallback(async () => {
@@ -1616,15 +1872,16 @@ function PracticumManagerCard() {
   const startNewPracticum = async () => {
     const trimmed = title.trim();
     if (!trimmed || saving) return;
-    if (!window.confirm(`Начать новый поток «${trimmed}»? Текущий поток останется как есть и доступен своим ученикам — но все новые уроки, стримы, расписание и приглашения будут уходить уже в новый.`)) return;
+    if (!window.confirm(`Начать новый поток «${trimmed}»? Текущий поток останется как есть и доступен своим ученикам — но эфиры и ваш личный рабочий поток переключатся на новый.`)) return;
     setSaving(true);
     setNotice("");
     try {
       const response = await fetch(`${API_ORIGIN}/api/course/practicum`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: trimmed }) });
-      const payload = await response.json().catch(() => ({})) as { message?: string };
+      const payload = await response.json().catch(() => ({})) as { message?: string; data?: { id: string } };
       if (!response.ok) throw new Error(payload.message ?? "Не удалось начать новый поток.");
       setTitle("");
-      setNotice(`Новый поток «${trimmed}» запущен и стал активным.`);
+      setNotice(`Новый поток «${trimmed}» запущен.`);
+      if (payload.data?.id) onWorkingPracticumChange(payload.data.id);
       await loadPracticums();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Не удалось начать новый поток.");
@@ -1633,35 +1890,57 @@ function PracticumManagerCard() {
     }
   };
 
-  const switchTo = async (practicum: PracticumSummary) => {
+  const switchActiveTo = async (practicum: PracticumSummary) => {
     if (saving) return;
-    if (!window.confirm(`Сделать активным поток «${practicum.title}»? Новые уроки, стримы, расписание и приглашения начнут уходить в него.`)) return;
+    if (!window.confirm(`Назначить поток «${practicum.title}» целью для эфиров? Не влияет на то, где кто-то из кураторов создаёт контент — только на «Стримы».`)) return;
     setSaving(true);
     setNotice("");
     try {
       const response = await fetch(`${API_ORIGIN}/api/course/practicums/${practicum.id}/activate`, { method: "POST", credentials: "include" });
       const payload = await response.json().catch(() => ({})) as { message?: string };
-      if (!response.ok) throw new Error(payload.message ?? "Не удалось переключить поток.");
-      setNotice(`Активным стал поток «${practicum.title}».`);
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось переключить поток для эфиров.");
+      setNotice(`Для эфиров назначен поток «${practicum.title}».`);
       await loadPracticums();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Не удалось переключить поток.");
+      setNotice(error instanceof Error ? error.message : "Не удалось переключить поток для эфиров.");
     } finally {
       setSaving(false);
     }
   };
 
+  const workHere = async (practicum: PracticumSummary) => {
+    if (switchingWorkId) return;
+    setSwitchingWorkId(practicum.id);
+    setNotice("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/course/working-practicum`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ practicumId: practicum.id }) });
+      const payload = await response.json().catch(() => ({})) as { message?: string };
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось переключить рабочий поток.");
+      onWorkingPracticumChange(practicum.id);
+      setNotice(`Теперь вы создаёте контент в потоке «${practicum.title}».`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Не удалось переключить рабочий поток.");
+    } finally {
+      setSwitchingWorkId("");
+    }
+  };
+
   return <section className="content-panel curator-dashboard-widget">
-    <div className="section-heading"><div><h2>Потоки</h2><p className="section-heading-note">Новые уроки, стримы, расписание и приглашения всегда уходят в активный поток. Переключение обратимо — данные не удаляются и не двигаются.</p></div></div>
+    <div className="section-heading"><div><h2>Потоки</h2><p className="section-heading-note">Новый урок, событие, медиа и приглашение по умолчанию уходят в ваш личный рабочий поток — у каждого куратора он может быть свой. Отдельно, только для эфиров, поток назначает владелец.</p></div></div>
     {loaded && practicums.length > 0 && <div className="curator-dashboard-widget-list">
-      {practicums.map((practicum) => <div className="curator-dashboard-widget-row" key={practicum.id}>
+      {practicums.map((practicum) => { const isMine = workingPracticumId ? practicum.id === workingPracticumId : practicum.isActive; return <div className="curator-dashboard-widget-row" key={practicum.id}>
         <div className="curator-dashboard-widget-copy"><strong>{practicum.title}</strong><span>{new Date(practicum.createdAt).toLocaleDateString("ru-RU")}</span></div>
-        {practicum.isActive
-          ? <span className="assignment-badge green">Активен</span>
-          : <button className="secondary-button" type="button" disabled={saving} onClick={() => void switchTo(practicum)}>Сделать активным</button>}
-      </div>)}
+        <div className="curator-dashboard-widget-row-actions">
+          {practicum.isActive && <span className="assignment-badge green">Эфиры здесь</span>}
+          {isMine
+            ? <span className="assignment-badge blue">Вы здесь работаете</span>
+            : <button className="secondary-button" type="button" disabled={switchingWorkId === practicum.id} onClick={() => void workHere(practicum)}>Работать здесь</button>}
+          {!isMine && <button className="secondary-button" type="button" onClick={() => onView(practicum)}>Просмотреть</button>}
+          {isOwner && !practicum.isActive && <button className="secondary-button" type="button" disabled={saving} onClick={() => void switchActiveTo(practicum)}>Назначить для эфиров</button>}
+        </div>
+      </div>; })}
     </div>}
-    <div className="media-editor-body">
+    {isOwner && <div className="media-editor-body">
       <div className="media-editor-fields">
         <label className="form-field"><span>Название нового потока</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Поток 05 · Октябрь" /></label>
       </div>
@@ -1669,7 +1948,8 @@ function PracticumManagerCard() {
         <button className="primary-button" type="button" disabled={!title.trim() || saving} onClick={() => void startNewPracticum()}>{saving ? "Сохраняем…" : "Начать новый поток"} <ChevronRight size={16} /></button>
         {notice && <span className="form-action-feedback"><Target size={16} /> {notice}</span>}
       </div>
-    </div>
+    </div>}
+    {!isOwner && notice && <div className="media-editor-body"><span className="form-action-feedback"><Target size={16} /> {notice}</span></div>}
   </section>;
 }
 
@@ -1794,20 +2074,21 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
   const [checkedCriteria, setCheckedCriteria] = useState<boolean[]>(() => (item.requirements ?? []).map(() => false));
   const [previewFile, setPreviewFile] = useState<NonNullable<ReviewQueueItem["attachmentFiles"]>[number] | null>(null);
   const [zoomImageUrl, setZoomImageUrl] = useState("");
+  const [openAttemptNumber, setOpenAttemptNumber] = useState<number | null>(null);
   useEffect(() => {
-    if (!zoomImageUrl) return;
-    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setZoomImageUrl(""); };
+    if (!zoomImageUrl && openAttemptNumber === null) return;
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") { setZoomImageUrl(""); setOpenAttemptNumber(null); } };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [zoomImageUrl]);
-  const [feedbackAttachmentName, setFeedbackAttachmentName] = useState("");
-  const [feedbackSelectedFile, setFeedbackSelectedFile] = useState<File | null>(null);
-  const [feedbackAttachmentPreviewUrl, setFeedbackAttachmentPreviewUrl] = useState("");
-  const [feedbackAttachmentType, setFeedbackAttachmentType] = useState<"image" | "video" | "file" | "">("");
-  const [feedbackAttachmentError, setFeedbackAttachmentError] = useState("");
+  }, [zoomImageUrl, openAttemptNumber]);
+  // Same hook the discussion composer uses — supports several files at once (see
+  // DiscussionAttachmentPreviewList below), unlike the old single-File state this replaced, which
+  // silently dropped the first photo whenever a curator attached a second one.
+  const feedbackAttachments = useDiscussionAttachments();
   const files = item.attachmentFiles ?? [];
   const currentAttemptNumber = Number.parseInt(item.attempt.replace(/\D/g, ""), 10) || 1;
-  const attemptHistory = item.attemptHistory?.length ? item.attemptHistory : [{ attempt: currentAttemptNumber, status: item.status, submittedAt: item.submittedAt }];
+  const attemptHistory = item.attemptHistory?.length ? item.attemptHistory : [{ attempt: currentAttemptNumber, status: item.status, submittedAt: item.submittedAt, answerText: item.answer, files, feedback: [] }];
+  const openAttempt = attemptHistory.find((attempt) => attempt.attempt === openAttemptNumber) ?? null;
 
   // NEEDS_REVISION/ACCEPTED submissions carry a reviewerId too (the curator who last decided
   // them), but there's nothing to decide right now — NEEDS_REVISION is waiting on the student
@@ -1817,31 +2098,17 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
   const canDecide = Boolean(item.reviewerId) && item.isReviewerSelf !== false && item.status === "На проверке";
   const awaitingResubmission = item.status === "Нужна доработка" && item.isReviewerSelf !== false;
 
-  useEffect(() => () => {
-    if (feedbackAttachmentPreviewUrl) URL.revokeObjectURL(feedbackAttachmentPreviewUrl);
-  }, [feedbackAttachmentPreviewUrl]);
-
-  const selectFeedbackAttachment = (file: File | undefined) => {
-    if (!file) return;
-    if (file.size > 10 * 1024 * 1024) {
-      setFeedbackAttachmentError("Файл слишком большой. Максимальный размер — 10 МБ.");
-      return;
-    }
-    setFeedbackAttachmentError("");
-    setFeedbackAttachmentName(file.name);
-    setFeedbackSelectedFile(file);
-    setFeedbackAttachmentType(file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "file");
-    setFeedbackAttachmentPreviewUrl(URL.createObjectURL(file));
-  };
-
   const handleFeedbackPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const imageItem = Array.from(event.clipboardData.items).find((entry) => entry.type.startsWith("image/"));
-    if (!imageItem) return;
-    const file = imageItem.getAsFile();
-    if (!file) return;
+    const imageItems = Array.from(event.clipboardData.items).filter((entry) => entry.type.startsWith("image/"));
+    if (imageItems.length === 0) return;
     event.preventDefault();
-    const extension = imageItem.type.split("/")[1] || "png";
-    selectFeedbackAttachment(new File([file], `screenshot-${Date.now()}.${extension}`, { type: imageItem.type }));
+    const files = imageItems.map((item, index) => {
+      const file = item.getAsFile();
+      if (!file) return null;
+      const extension = item.type.split("/")[1] || "png";
+      return new File([file], `screenshot-${Date.now()}-${index}.${extension}`, { type: item.type });
+    }).filter((file): file is File => file !== null);
+    feedbackAttachments.addFiles(files);
   };
 
   const submitDecision = async (nextDecision: "accepted" | "revision") => {
@@ -1852,16 +2119,10 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
     if (!canDecide) return;
     setDecisionError("");
     const checkedRequirements = (item.requirements ?? []).filter((_, index) => checkedCriteria[index]);
-    let uploadedFileId = "";
+    let uploadedFileIds: string[] = [];
     try {
-      if (feedbackSelectedFile) {
-        const createResponse = await fetch(`${API_ORIGIN}/api/files`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalName: feedbackSelectedFile.name, mimeType: feedbackSelectedFile.type, byteSize: feedbackSelectedFile.size }) });
-        const createPayload = await createResponse.json().catch(() => ({})) as { message?: string; data?: { id: string; uploadUrl: string } };
-        if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
-        uploadedFileId = createPayload.data.id;
-        const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": feedbackSelectedFile.type }, body: feedbackSelectedFile });
-        if (!uploadResponse.ok) throw new Error("Не удалось загрузить файл.");
-      }
+      const uploaded = await feedbackAttachments.uploadAll();
+      uploadedFileIds = uploaded.uploadedFileIds;
       const response = await fetch(`${API_ORIGIN}/api/review/submissions/${item.id}`, {
         method: "PATCH",
         credentials: "include",
@@ -1870,14 +2131,16 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
           decision: nextDecision,
           feedback: feedback.trim() || undefined,
           checkedRequirements: checkedRequirements.length > 0 ? checkedRequirements : undefined,
-          attachment: feedbackSelectedFile && uploadedFileId ? { fileId: uploadedFileId, originalName: feedbackSelectedFile.name, mimeType: feedbackSelectedFile.type, byteSize: feedbackSelectedFile.size } : undefined,
+          attachments: uploaded.payload.length > 0 ? uploaded.payload : undefined,
         }),
       });
       const payload = await response.json() as { message?: string };
       if (!response.ok) throw new Error(payload.message ?? "Не удалось сохранить решение.");
+      setFeedback("");
+      feedbackAttachments.clear();
       window.dispatchEvent(new Event(assignmentSubmittedEvent));
     } catch (error) {
-      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
+      for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
       setDecisionError(error instanceof Error ? error.message : "Не удалось сохранить решение.");
     }
   };
@@ -1937,10 +2200,20 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
           <button type="button" className="submission-file" onClick={() => file.type.startsWith("image/") ? setZoomImageUrl(`${API_ORIGIN}${file.url}`) : setPreviewFile(file)}><FileCheck2 size={16} /><span>{file.name}</span><Maximize2 size={14} /></button>
         </div>) : <div className="submission-legacy-file"><FileCheck2 size={16} /><div><strong>{[...new Set(item.attachments)].join(", ")}</strong><span>Это вложение сохранено до подключения защищённого хранилища. Попросите ученика отправить работу повторно.</span></div></div>}
       </div><p className="attachment-preview-note">Предпросмотр открыт внутри платформы и доступен только участникам этой проверки.</p></div>}
-        <div className="submission-section review-history-section"><div className="review-section-heading"><span className="detail-label">ИСТОРИЯ ПОПЫТОК</span></div><div className="attempt-history">{attemptHistory.map((attempt) => { const isCurrent = attempt.attempt === currentAttemptNumber; const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted"; const statusLabel = attempt.status === "На проверке" ? "Отправлено на проверку" : attempt.status; return <div key={attempt.attempt}><span className={`attempt-dot ${dotTone}`} /><div><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><small>{attempt.submittedAt} · {statusLabel}</small></div></div>; })}</div></div>
-      <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ВАШ ОТВЕТ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} onPaste={handleFeedbackPaste} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : awaitingResubmission ? "Ждём доработку от ученика — как только он отправит новую попытку, здесь снова будет можно оставить ответ." : "Напиши, что получилось и что нужно поправить… Скриншот можно вставить через Ctrl+V"} rows={4} disabled={item.status === "Принято" || !canDecide} />{item.status !== "Принято" && canDecide && <label className={`discussion-attachment-picker ${feedbackAttachmentName ? "has-file" : ""}`} htmlFor="curator-feedback-attachment"><FileCheck2 size={17} /><span>{feedbackAttachmentName || "Прикрепить скриншот или файл"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V</small><input id="curator-feedback-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectFeedbackAttachment(event.target.files?.[0])} /></label>}{feedbackAttachmentError && <div className="file-error" role="alert">{feedbackAttachmentError}</div>}{feedbackAttachmentPreviewUrl && <div className="discussion-selected-preview">{feedbackAttachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${feedbackAttachmentName}`} style={{ backgroundImage: `url("${feedbackAttachmentPreviewUrl}")` }} />}{feedbackAttachmentType === "video" && <video src={feedbackAttachmentPreviewUrl} controls playsInline preload="metadata" />}{feedbackAttachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{feedbackAttachmentName}</span></div>}</div>}{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}{awaitingResubmission && <div className="detail-feedback curator-decision"><Clock3 size={17} /><div><strong>Ждём доработку от ученика</strong><p>Вы уже отправили эту попытку на доработку. Как только ученик пришлёт новую, работа снова появится здесь для проверки.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
+        <div className="submission-section review-history-section"><div className="review-section-heading"><span className="detail-label">ИСТОРИЯ ПОПЫТОК</span></div><div className="attempt-history">{attemptHistory.map((attempt) => { const isCurrent = attempt.attempt === currentAttemptNumber; const dotTone = attempt.status === "Принято" ? "done" : isCurrent ? "current" : "muted"; const statusLabel = attempt.status === "На проверке" ? "Отправлено на проверку" : attempt.status; return <button type="button" className="attempt-history-row" key={attempt.attempt} onClick={() => setOpenAttemptNumber(attempt.attempt)}><span className={`attempt-dot ${dotTone}`} /><div><strong>Попытка {attempt.attempt}{isCurrent ? " · текущая" : ""}</strong><small>{attempt.submittedAt} · {statusLabel}</small></div><ChevronRight size={15} /></button>; })}</div></div>
+      <div className="curator-feedback"><label className="detail-label" htmlFor="curator-feedback">ВАШ ОТВЕТ</label><textarea id="curator-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} onPaste={handleFeedbackPaste} placeholder={item.status === "Принято" ? "Работа уже принята — история проверки доступна выше." : awaitingResubmission ? "Ждём доработку от ученика — как только он отправит новую попытку, здесь снова будет можно оставить ответ." : "Напиши, что получилось и что нужно поправить… Скриншот можно вставить через Ctrl+V"} rows={4} disabled={item.status === "Принято" || !canDecide} />{item.status !== "Принято" && canDecide && <label className={`discussion-attachment-picker ${feedbackAttachments.attachments.length > 0 ? "has-file" : ""}`} htmlFor="curator-feedback-attachment"><FileCheck2 size={17} /><span>{feedbackAttachments.attachments.length > 0 ? `Прикреплено файлов: ${feedbackAttachments.attachments.length}` : "Прикрепить скриншот или файл"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ за файл · можно прикрепить сразу несколько, или вставить скриншот через Ctrl+V</small><input id="curator-feedback-attachment" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { feedbackAttachments.addFiles(event.target.files); event.target.value = ""; }} /></label>}{feedbackAttachments.error && <div className="file-error" role="alert">{feedbackAttachments.error}</div>}<DiscussionAttachmentPreviewList attachments={feedbackAttachments.attachments} onRemove={feedbackAttachments.removeAt} />{decisionError && <div className="file-error" role="alert">{decisionError}</div>}{item.status === "Принято" && <div className="detail-feedback curator-decision"><CheckCircle2 size={17} /><div><strong>Работа уже принята</strong><p>Повторная попытка для этого задания не создаётся. Все предыдущие ответы и комментарии сохранены в истории ученика.</p></div></div>}{awaitingResubmission && <div className="detail-feedback curator-decision"><Clock3 size={17} /><div><strong>Ждём доработку от ученика</strong><p>Вы уже отправили эту попытку на доработку. Как только ученик пришлёт новую, работа снова появится здесь для проверки.</p></div></div>}<div className="curator-actions"><button className="secondary-button" disabled={item.status === "Принято" || !canDecide || !feedback.trim()} onClick={() => void submitDecision("revision")}>Вернуть на доработку</button><button className="primary-button" disabled={item.status === "Принято" || !canDecide} onClick={() => void submitDecision("accepted")}>Принять работу <ChevronRight size={16} /></button></div></div>
     </div>
     {previewFile && <div className="attachment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Просмотр файла ${previewFile.name}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewFile(null); }}><div className="attachment-modal"><div className="video-modal-head"><strong>{previewFile.name}</strong><button className="icon-button" aria-label="Закрыть просмотр" onClick={() => setPreviewFile(null)}><X size={18} /></button></div>{previewFile.type.startsWith("video/") && <video src={`${API_ORIGIN}${previewFile.url}`} controls autoPlay playsInline />}{previewFile.type === "application/pdf" && <iframe src={`${API_ORIGIN}${previewFile.url}`} title={previewFile.name} />}</div></div>}
+    {openAttempt && <div className="attachment-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Попытка ${openAttempt.attempt}`} onMouseDown={(event) => { if (event.currentTarget === event.target) setOpenAttemptNumber(null); }}><div className="attachment-modal attempt-detail-modal">
+      <div className="video-modal-head"><strong>Попытка {openAttempt.attempt}</strong><button className="icon-button" aria-label="Закрыть" onClick={() => setOpenAttemptNumber(null)}><X size={18} /></button></div>
+      <div className="submission-section submission-answer-section"><span className="detail-label">ОТВЕТ УЧЕНИКА</span><p className="submission-answer">{openAttempt.answerText || "Ответ отправлен без файла."}</p></div>
+      {openAttempt.files.length > 0 && <div className="submission-section"><span className="detail-label">ВЛОЖЕНИЯ</span><div className="submission-files">{openAttempt.files.map((file) => <div className="submission-file-card has-preview" key={file.id}>
+        {file.type.startsWith("image/") && <button type="button" className="submission-image-preview submission-image-preview-button" aria-label={`Увеличить изображение ${file.name}`} onClick={() => setZoomImageUrl(`${API_ORIGIN}${file.url}`)}><Image src={`${API_ORIGIN}${file.url}`} alt={`Предпросмотр вложения ${file.name}`} fill sizes="(max-width: 700px) 100vw, 720px" unoptimized /><span className="submission-image-preview-zoom-hint"><Maximize2 size={13} /> Увеличить</span></button>}
+        {file.type.startsWith("video/") && <video src={`${API_ORIGIN}${file.url}`} controls preload="metadata" />}
+        <button type="button" className="submission-file" onClick={() => file.type.startsWith("image/") ? setZoomImageUrl(`${API_ORIGIN}${file.url}`) : setPreviewFile(file)}><FileCheck2 size={16} /><span>{file.name}</span><Maximize2 size={14} /></button>
+      </div>)}</div></div>}
+      {openAttempt.feedback.length > 0 && <div className="submission-section"><span className="detail-label">ОТВЕТ КУРАТОРА</span>{openAttempt.feedback.map((entry) => <div className="attempt-detail-feedback-entry" key={entry.id}>{entry.text && <p className="submission-answer">{entry.text}</p>}{entry.attachments.map((attachment) => attachment.mimeType.startsWith("image/") ? <button type="button" key={attachment.id} className="assignment-history-feedback-image assignment-history-feedback-image-button" aria-label={`Увеличить изображение ${attachment.originalName}`} onClick={() => setZoomImageUrl(`${API_ORIGIN}${attachment.url}`)}><Image src={`${API_ORIGIN}${attachment.url}`} alt={attachment.originalName} fill sizes="320px" unoptimized /></button> : <a key={attachment.id} className="submission-file" href={`${API_ORIGIN}${attachment.url}`} target="_blank" rel="noreferrer"><FileCheck2 size={14} /><span>{attachment.originalName}</span><ArrowUpRight size={12} /></a>)}<small className="attempt-detail-feedback-date">{new Date(entry.createdAt).toLocaleString("ru-RU")}</small></div>)}</div>}
+    </div></div>}
     {zoomImageUrl && typeof document !== "undefined" && createPortal(
       <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
         <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
@@ -1960,15 +2233,10 @@ type StudentDirectoryRecord = {
   activeSessionCount: number;
   loginEventCount: number;
   submissionCount: number;
-  assignedCurator: { id: string; name: string } | null;
-  isAssignedToActor: boolean;
-  canClaim: boolean;
-  canTransfer: boolean;
+  practicum: { id: string; title: string } | null;
   canViewDetails: boolean;
   lastSession: { lastActiveAt: string; deviceName: string | null; ipAddress: string | null; countryCode?: string | null; city: string | null } | null;
 };
-
-type CuratorDirectoryRecord = { id: string; name: string; email: string | null };
 
 function formatRegion(city: string | null | undefined, countryCode: string | null | undefined): string {
   const parts = [city, countryCode].filter((part): part is string => Boolean(part && part.trim()));
@@ -1986,18 +2254,41 @@ function formatLoginEventReason(reasonCode: string | null): string | null {
   return reasonCode ? `Причина: ${reasonCode}` : null;
 }
 
-function CuratorStudentsView({ onInvite, requestedStudentId = "" }: { onInvite: () => void; requestedStudentId?: string }) {
+function CuratorStudentsView({ onInvite, requestedStudentId = "", isOwner = false }: { onInvite: () => void; requestedStudentId?: string; isOwner?: boolean }) {
   const [students, setStudents] = useState<StudentDirectoryRecord[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [claimingStudentId, setClaimingStudentId] = useState("");
+  const [practicums, setPracticums] = useState<PracticumSummary[]>([]);
+  // "" means "Все потоки" (every student ever enrolled, incl. old cohorts — the historical
+  // behaviour, kept so a former student who reaches out can still be found). Defaults to the
+  // active practicum once the list loads, so the roster reads as "current cohort" out of the box.
+  const [practicumFilter, setPracticumFilter] = useState("");
+  const [practicumFilterTouched, setPracticumFilterTouched] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`${API_ORIGIN}/api/course/practicums`, { credentials: "include", cache: "no-store" });
+        const payload = await response.json().catch(() => ({})) as { data?: PracticumSummary[] };
+        if (!cancelled && response.ok && Array.isArray(payload.data)) {
+          setPracticums(payload.data);
+          if (!practicumFilterTouched) setPracticumFilter(payload.data.find((practicum) => practicum.isActive)?.id ?? "");
+        }
+      } catch { /* filter just stays on "Все потоки" if this fails */ }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     const loadStudents = async () => {
+      setLoading(true);
       try {
-        const response = await fetch(`${API_ORIGIN}/api/security/students`, { credentials: "include", cache: "no-store", signal: controller.signal });
+        const query = practicumFilter ? `?practicumId=${encodeURIComponent(practicumFilter)}` : "";
+        const response = await fetch(`${API_ORIGIN}/api/security/students${query}`, { credentials: "include", cache: "no-store", signal: controller.signal });
         if (!response.ok) throw new Error(response.status === 403 ? "Нет прав для просмотра списка учеников." : "Не удалось загрузить список учеников.");
         const payload = await response.json() as { data: StudentDirectoryRecord[] };
         setStudents(payload.data);
@@ -2011,111 +2302,37 @@ function CuratorStudentsView({ onInvite, requestedStudentId = "" }: { onInvite: 
     };
     void loadStudents();
     return () => controller.abort();
-  }, [requestedStudentId]);
+  }, [requestedStudentId, practicumFilter]);
 
   const selectedStudent = students.find((student) => student.id === selectedId) ?? students[0];
   const activeSessions = students.reduce((total, student) => total + student.activeSessionCount, 0);
   const submissions = students.reduce((total, student) => total + student.submissionCount, 0);
 
-  const claimStudent = async (studentId: string) => {
-    if (claimingStudentId) return;
-    setClaimingStudentId(studentId);
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/security/students/${studentId}/claim`, {
-        method: "POST",
-        credentials: "include",
-      });
-      const payload = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(payload.message ?? "Не удалось закрепить ученика.");
-
-      const refreshed = await fetch(`${API_ORIGIN}/api/security/students`, { credentials: "include", cache: "no-store" });
-      const refreshedPayload = await refreshed.json() as { data?: StudentDirectoryRecord[]; message?: string };
-      if (!refreshed.ok || !Array.isArray(refreshedPayload.data)) {
-        throw new Error(refreshedPayload.message ?? "Ученик закреплён, но список не удалось обновить.");
-      }
-      setStudents(refreshedPayload.data);
-    } finally {
-      setClaimingStudentId("");
-    }
+  // Deletion is permanent (see the confirm dialog in StudentDirectoryDetailContent) — once it
+  // succeeds server-side, just drop them from local state rather than refetching the whole list.
+  const handleDeleted = (studentId: string) => {
+    setStudents((current) => current.filter((student) => student.id !== studentId));
+    setSelectedId("");
   };
 
-  const transferStudent = async (studentId: string, curatorId: string) => {
-    if (claimingStudentId) return;
-    setClaimingStudentId(studentId);
-    try {
-      const response = await fetch(`${API_ORIGIN}/api/security/students/${studentId}/assignment`, {
-        method: "PATCH",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ curatorId }),
-      });
-      const payload = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(payload.message ?? "Не удалось передать ученика.");
+  if (selectedStudent && selectedId) return <StudentDirectoryFullPage student={selectedStudent} onBack={() => setSelectedId("")} onDeleted={handleDeleted} isOwner={isOwner} />;
 
-      const refreshed = await fetch(`${API_ORIGIN}/api/security/students`, { credentials: "include", cache: "no-store" });
-      const refreshedPayload = await refreshed.json() as { data?: StudentDirectoryRecord[]; message?: string };
-      if (!refreshed.ok || !Array.isArray(refreshedPayload.data)) {
-        throw new Error(refreshedPayload.message ?? "Ученик передан, но список не удалось обновить.");
-      }
-      setStudents(refreshedPayload.data);
-    } finally {
-      setClaimingStudentId("");
-    }
-  };
-
-  if (selectedStudent && selectedId) return <StudentDirectoryFullPage student={selectedStudent} onBack={() => setSelectedId("")} onClaim={claimStudent} onTransfer={transferStudent} claiming={claimingStudentId === selectedStudent.id} />;
+  const practicumFilterSelect = practicums.length > 0 && <label className="directory-practicum-filter"><span>Поток</span><select value={practicumFilter} onChange={(event) => { setPracticumFilterTouched(true); setPracticumFilter(event.target.value); }}><option value="">Все потоки</option>{practicums.map((practicum) => <option key={practicum.id} value={practicum.id}>{practicum.title}{practicum.isActive ? " · активен" : ""}</option>)}</select></label>;
 
   if (loading) return <section className="content-panel directory-empty"><div className="empty-state"><UsersRoundIcon /><strong>Загружаем учеников</strong><span>Проверяем доступ и получаем данные из базы.</span></div></section>;
   if (error) return <section className="content-panel directory-empty"><div className="empty-state"><ShieldCheck size={24} /><strong>{error}</strong><span>Список доступен владельцу и куратору только в рамках их прав.</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Открыть приглашения</button></div></section>;
-  if (students.length === 0) return <section className="content-panel directory-empty"><div className="empty-state"><UsersRoundIcon /><strong>Пока нет учеников</strong><span>Создай первое приглашение, чтобы участник появился в этом списке.</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Создать приглашение</button></div></section>;
+  if (students.length === 0) return <section className="content-panel directory-empty-with-heading"><div className="section-heading"><div><h2>Ученики</h2></div><div className="section-heading-actions">{practicumFilterSelect}</div></div><div className="directory-empty"><div className="empty-state"><UsersRoundIcon /><strong>{practicumFilter ? "В этом потоке пока нет учеников" : "Пока нет учеников"}</strong><span>{practicumFilter ? "Переключитесь на «Все потоки» или создайте приглашение прямо в этот поток." : "Создай первое приглашение, чтобы участник появился в этом списке."}</span><button className="primary-button" onClick={onInvite}><UserPlus size={16} /> Создать приглашение</button></div></div></section>;
 
-  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<UsersRoundIcon />} label="Учеников в потоке" value={String(students.length)} detail="Активные участники практикума" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /><StatCard icon={<FileCheck2 size={18} />} label="Отправлено работ" value={String(submissions)} detail="Всего в базе" accent="amber" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><h2>Ученики</h2></div><div className="section-heading-actions"><button className="primary-button compact-button curator-create-assignment-button" onClick={onInvite}><UserPlus size={15} /> Создать приглашение</button></div></div><div className="directory-rows">{students.map((student) => { const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0]; return <button className={`directory-row ${student.id === selectedStudent.id ? "selected" : ""}`} key={student.id} onClick={() => setSelectedId(student.id)}>{identity?.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={31} height={31} unoptimized /> : <div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}<div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</span></div><div className="directory-row-meta"><strong>{student.submissionCount}</strong><span>ДЗ</span></div><ChevronRight size={16} /></button>; })}</div></section><StudentDirectoryDetail student={selectedStudent} onClaim={claimStudent} onTransfer={transferStudent} claiming={claimingStudentId === selectedStudent?.id} /></div></div>;
+  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<UsersRoundIcon />} label="Учеников в потоке" value={String(students.length)} detail="Активные участники практикума" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /><StatCard icon={<FileCheck2 size={18} />} label="Отправлено работ" value={String(submissions)} detail="Всего в базе" accent="amber" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><h2>Ученики</h2></div><div className="section-heading-actions">{practicumFilterSelect}<button className="primary-button compact-button curator-create-assignment-button" onClick={onInvite}><UserPlus size={15} /> Создать приглашение</button></div></div><div className="directory-rows">{students.map((student) => { const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0]; return <button className={`directory-row ${student.id === selectedStudent.id ? "selected" : ""}`} key={student.id} onClick={() => setSelectedId(student.id)}>{identity?.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={31} height={31} unoptimized /> : <div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}<div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}{student.practicum ? ` · ${student.practicum.title}` : ""}</span></div><div className="directory-row-meta"><strong>{student.submissionCount}</strong><span>ДЗ</span></div><ChevronRight size={16} /></button>; })}</div></section><StudentDirectoryDetail student={selectedStudent} onDeleted={handleDeleted} isOwner={isOwner} /></div></div>;
 }
 
-function StudentDirectoryFullPage({ student, onBack, onClaim, onTransfer, claiming }: { student: StudentDirectoryRecord; onBack: () => void; onClaim: (studentId: string) => Promise<void>; onTransfer?: (studentId: string, curatorId: string) => Promise<void>; claiming: boolean }) {
+function StudentDirectoryFullPage({ student, onBack, onDeleted, isOwner = false }: { student: StudentDirectoryRecord; onBack: () => void; onDeleted: (studentId: string) => void; isOwner?: boolean }) {
   const identity = student.identities.find((item) => item.provider === "DISCORD") ?? student.identities[0];
-  const [curators, setCurators] = useState<CuratorDirectoryRecord[]>([]);
-  const [selectedCuratorId, setSelectedCuratorId] = useState("");
-  const [transferOpen, setTransferOpen] = useState(false);
-  const [transferring, setTransferring] = useState(false);
-  const [transferError, setTransferError] = useState("");
-  useEffect(() => {
-    if (!student.canTransfer || !onTransfer) return;
-    let cancelled = false;
-    void fetch(API_ORIGIN + "/api/security/curators", { credentials: "include", cache: "no-store" })
-      .then((response) => response.ok ? response.json() as Promise<{ data: CuratorDirectoryRecord[] }> : null)
-      .then((payload) => {
-        if (cancelled || !payload?.data) return;
-        setCurators(payload.data);
-        const alternatives = payload.data.filter((curator) => curator.id !== student.assignedCurator?.id);
-        setSelectedCuratorId((current) => current && alternatives.some((curator) => curator.id === current) ? current : alternatives[0]?.id ?? "");
-      })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [student.id, student.canTransfer, student.assignedCurator?.id, onTransfer]);
-  void curators;
-  void transferOpen;
-  void transferError;
-
-  const transfer = async () => {
-    if (!onTransfer || !selectedCuratorId || transferring) return;
-    setTransferring(true);
-    setTransferError("");
-    try {
-      await onTransfer(student.id, selectedCuratorId);
-      setTransferOpen(false);
-    } catch (error) {
-      setTransferError(error instanceof Error ? error.message : "Не удалось передать ученика.");
-    } finally {
-      setTransferring(false);
-    }
-  };
-  void transfer;
-  return <div className="student-full-page"><div className="student-full-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Назад к ученикам</button><div><span className="section-kicker">ПРОФИЛЬ УЧЕНИКА</span><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong></div></div><StudentDirectoryDetail student={student} onClaim={onClaim} claiming={claiming} /></div>;
+  return <div className="student-full-page"><div className="student-full-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Назад к ученикам</button><div><span className="section-kicker">ПРОФИЛЬ УЧЕНИКА</span><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong></div></div><StudentDirectoryDetail student={student} onDeleted={(studentId) => { onDeleted(studentId); onBack(); }} isOwner={isOwner} /></div>;
 }
 
-function StudentDirectoryDetail({ student, onClaim, onTransfer, claiming }: { student: StudentDirectoryRecord; onClaim?: (studentId: string) => Promise<void>; onTransfer?: (studentId: string, curatorId: string) => Promise<void>; claiming?: boolean }) {
-  return <div className="student-detail-stack directory-detail"><StudentDirectoryDetailContent student={student} onClaim={onClaim} onTransfer={onTransfer} claiming={claiming} /><StudentBookingPanel student={student} /><StudentModuleAccessPanel student={student} /><StudentTransferControls student={student} onTransfer={onTransfer} /></div>;
+function StudentDirectoryDetail({ student, onDeleted, isOwner = false }: { student: StudentDirectoryRecord; onDeleted: (studentId: string) => void; isOwner?: boolean }) {
+  return <div className="student-detail-stack directory-detail"><StudentDirectoryDetailContent student={student} onDeleted={onDeleted} isOwner={isOwner} /><StudentBookingPanel student={student} /><StudentModuleAccessPanel student={student} /></div>;
 }
 
 type StudentBookingCurrent = { id: string; type: string; typeLabel: string; title: string; date: string; time: string };
@@ -2255,57 +2472,8 @@ function StudentModuleAccessPanel({ student }: { student: StudentDirectoryRecord
   </section>;
 }
 
-function StudentTransferControls({ student, onTransfer }: { student: StudentDirectoryRecord; onTransfer?: (studentId: string, curatorId: string) => Promise<void> }) {
-  const [curators, setCurators] = useState<CuratorDirectoryRecord[]>([]);
-  const [selectedCuratorId, setSelectedCuratorId] = useState("");
-  const [open, setOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
 
-  useEffect(() => {
-    if (!student.canTransfer) return;
-    let cancelled = false;
-    void fetch(API_ORIGIN + "/api/security/curators", { credentials: "include", cache: "no-store" })
-      .then((response) => response.ok ? response.json() as Promise<{ data: CuratorDirectoryRecord[] }> : null)
-      .then((payload) => {
-        if (cancelled || !payload?.data) return;
-        setCurators(payload.data);
-        const alternatives = payload.data.filter((curator) => curator.id !== student.assignedCurator?.id);
-        setSelectedCuratorId(alternatives[0]?.id ?? "");
-      })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [student.canTransfer, student.assignedCurator?.id]);
-
-  if (!student.canTransfer) return null;
-  const alternatives = curators.filter((curator) => curator.id !== student.assignedCurator?.id);
-  const transfer = async () => {
-    if (!selectedCuratorId || saving) return;
-    setSaving(true);
-    setError("");
-    try {
-      if (onTransfer) {
-        await onTransfer(student.id, selectedCuratorId);
-      } else {
-        const response = await fetch(`${API_ORIGIN}/api/security/students/${student.id}/assignment`, { method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ curatorId: selectedCuratorId }) });
-        if (!response.ok) {
-          const payload = await response.json() as { message?: string };
-          throw new Error(payload.message ?? "Не удалось передать ученика.");
-        }
-        window.location.reload();
-      }
-      setOpen(false);
-    } catch (transferError) {
-      setError(transferError instanceof Error ? transferError.message : "Не удалось передать ученика.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return <section className="student-transfer-panel"><div className="student-transfer-panel-head"><div><span className="section-kicker">НАЗНАЧЕНИЕ</span><strong>{student.assignedCurator ? `Закреплён за: ${student.assignedCurator.name}` : "Куратор ещё не назначен"}</strong></div><button type="button" className="secondary-button" onClick={() => { setError(""); setOpen((current) => !current); }}><ArrowRightLeft size={15} /> Передать ученика</button></div>{open && <div className="student-transfer-form"><label htmlFor={`student-transfer-${student.id}`}>Новый куратор</label><select id={`student-transfer-${student.id}`} value={selectedCuratorId} onChange={(event) => setSelectedCuratorId(event.target.value)}><option value="">Выберите куратора</option>{alternatives.map((curator) => <option key={curator.id} value={curator.id}>{curator.name}{curator.email ? ` · ${curator.email}` : ""}</option>)}</select><div className="student-transfer-actions"><button className="secondary-button" type="button" onClick={() => setOpen(false)}>Отмена</button><button className="primary-button" type="button" disabled={!selectedCuratorId || saving} onClick={() => void transfer()}>{saving ? "Передаём…" : "Подтвердить передачу"}</button></div>{alternatives.length === 0 && <span className="student-transfer-empty">Нет других активных кураторов.</span>}{error && <div className="file-error" role="alert">{error}</div>}</div>}</section>;
-}
-
-function StudentDirectoryDetailContent({ student, onClaim, onTransfer, claiming }: { student: StudentDirectoryRecord; onClaim?: (studentId: string) => Promise<void>; onTransfer?: (studentId: string, curatorId: string) => Promise<void>; claiming?: boolean }) {
+function StudentDirectoryDetailContent({ student, onDeleted, isOwner = false }: { student: StudentDirectoryRecord; onDeleted: (studentId: string) => void; isOwner?: boolean }) {
   type AssignmentAttempt = {
     id: string;
     attempt: number;
@@ -2331,67 +2499,8 @@ function StudentDirectoryDetailContent({ student, onClaim, onTransfer, claiming 
   const [studentTab, setStudentTab] = useState<"overview" | "assignments">("overview");
   const [studentAssignments, setStudentAssignments] = useState<AssignmentHistory[]>([]);
   const [expandedAssignmentId, setExpandedAssignmentId] = useState("");
-  const [claimingSelf, setClaimingSelf] = useState(false);
-  const [claimError, setClaimError] = useState("");
-  const [curators, setCurators] = useState<CuratorDirectoryRecord[]>([]);
-  const [selectedCuratorId, setSelectedCuratorId] = useState("");
-  const [transferOpen, setTransferOpen] = useState(false);
-  const [transferring, setTransferring] = useState(false);
-  const [transferError, setTransferError] = useState("");
-
-  useEffect(() => {
-    if (!student.canTransfer || !onTransfer) return;
-    let cancelled = false;
-    void fetch(API_ORIGIN + "/api/security/curators", { credentials: "include", cache: "no-store" })
-      .then((response) => response.ok ? response.json() as Promise<{ data: CuratorDirectoryRecord[] }> : null)
-      .then((payload) => {
-        if (cancelled || !payload?.data) return;
-        setCurators(payload.data);
-        const alternatives = payload.data.filter((curator) => curator.id !== student.assignedCurator?.id);
-        setSelectedCuratorId((current) => current && alternatives.some((curator) => curator.id === current) ? current : alternatives[0]?.id ?? "");
-      })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [student.id, student.canTransfer, student.assignedCurator?.id, onTransfer]);
-
-  const transfer = async () => {
-    if (!onTransfer || !selectedCuratorId || transferring) return;
-    setTransferring(true);
-    setTransferError("");
-    try {
-      await onTransfer(student.id, selectedCuratorId);
-      setTransferOpen(false);
-    } catch (error) {
-      setTransferError(error instanceof Error ? error.message : "Не удалось передать ученика.");
-    } finally {
-      setTransferring(false);
-    }
-  };
-
-  void curators;
-  void transferOpen;
-  void transferError;
-  void transfer;
-
-  const claimSelf = async () => {
-    if (claimingSelf) return;
-    setClaimingSelf(true);
-    setClaimError("");
-    try {
-      if (onClaim) await onClaim(student.id);
-      else {
-        const response = await fetch(`${API_ORIGIN}/api/security/students/${student.id}/claim`, { method: "POST", credentials: "include" });
-        if (!response.ok) {
-          const payload = await response.json() as { message?: string };
-          throw new Error(payload.message ?? "Не удалось закрепить ученика.");
-        }
-      }
-    } catch (error) {
-      setClaimError(error instanceof Error ? error.message : "Не удалось закрепить ученика.");
-    } finally {
-      setClaimingSelf(false);
-    }
-  };
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -2463,15 +2572,31 @@ function StudentDirectoryDetailContent({ student, onClaim, onTransfer, claiming 
   const formatDateTime = (value: string | null) => value ? new Date(value).toLocaleString("ru-RU") : "Дата не указана";
   const statusLabel = (status: string) => status === "ACCEPTED" ? "Принято" : status === "NEEDS_REVISION" ? "На доработке" : status === "IN_REVIEW" ? "На проверке" : status === "SUBMITTED" ? "Отправлено" : status === "DRAFT" ? "Черновик" : status;
   const statusTone = (status: string) => status === "ACCEPTED" ? "green" : status === "NEEDS_REVISION" ? "amber" : "blue";
+  const studentLabel = identity?.displayName ?? identity?.username ?? "этого ученика";
 
-  if (!student.canViewDetails) {
-    return <section className="content-panel directory-detail"><div className="empty-state"><ShieldCheck size={24} /><strong>Ученик пока не закреплён</strong><span>Закрепите ученика за собой, чтобы открыть его задания, входы и устройства.</span>{student.canClaim && <button className="primary-button" type="button" onClick={() => void claimSelf()} disabled={claimingSelf || claiming}><UserPlus size={16} />{claimingSelf || claiming ? "Закрепляем…" : "Взять ученика"}</button>}{claimError && <div className="file-error" role="alert">{claimError}</div>}</div></section>;
-  }
+  const deleteStudentAccount = async () => {
+    if (deleting) return;
+    const confirmed = window.confirm(`Удалить «${studentLabel}» с платформы? Все его ДЗ, переписка с куратором и история входов будут стёрты безвозвратно — это нельзя отменить. Если уверены — удалить?`);
+    if (!confirmed) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/security/students/${student.id}/delete`, { method: "POST", credentials: "include" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { message?: string };
+        throw new Error(payload.message ?? "Не удалось удалить ученика.");
+      }
+      onDeleted(student.id);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Не удалось удалить ученика.");
+      setDeleting(false);
+    }
+  };
 
   return <section className="content-panel directory-detail">
     <div className="directory-detail-heading">
       {identity?.avatarUrl ? <Image className="profile-avatar large profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Ученик"} width={46} height={46} unoptimized /> : <div className="profile-avatar large">{(identity?.displayName ?? identity?.username ?? "У").slice(0, 2).toUpperCase()}</div>}
-      <div className="directory-detail-title"><span className="section-kicker">ПРОФИЛЬ УЧЕНИКА</span><h2>{identity?.displayName ?? identity?.username ?? "Без имени"}</h2><p>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</p><div className={`student-assignment-status ${student.isAssignedToActor ? "current" : ""}`}><span>{student.isAssignedToActor ? "Закреплён за вами" : student.assignedCurator ? `Закреплён за: ${student.assignedCurator.name}` : "Не закреплён за куратором"}</span>{student.canClaim && <button type="button" className="secondary-button" onClick={() => void claimSelf()} disabled={claimingSelf || claiming}><UserPlus size={15} />{claimingSelf || claiming ? "Закрепляем…" : student.assignedCurator ? "Переназначить себе" : "Взять ученика"}</button>}</div>{claimError && <div className="file-error" role="alert">{claimError}</div>}</div>
+      <div className="directory-detail-title"><span className="section-kicker">ПРОФИЛЬ УЧЕНИКА</span><h2>{identity?.displayName ?? identity?.username ?? "Без имени"}</h2><p>{identity?.provider ?? "Профиль без провайдера"} · {student.status === "ACTIVE" ? "Активен" : student.status}</p><div className="student-assignment-status">{isOwner && <RoleSwitchButton userId={student.id} nextRole="CURATOR" label="Сделать куратором" confirmText={`Сделать «${studentLabel}» куратором? Зачисление в поток и доступ к урокам будут сняты — как у нового куратора.`} />}<button type="button" className="secondary-button danger-button" onClick={() => void deleteStudentAccount()} disabled={deleting}><Trash2 size={15} />{deleting ? "Удаляем…" : "Удалить ученика"}</button></div>{deleteError && <div className="file-error" role="alert">{deleteError}</div>}</div>
     </div>
     <div className="directory-detail-grid">
       <div><span>Discord</span><strong>{identity?.username ?? "Не подключён"}</strong></div>
@@ -2520,6 +2645,196 @@ function StudentDirectoryDetailContent({ student, onClaim, onTransfer, claiming 
   </section>;
 }
 
+type TeamMemberRecord = {
+  id: string;
+  role: string;
+  status: string;
+  createdAt: string;
+  email: string | null;
+  identities: Array<{ provider: string; username: string | null; displayName: string | null; avatarUrl: string | null }>;
+  activeSessionCount: number;
+  loginEventCount: number;
+  lastSession: { lastActiveAt: string; deviceName: string | null; ipAddress: string | null; countryCode?: string | null; city: string | null } | null;
+};
+
+/**
+ * Owner-only device/session security for curator accounts — the staff counterpart to
+ * "Ученики". Needed because a curator's 3rd-device approval has nobody who can grant it once
+ * they're off the student roster (see auth-service.ts#assertCanManageDeviceSecurity): this is
+ * where that approval actually happens.
+ */
+function CuratorTeamView({ isOwner }: { isOwner: boolean }) {
+  const [members, setMembers] = useState<TeamMemberRecord[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch(`${API_ORIGIN}/api/security/team`, { credentials: "include", cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(response.status === 403 ? "Нет прав для просмотра списка команды." : "Не удалось загрузить список команды.");
+        const payload = await response.json() as { data: TeamMemberRecord[] };
+        setMembers(payload.data);
+      })
+      .catch((requestError: unknown) => {
+        if (requestError instanceof DOMException && requestError.name === "AbortError") return;
+        setError(requestError instanceof Error ? requestError.message : "Не удалось загрузить список команды.");
+      })
+      .finally(() => setLoading(false));
+    return () => controller.abort();
+  }, []);
+
+  const selectedMember = members.find((member) => member.id === selectedId) ?? members[0];
+  const activeSessions = members.reduce((total, member) => total + member.activeSessionCount, 0);
+
+  // Mirrors CuratorStudentsView/StudentDirectoryFullPage: `.directory-detail` is force-hidden by
+  // CSS whenever it's nested inside `.directory-layout` under `.student-directory` (see
+  // globals.css ".student-directory > .directory-layout > .directory-detail { display: none; }"),
+  // so a selected row has to navigate to a dedicated full-page view instead of a live side panel
+  // — without this branch the click "worked" (fetched data) but nothing was ever visible.
+  if (selectedMember && selectedId) return <TeamMemberFullPage member={selectedMember} onBack={() => setSelectedId("")} isOwner={isOwner} />;
+
+  if (loading) return <section className="content-panel directory-empty"><div className="empty-state"><ShieldCheck size={24} /><strong>Загружаем команду</strong><span>Проверяем доступ и получаем данные из базы.</span></div></section>;
+  if (error) return <section className="content-panel directory-empty"><div className="empty-state"><ShieldCheck size={24} /><strong>{error}</strong></div></section>;
+  if (members.length === 0) return <section className="content-panel directory-empty"><div className="empty-state"><ShieldCheck size={24} /><strong>Кураторов пока нет</strong><span>Как только куратор примет приглашение, его устройства появятся здесь.</span></div></section>;
+
+  return <div className="student-directory"><div className="directory-stats"><StatCard icon={<ShieldCheck size={18} />} label="Кураторов" value={String(members.length)} detail="Активные сотрудники" accent="blue" /><StatCard icon={<MonitorSmartphone size={18} />} label="Активных устройств" value={String(activeSessions)} detail="Сессии, которые видит система" accent="cyan" /></div><div className="directory-layout"><section className="content-panel directory-list"><div className="section-heading"><div><h2>Куратор</h2></div></div><div className="directory-rows">{members.map((member) => { const identity = member.identities.find((item) => item.provider === "DISCORD") ?? member.identities[0]; return <button className={`directory-row ${member.id === selectedMember.id ? "selected" : ""}`} key={member.id} onClick={() => setSelectedId(member.id)}>{identity?.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Куратор"} width={31} height={31} unoptimized /> : <div className="profile-avatar">{(identity?.displayName ?? identity?.username ?? "К").slice(0, 2).toUpperCase()}</div>}<div className="directory-row-copy"><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong><span>{identity?.provider ?? "Профиль без провайдера"} · {member.status === "ACTIVE" ? "Активен" : member.status}</span></div><div className="directory-row-meta team-row-meta"><strong>{member.activeSessionCount}</strong><span>устройств</span></div><ChevronRight size={16} /></button>; })}</div></section></div></div>;
+}
+
+function TeamMemberFullPage({ member, onBack, isOwner }: { member: TeamMemberRecord; onBack: () => void; isOwner: boolean }) {
+  const identity = member.identities.find((item) => item.provider === "DISCORD") ?? member.identities[0];
+  return <div className="student-full-page"><div className="student-full-page-toolbar"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> Назад к команде</button><div><span className="section-kicker">ПРОФИЛЬ КУРАТОРА</span><strong>{identity?.displayName ?? identity?.username ?? "Без имени"}</strong></div></div><TeamMemberDetail member={member} isOwner={isOwner} /></div>;
+}
+
+function TeamMemberDetail({ member, isOwner }: { member: TeamMemberRecord | undefined; isOwner: boolean }) {
+  type SecurityDetail = { sessions: Array<{ id: string; status: string; deviceName: string | null; userAgent: string | null; ipAddress: string | null; countryCode?: string | null; city: string | null; lastActiveAt: string; createdAt: string; expiresAt: string }>; loginEvents: Array<{ id: string; outcome: string; reasonCode: string | null; ipAddress: string | null; countryCode?: string | null; city: string | null; createdAt: string }> };
+  const [detail, setDetail] = useState<SecurityDetail | null>(null);
+  const [revoking, setRevoking] = useState("");
+  const [approving, setApproving] = useState("");
+  const [securityError, setSecurityError] = useState("");
+
+  useEffect(() => {
+    if (!member) return;
+    let cancelled = false;
+    void fetch(`${API_ORIGIN}/api/security/team/${member.id}`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ data: SecurityDetail }> : null)
+      .then((payload) => { if (!cancelled && payload?.data) setDetail(payload.data); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [member]);
+
+  if (!member) return <section className="content-panel directory-detail"><div className="empty-state"><ShieldCheck size={24} /><strong>Выберите куратора</strong></div></section>;
+
+  const revoke = async (sessionId: string) => {
+    if (!window.confirm("Отозвать эту сессию?")) return;
+    setRevoking(sessionId);
+    setSecurityError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/security/team/${member.id}/sessions/${sessionId}/revoke`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "Owner security review" }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { message?: string };
+        throw new Error(payload.message ?? "Не удалось изменить статус устройства.");
+      }
+      setDetail((current) => current ? { ...current, sessions: current.sessions.map((session) => session.id === sessionId ? { ...session, status: "REVOKED" } : session) } : current);
+    } catch (error) {
+      setSecurityError(error instanceof Error ? error.message : "Не удалось изменить статус устройства.");
+    } finally {
+      setRevoking("");
+    }
+  };
+
+  const approve = async (sessionId: string) => {
+    setApproving(sessionId);
+    setSecurityError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/security/team/${member.id}/sessions/${sessionId}/approve`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "Device approved by owner" }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { message?: string };
+        throw new Error(payload.message ?? "Не удалось разрешить устройство.");
+      }
+      setDetail((current) => current ? { ...current, sessions: current.sessions.map((session) => session.id === sessionId ? { ...session, status: "ACTIVE" } : session) } : current);
+    } catch (error) {
+      setSecurityError(error instanceof Error ? error.message : "Не удалось разрешить устройство.");
+    } finally {
+      setApproving("");
+    }
+  };
+
+  const identity = member.identities.find((item) => item.provider === "DISCORD") ?? member.identities[0];
+  const activeSessions = detail?.sessions.filter((session) => session.status === "ACTIVE") ?? [];
+  const pendingSessions = detail?.sessions.filter((session) => session.status === "PENDING") ?? [];
+  const revokedSessions = detail?.sessions.filter((session) => session.status === "REVOKED" || session.status === "EXPIRED") ?? [];
+  const unusualActivity = activeSessions.length > 1 && new Set(activeSessions.map((session) => session.countryCode ?? session.city ?? session.ipAddress).filter(Boolean)).size > 1;
+  const formatDevice = (userAgent: string | null) => userAgent?.includes("Windows") ? "Windows · браузер" : userAgent?.includes("Macintosh") ? "macOS · браузер" : userAgent?.includes("Android") ? "Android · мобильное устройство" : userAgent?.includes("iPhone") ? "iPhone · мобильное устройство" : "Браузер";
+  const formatDateTime = (value: string | null) => value ? new Date(value).toLocaleString("ru-RU") : "Дата не указана";
+
+  return <section className="content-panel directory-detail">
+    <div className="directory-detail-heading">
+      {identity?.avatarUrl ? <Image className="profile-avatar large profile-avatar-image" src={identity.avatarUrl} alt={identity.displayName ?? identity.username ?? "Куратор"} width={46} height={46} unoptimized /> : <div className="profile-avatar large">{(identity?.displayName ?? identity?.username ?? "К").slice(0, 2).toUpperCase()}</div>}
+      <div className="directory-detail-title"><span className="section-kicker">ПРОФИЛЬ КУРАТОРА</span><h2>{identity?.displayName ?? identity?.username ?? "Без имени"}</h2><p>{identity?.provider ?? "Профиль без провайдера"} · {member.status === "ACTIVE" ? "Активен" : member.status}</p>{isOwner && <div className="student-assignment-status"><RoleSwitchButton userId={member.id} nextRole="STUDENT" label="Сделать учеником" confirmText={`Сделать «${identity?.displayName ?? identity?.username ?? "этого куратора"}» учеником? Он попадёт в активный поток заново, как только принявший приглашение ученик; ученики, которые сейчас закреплены за ним, останутся без куратора.`} /></div>}</div>
+    </div>
+    <div className="directory-detail-grid">
+      <div><span>Discord</span><strong>{identity?.username ?? "Не подключён"}</strong></div>
+      <div><span>Событий входа</span><strong>{member.loginEventCount}</strong></div>
+      <div><span>Активных устройств</span><strong>{detail ? activeSessions.length : member.activeSessionCount}</strong></div>
+    </div>
+    <div className="directory-security">
+      {securityError && <div className="file-error" role="alert">{securityError}</div>}
+      {detail && pendingSessions.length > 0 && <div className="security-pending-list"><div className="security-pending-heading"><div><span className="section-kicker">ТРЕБУЕТСЯ РЕШЕНИЕ</span><h4>Новые устройства ожидают подтверждения</h4><p>Если уже заняты два места, сначала отзовите активное устройство, затем разрешите это.</p></div><span>{pendingSessions.length}</span></div>{pendingSessions.map((session) => <article className="security-device-card pending" key={session.id}><div className="security-device-head"><div><span className="security-device-status pending">ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ</span><h4>{formatDevice(session.userAgent)}</h4></div>{isOwner && <div className="security-device-actions"><button className="primary-button" disabled={approving === session.id} onClick={() => void approve(session.id)}>{approving === session.id ? "Разрешаем…" : "Разрешить устройство"}</button><button className="secondary-button danger" disabled={revoking === session.id} onClick={() => void revoke(session.id)}>{revoking === session.id ? "Отклоняем…" : "Отклонить"}</button></div>}</div><div className="security-device-grid"><div><span>IP-АДРЕС</span><strong>{session.ipAddress ?? "Не определён"}</strong></div><div><span>РЕГИОН</span><strong>{formatRegion(session.city, session.countryCode)}</strong></div><div><span>ЗАПРОС</span><strong>{formatDateTime(session.createdAt)}</strong></div><div><span>ИСТЕКАЕТ</span><strong>{formatDateTime(session.expiresAt)}</strong></div></div></article>)}</div>}
+      <div className="section-heading"><div><span className="section-kicker">КОНТРОЛЬ ДОСТУПА</span><h3>Доверенные устройства</h3></div><ShieldCheck size={18} className="heading-icon" /></div>
+      {unusualActivity && <div className="file-error" role="status">Активные сессии имеют разные сетевые признаки. Это сигнал для проверки, но не доказательство передачи аккаунта.</div>}
+      {detail && activeSessions.length === 0 && pendingSessions.length === 0 && <div className="empty-state compact"><MonitorSmartphone size={21} /><strong>Нет активных устройств</strong><span>Все ранее созданные сессии отозваны или завершены.</span></div>}
+      {activeSessions.map((session) => <article className="security-device-card" key={session.id}><div className="security-device-head"><div><span className="security-device-status">АКТИВНО</span><h4>{formatDevice(session.userAgent)}</h4></div>{isOwner && <button className="secondary-button" disabled={revoking === session.id} onClick={() => void revoke(session.id)}>{revoking === session.id ? "Отзываем…" : "Отозвать доступ"}</button>}</div><div className="security-device-grid"><div><span>IP-АДРЕС</span><strong>{session.ipAddress ?? "Не определён"}</strong></div><div><span>РЕГИОН</span><strong>{formatRegion(session.city, session.countryCode)}</strong></div><div><span>ПЕРВЫЙ ВХОД</span><strong>{new Date(session.createdAt).toLocaleString("ru-RU")}</strong></div><div><span>ПОСЛЕДНЯЯ АКТИВНОСТЬ</span><strong>{new Date(session.lastActiveAt).toLocaleString("ru-RU")}</strong></div></div></article>)}
+      {revokedSessions.length > 0 && <details className="security-event-list"><summary className="detail-label">ЗАВЕРШЁННЫЕ СЕССИИ ({revokedSessions.length})</summary>{revokedSessions.slice(0, 10).map((session) => <div className="security-event" key={session.id}><strong>{formatDevice(session.userAgent)}</strong><span>Сессия завершена · {new Date(session.createdAt).toLocaleString("ru-RU")} · IP: {session.ipAddress ?? "не определён"} · {formatRegion(session.city, session.countryCode)}</span></div>)}</details>}
+      {detail && <details className="security-event-list"><summary className="detail-label">ПОСЛЕДНИЕ ВХОДЫ</summary>{detail.loginEvents.slice(0, 5).map((event) => <div className="security-event" key={event.id}><strong>{formatLoginEventLabel(event.outcome, event.reasonCode)}{formatLoginEventReason(event.reasonCode) && <small>{formatLoginEventReason(event.reasonCode)}</small>}</strong><span>{new Date(event.createdAt).toLocaleString("ru-RU")} · IP: {event.ipAddress ?? "не определён"} · {formatRegion(event.city, event.countryCode)}</span></div>)}</details>}
+    </div>
+  </section>;
+}
+
+/**
+ * Owner-only student <-> curator toggle for a test account — same effect as accepting a fresh
+ * invitation with the other role (Enrollment/module access on the way in, curator assignments
+ * cleared on the way out), without needing a new Discord identity each time. See
+ * auth-service.ts#setUserRole for exactly what moves.
+ */
+function RoleSwitchButton({ userId, nextRole, label, confirmText }: { userId: string; nextRole: "STUDENT" | "CURATOR"; label: string; confirmText: string }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const run = async () => {
+    if (busy || !window.confirm(confirmText)) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/security/students/${userId}/role`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: nextRole }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { message?: string };
+        throw new Error(payload.message ?? "Не удалось изменить роль.");
+      }
+      window.location.reload();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Не удалось изменить роль.");
+      setBusy(false);
+    }
+  };
+  return <span className="role-switch-control"><button type="button" className="secondary-button" onClick={() => void run()} disabled={busy}><ArrowRightLeft size={15} />{busy ? "Меняем…" : label}</button>{error && <div className="file-error" role="alert">{error}</div>}</span>;
+}
+
 function UsersRoundIcon() {
   return <UserPlus size={18} />;
 }
@@ -2539,10 +2854,10 @@ function CuratorInvitationsViewLegacyCurrent() {
     try {
       if (!isDiscordUserId(discordId)) throw new Error("Укажите корректный Discord ID (17–20 цифр), а не имя пользователя.");
       const response = await fetch(`${API_ORIGIN}/api/auth/invitations`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ role, email: email.trim() || undefined, expiresInHours: Number(expiresInHours), targetProvider: "DISCORD", targetSubject: discordId.trim() }) });
-      const payload = await response.json() as { data?: { token: string; expiresAt: string; emailSent?: boolean }; message?: string };
+      const payload = await response.json() as { data?: { token: string; expiresAt: string; emailSent?: boolean; emailError?: string }; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать приглашение");
       const url = `${window.location.origin}/?invite=${encodeURIComponent(payload.data.token)}`;
-      setInviteUrl(url); setNotice(`Ссылка создана до ${new Date(payload.data.expiresAt).toLocaleString("ru-RU")}. ${payload.data.emailSent ? "Письмо отправлено." : "Письмо не отправлено: для тестового отправителя Resend нужен email аккаунта Resend."}`);
+      setInviteUrl(url); setNotice(`Ссылка создана до ${new Date(payload.data.expiresAt).toLocaleString("ru-RU")}. ${payload.data.emailSent ? "Письмо отправлено." : payload.data.emailError ? `Письмо не отправлено: ${payload.data.emailError}` : "Письмо не отправлено: email не указан."}`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "API недоступен. Проверь сервер."); }
     finally { setIsSubmitting(false); }
   };
@@ -2581,7 +2896,7 @@ function CuratorInvitationsViewLegacyCurrent() {
 
 void CuratorInvitationsViewLegacyCurrent;
 
-function CuratorInvitationsView() {
+function CuratorInvitationsView({ workingPracticumId = null }: { workingPracticumId?: string | null }) {
   const [role, setRole] = useState<"STUDENT" | "CURATOR">("STUDENT");
   const [email, setEmail] = useState("");
   const [discordId, setDiscordId] = useState("");
@@ -2601,12 +2916,17 @@ function CuratorInvitationsView() {
         const payload = await response.json().catch(() => ({})) as { data?: PracticumSummary[] };
         if (cancelled || !response.ok || !Array.isArray(payload.data)) return;
         setPracticums(payload.data);
-        setPracticumId((current) => current || payload.data!.find((item) => item.isActive)?.id || payload.data![0]?.id || "");
+        setPracticumId((current) => current
+          || payload.data!.find((item) => item.id === workingPracticumId)?.id
+          || payload.data!.find((item) => item.isActive)?.id
+          || payload.data![0]?.id
+          || "");
       } catch {
-        // form still works without the picker — server falls back to the active practicum
+        // form still works without the picker — server falls back to the inviting curator's working practicum
       }
     })();
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const createInvitation = async (event: FormEvent<HTMLFormElement>) => {
@@ -2632,10 +2952,10 @@ function CuratorInvitationsView() {
           practicumId: practicumId || undefined,
         }),
       });
-      const payload = await response.json() as { data?: { token: string; expiresAt: string; emailSent?: boolean }; message?: string };
+      const payload = await response.json() as { data?: { token: string; expiresAt: string; emailSent?: boolean; emailError?: string }; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать приглашение");
       setInviteUrl(`${window.location.origin}/?invite=${encodeURIComponent(payload.data.token)}`);
-      setNotice(`Ссылка создана до ${new Date(payload.data.expiresAt).toLocaleString("ru-RU")}. ${payload.data.emailSent ? "Письмо отправлено." : "Письмо не отправлено: email не указан или Resend не настроен."}`);
+      setNotice(`Ссылка создана до ${new Date(payload.data.expiresAt).toLocaleString("ru-RU")}. ${payload.data.emailSent ? "Письмо отправлено." : payload.data.emailError ? `Письмо не отправлено: ${payload.data.emailError}` : "Письмо не отправлено: email не указан."}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "API недоступен. Проверьте сервер.");
     } finally {
@@ -2671,7 +2991,7 @@ function CuratorInvitationsView() {
       <div className="section-heading"><div><span className="section-kicker">НОВЫЙ ДОСТУП</span><h2>Создать приглашение</h2><p className="section-heading-note">Ссылка будет работать только для указанного Discord-аккаунта.</p></div><UserPlus size={19} className="heading-icon" /></div>
       <div className="form-body">
         <label className="form-field"><span>Роль участника</span><select value={role} onChange={(event) => setRole(event.target.value as "STUDENT" | "CURATOR")}><option value="STUDENT">Ученик</option><option value="CURATOR">Куратор</option></select></label>
-        {practicums.length > 0 && <label className="form-field"><span>Поток</span><select value={practicumId} onChange={(event) => setPracticumId(event.target.value)}>{practicums.map((item) => <option key={item.id} value={item.id}>{item.title}{item.isActive ? " · активен" : ""}</option>)}</select><small className="file-field-note">Куда попадёт участник после подтверждения Discord. По умолчанию — активный поток.</small></label>}
+        {practicums.length > 0 && <label className="form-field"><span>Поток</span><select value={practicumId} onChange={(event) => setPracticumId(event.target.value)}>{practicums.map((item) => <option key={item.id} value={item.id}>{item.title}{item.id === workingPracticumId ? " · ваш рабочий" : item.isActive ? " · эфиры здесь" : ""}</option>)}</select><small className="file-field-note">Куда попадёт участник после подтверждения Discord. По умолчанию — ваш рабочий поток.</small></label>}
         <label className="form-field"><span>Email участника</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="student@example.com" required={role === "STUDENT"} /><small className="file-field-note">На этот адрес будут приходить уведомления о ДЗ, стримах и обсуждениях.</small></label>
         <label className="form-field"><span>Discord ID участника</span><input type="text" inputMode="numeric" pattern="[0-9]{17,20}" value={discordId} onChange={(event) => setDiscordId(event.target.value)} placeholder="Например, 1535254297472925738" required /><small className="file-field-note">Это числовой ID Discord, не username. Найти его можно в Discord с включённым режимом разработчика.</small></label>
         <label className="form-field"><span>Ссылка действует, часов</span><input type="number" min="1" max="720" value={expiresInHours} onChange={(event) => setExpiresInHours(event.target.value)} required /></label>
@@ -2772,6 +3092,7 @@ function CuratorLessonPage({ module, onBack, onNavigate }: { module: CourseApiMo
         requirements: Array.isArray(createdAssignment.requirements) ? createdAssignment.requirements : requirements,
         allowedFormats: Array.isArray(createdAssignment.allowedFormats) ? createdAssignment.allowedFormats : ["comment", "image"],
         deadline: createdAssignment.deadline ?? null,
+        materials: Array.isArray(createdAssignment.materials) ? createdAssignment.materials : [],
       }]);
       setAssignmentTitle(""); setAssignmentDescription(""); setAssignmentRequirements([""]); setShowAssignmentForm(false); showNotice("Домашнее задание добавлено в этот урок.");
     } catch (reason) { showNotice(reason instanceof Error ? reason.message : "Не удалось создать домашнее задание", true); }
@@ -2846,13 +3167,13 @@ function CuratorLessonPage({ module, onBack, onNavigate }: { module: CourseApiMo
     <div className="module-resource-grid">
       <section className="module-resource-card module-description-card"><div className="module-resource-heading"><BookOpen size={17} /><h3>Описание</h3><span>Редактируется</span></div><textarea className="curator-lesson-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Добавьте описание урока…" /></section>
       <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMedia.length} {thematicMedia.length === 1 ? "материал" : "материалов"}</span><button className="quiet-button add-button" type="button" onClick={() => openMediaLibrary("STREAM")}><Plus size={15} /> Добавить стрим</button></div>{thematicMedia.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических стримов пока нет</strong><span>Q&A-записи не смешиваются с тематическими материалами.</span></div> : <div className="module-video-stack">{thematicMedia.map((item) => <div className={`module-video-card ${draggedId === item.id ? "is-dragging" : ""}`} key={item.id} draggable onDragStart={() => setDraggedId(item.id)} onDragEnd={() => setDraggedId(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => moveMedia(item.id)}><div className="module-video-stage">{item.embedUrl && <iframe src={item.embedUrl} title={item.title ?? "Запись стрима"} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}<span className="module-video-label">{item.title ?? "Материал без названия"}</span><span className="stream-duration">{item.status === "PUBLISHED" ? "ОПУБЛИКОВАНО" : "ЧЕРНОВИК"}</span><span className="curator-drag-handle" title="Перетащите, чтобы изменить порядок">⋮⋮</span></div><div className="module-video-footer"><span className="module-video-kind-badge">{mediaKindLabel(item.kind)}</span><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingMediaId === item.id} onClick={() => void archiveLessonMedia(item)}>{deletingMediaId === item.id ? "Удаляем…" : "Удалить"}</button></div></div>)}</div>}</section>
-      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{assignments.length} {assignments.length === 1 ? "задание" : "заданий"}</span><button className="quiet-button add-button" type="button" onClick={() => setShowAssignmentForm((current) => !current)}><Plus size={15} /> {showAssignmentForm ? "Закрыть" : "Добавить ДЗ"}</button></div>{showAssignmentForm && <div className="curator-inline-form"><input value={assignmentTitle} onChange={(event) => setAssignmentTitle(event.target.value)} placeholder="Название домашнего задания" /><textarea value={assignmentDescription} onChange={(event) => setAssignmentDescription(event.target.value)} placeholder="Описание и контекст для ученика" /><div className="assignment-criteria-editor"><div className="assignment-criteria-heading"><span>Критерии проверки</span><button className="quiet-button" type="button" onClick={() => setAssignmentRequirements((current) => [...current, ""])}><Plus size={14} /> Добавить критерий</button></div>{assignmentRequirements.map((requirement, index) => <div className="assignment-criterion-row" key={`new-criterion-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => setAssignmentRequirements((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} placeholder="Например: разобрать график и описать выводы" />{assignmentRequirements.length > 1 && <button className="icon-button compact" type="button" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setAssignmentRequirements((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>}</div>)}</div><button className="primary-button" type="button" disabled={saving || !assignmentTitle.trim() || !assignmentDescription.trim()} onClick={() => void createAssignment()}>{saving ? "Создаём…" : "Создать ДЗ в этом уроке"}</button></div>}{assignments.length > 0 ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div className="curator-assignment-card-head"><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingAssignmentId === assignment.id} onClick={() => void archiveAssignment(assignment)}>{deletingAssignmentId === assignment.id ? "Удаляем…" : "Удалить"}</button></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}</article>)}</div> : <div className="module-empty-copy">В этом уроке пока нет домашних заданий.</div>}</section>
+      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{assignments.length} {assignments.length === 1 ? "задание" : "заданий"}</span><button className="quiet-button add-button" type="button" onClick={() => setShowAssignmentForm((current) => !current)}><Plus size={15} /> {showAssignmentForm ? "Закрыть" : "Добавить ДЗ"}</button></div>{showAssignmentForm && <div className="curator-inline-form"><input value={assignmentTitle} onChange={(event) => setAssignmentTitle(event.target.value)} placeholder="Название домашнего задания" /><textarea value={assignmentDescription} onChange={(event) => setAssignmentDescription(event.target.value)} placeholder="Описание и контекст для ученика" /><div className="assignment-criteria-editor"><div className="assignment-criteria-heading"><span>Критерии проверки</span><button className="quiet-button" type="button" onClick={() => setAssignmentRequirements((current) => [...current, ""])}><Plus size={14} /> Добавить критерий</button></div>{assignmentRequirements.map((requirement, index) => <div className="assignment-criterion-row" key={`new-criterion-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><input value={requirement} onChange={(event) => setAssignmentRequirements((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} placeholder="Например: разобрать график и описать выводы" />{assignmentRequirements.length > 1 && <button className="icon-button compact" type="button" aria-label={`Удалить критерий ${index + 1}`} onClick={() => setAssignmentRequirements((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>}</div>)}</div><button className="primary-button" type="button" disabled={saving || !assignmentTitle.trim() || !assignmentDescription.trim()} onClick={() => void createAssignment()}>{saving ? "Создаём…" : "Создать ДЗ в этом уроке"}</button></div>}{assignments.length > 0 ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div className="curator-assignment-card-head"><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingAssignmentId === assignment.id} onClick={() => void archiveAssignment(assignment)}>{deletingAssignmentId === assignment.id ? "Удаляем…" : "Удалить"}</button></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}<AssignmentMaterialsInline materials={assignment.materials} /></article>)}</div> : <div className="module-empty-copy">В этом уроке пока нет домашних заданий.</div>}</section>
       <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMedia.length} {qaMedia.length === 1 ? "запись" : "записей"}</span><button className="quiet-button add-button" type="button" onClick={() => openMediaLibrary("QA")}><Plus size={15} /> Добавить Q&A</button></div>{qaMedia.length > 0 && <div className="module-video-stack">{qaMedia.map((item) => <div className="module-qa-video-card" key={item.id}><div className="module-qa-video-stage">{item.embedUrl && <TrackedVideo mediaId={item.id} src={item.embedUrl} title={item.title ?? "Q&A с куратором"} />}<span>{item.title ?? "Q&A-запись"}</span></div><div className="module-video-footer"><span className="module-video-kind-badge">{item.status === "PUBLISHED" ? "Опубликовано" : "Черновик"}</span><button className="secondary-button danger-button compact-button" type="button" disabled={saving || deletingMediaId === item.id} onClick={() => void archiveLessonMedia(item)}>{deletingMediaId === item.id ? "Удаляем…" : "Удалить"}</button></div></div>)}</div>}<ul>{fallback.questions.map((question) => <li key={question}>{question}</li>)}</ul>{qaMedia.length === 0 && <div className="module-action-feedback">Добавьте Q&A-запись — она будет показана ученику именно в этом блоке.</div>}</section>
     </div>{notice && <div className={`detail-feedback ${noticeError ? "error" : "accepted"} curator-lesson-notice`} role={noticeError ? "alert" : undefined}>{notice}</div>}
   </div>;
 }
 
-function CuratorModuleAccessView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
+function CuratorModuleAccessView({ onNavigate, viewingPracticumId = null }: { onNavigate: (nextNav: CuratorNav) => void; viewingPracticumId?: string | null }) {
   const [modules, setModules] = useState<CourseApiModule[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -2861,7 +3182,7 @@ function CuratorModuleAccessView({ onNavigate }: { onNavigate: (nextNav: Curator
   const [showModuleForm, setShowModuleForm] = useState(false);
   const [moduleTitle, setModuleTitle] = useState("");
   const [moduleDescription, setModuleDescription] = useState("");
-  useEffect(() => { void fetch(`${API_ORIGIN}/api/course/manage`, { credentials: "include", cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error("Не удалось загрузить программу"); const payload = await response.json() as { data: { modules: CourseApiModule[] } }; setModules(payload.data.modules); }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Не удалось загрузить программу")); }, []);
+  useEffect(() => { const url = `${API_ORIGIN}/api/course/manage${viewingPracticumId ? `?viewPracticumId=${viewingPracticumId}` : ""}`; void fetch(url, { credentials: "include", cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error("Не удалось загрузить программу"); const payload = await response.json() as { data: { modules: CourseApiModule[] } }; setModules(payload.data.modules); }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Не удалось загрузить программу")); }, [viewingPracticumId]);
   useEffect(() => {
     const targetModuleId = window.sessionStorage.getItem(OPEN_MODULE_AFTER_PUBLISH_KEY);
     if (!targetModuleId || !modules.some((module) => module.id === targetModuleId)) return;
@@ -2910,7 +3231,7 @@ function CuratorModuleAccessView({ onNavigate }: { onNavigate: (nextNav: Curator
   const openedModule = modules.find((module) => module.id === openedModuleId);
   if (openedModule) return <CuratorLessonPage key={openedModule.id} module={openedModule} onBack={() => setOpenedModuleId("")} onNavigate={onNavigate} />;
   const unlockedCount = modules.filter((module) => module.status !== "LOCKED").length;
-  return <section className="content-panel module-access-panel"><div className="section-heading"><div><h2>Уроки практикума</h2><p className="section-heading-note">{unlockedCount} из {modules.length} открыто ученикам. Откройте урок — сразу попадёте на страницу, как её видит ученик.</p></div><button className="primary-button module-add-button" type="button" onClick={() => setShowModuleForm((current) => !current)}><Plus size={16} /> {showModuleForm ? "Закрыть форму" : "Добавить урок"}</button></div>{showModuleForm && <div className="module-create-form"><div className="module-create-form-heading"><div><strong>Добавить урок в программу</strong><p>Урок появится в программе сразу — начните добавлять материалы, а открыть доступ ученикам можно одним кликом, когда всё будет готово.</p></div></div><div className="module-create-fields"><label className="module-create-wide"><span>Название урока</span><input value={moduleTitle} onChange={(event) => setModuleTitle(event.target.value)} placeholder="Например, Управление риском" /></label><label className="module-create-wide"><span>Описание</span><textarea value={moduleDescription} onChange={(event) => setModuleDescription(event.target.value)} placeholder="Что ученик изучит в этом уроке" /></label></div><div className="module-create-actions"><button className="secondary-button" type="button" onClick={() => setShowModuleForm(false)}>Отмена</button><button className="primary-button module-add-button" type="button" disabled={busy === "new-module" || !moduleTitle.trim()} onClick={() => void createModule()}><Plus size={16} /> {busy === "new-module" ? "Создаём…" : "Создать урок"}</button></div></div>}{error && <div className="file-error" role="alert">{error}</div>}{notice && <div className="form-action-feedback">{notice}</div>}<div className="module-access-list">{modules.map((module) => { const unlocked = module.status !== "LOCKED"; const contentCount = module.media.length + module.assignments.length; return <div key={module.id}><div className={`module-access-row ${unlocked ? "is-unlocked" : "is-locked"}`}><div className={`module-access-status ${unlocked ? "open" : "closed"}`}>{unlocked ? "Доступен ученикам" : "Закрыт"}</div><div className="module-access-copy"><strong data-module-number={module.number}>{module.title}</strong><span>{module.section} · {pluralizeMaterials(contentCount)}</span></div><div className="module-access-actions"><button className="secondary-button" type="button" onClick={() => setOpenedModuleId(module.id)}>Открыть урок</button><button className={unlocked ? "secondary-button" : "primary-button"} type="button" disabled={busy === module.id} onClick={() => void toggle(module)}>{busy === module.id ? "Сохраняем…" : unlocked ? "Закрыть урок" : "Разблокировать"}</button><button className="secondary-button" type="button" disabled={busy === module.id} onClick={() => void markCompleted(module)}>Урок пройден</button><button className="secondary-button danger-button" type="button" disabled={busy === module.id} onClick={() => void deleteModule(module)}>Удалить</button></div></div></div>; })}</div></section>;
+  return <section className="content-panel module-access-panel"><div className="section-heading"><div><h2>Уроки практикума</h2><p className="section-heading-note">{unlockedCount} из {modules.length} открыто ученикам. Откройте урок — сразу попадёте на страницу, как её видит ученик.</p></div>{!viewingPracticumId && <button className="primary-button module-add-button" type="button" onClick={() => setShowModuleForm((current) => !current)}><Plus size={16} /> {showModuleForm ? "Закрыть форму" : "Добавить урок"}</button>}</div>{showModuleForm && !viewingPracticumId && <div className="module-create-form"><div className="module-create-form-heading"><div><strong>Добавить урок в программу</strong><p>Урок появится в программе сразу — начните добавлять материалы, а открыть доступ ученикам можно одним кликом, когда всё будет готово.</p></div></div><div className="module-create-fields"><label className="module-create-wide"><span>Название урока</span><input value={moduleTitle} onChange={(event) => setModuleTitle(event.target.value)} placeholder="Например, Управление риском" /></label><label className="module-create-wide"><span>Описание</span><textarea value={moduleDescription} onChange={(event) => setModuleDescription(event.target.value)} placeholder="Что ученик изучит в этом уроке" /></label></div><div className="module-create-actions"><button className="secondary-button" type="button" onClick={() => setShowModuleForm(false)}>Отмена</button><button className="primary-button module-add-button" type="button" disabled={busy === "new-module" || !moduleTitle.trim()} onClick={() => void createModule()}><Plus size={16} /> {busy === "new-module" ? "Создаём…" : "Создать урок"}</button></div></div>}{error && <div className="file-error" role="alert">{error}</div>}{notice && <div className="form-action-feedback">{notice}</div>}<div className="module-access-list">{modules.map((module) => { const unlocked = module.status !== "LOCKED"; const contentCount = module.media.length + module.assignments.length; return <div key={module.id}><div className={`module-access-row ${unlocked ? "is-unlocked" : "is-locked"}`}><div className={`module-access-status ${unlocked ? "open" : "closed"}`}>{unlocked ? "Доступен ученикам" : "Закрыт"}</div><div className="module-access-copy"><strong data-module-number={module.number}>{module.title}</strong><span>{module.section} · {pluralizeMaterials(contentCount)}</span></div><div className="module-access-actions"><button className="secondary-button" type="button" onClick={() => setOpenedModuleId(module.id)}>Открыть урок</button><button className={unlocked ? "secondary-button" : "primary-button"} type="button" disabled={busy === module.id} onClick={() => void toggle(module)}>{busy === module.id ? "Сохраняем…" : unlocked ? "Закрыть урок" : "Разблокировать"}</button><button className="secondary-button" type="button" disabled={busy === module.id} onClick={() => void markCompleted(module)}>Урок пройден</button><button className="secondary-button danger-button" type="button" disabled={busy === module.id} onClick={() => void deleteModule(module)}>Удалить</button></div></div></div>; })}</div></section>;
 }
 
 function CuratorPlaceholder({ title }: { title: string }) {
@@ -2933,7 +3254,7 @@ function mediaKindLabel(kind: CuratorMediaItem["kind"]): string {
   }[kind];
 }
 
-function CuratorMediaLibraryView() {
+function CuratorMediaLibraryView({ viewingPracticumId = null }: { viewingPracticumId?: string | null }) {
   const [course, setCourse] = useState<CourseState | null>(null);
   const [selectedId, setSelectedId] = useState("");
   const [moduleId, setModuleId] = useState("");
@@ -2953,9 +3274,12 @@ function CuratorMediaLibraryView() {
   const [reclassifyModuleId, setReclassifyModuleId] = useState("");
   const [reclassifyScheduleEventId, setReclassifyScheduleEventId] = useState("");
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameTitle, setRenameTitle] = useState("");
 
   const loadCourse = useCallback(async () => {
-    const response = await fetch(`${API_ORIGIN}/api/course/manage`, { credentials: "include", cache: "no-store" });
+    const url = `${API_ORIGIN}/api/course/manage${viewingPracticumId ? `?viewPracticumId=${viewingPracticumId}` : ""}`;
+    const response = await fetch(url, { credentials: "include", cache: "no-store" });
     const payload = await response.json().catch(() => ({})) as CourseApiPayload & { message?: string };
     if (!response.ok) throw new Error(payload.message ?? "Не удалось загрузить программу.");
     const nextCourse = normalizeCourse(payload);
@@ -2963,7 +3287,7 @@ function CuratorMediaLibraryView() {
     setCourse(nextCourse);
     const firstModuleId = nextCourse.modules[0]?.id ?? "";
     setModuleId((current) => current || firstModuleId);
-  }, []);
+  }, [viewingPracticumId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -3086,18 +3410,29 @@ function CuratorMediaLibraryView() {
     }
   };
 
-  const attachSelected = async () => {
-    if (!selected || !moduleId || !selected.moduleId || selected.kind === "TALKS" || selected.moduleId === moduleId) return;
+  const openRename = () => {
+    if (!selected) return;
+    setRenameTitle(selected.title ?? "");
+    setRenaming(true);
+  };
+
+  const renameSelected = async () => {
+    if (!selected) return;
+    const nextTitle = renameTitle.trim();
+    if (!nextTitle) return;
     setNotice(""); setSaving(true);
     try {
-      const response = await fetch(`${API_ORIGIN}/api/course/media/${selected.id}/module`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ moduleId }) });
+      const response = await fetch(`${API_ORIGIN}/api/course/media/${selected.id}/title`, { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: nextTitle }) });
       const payload = await response.json().catch(() => ({})) as { message?: string };
-      if (!response.ok) throw new Error(payload.message ?? "Не удалось привязать стрим к уроку");
+      if (!response.ok) throw new Error(payload.message ?? "Не удалось переименовать запись.");
+      setRenaming(false);
       await loadCourse();
-      setNotice("Стрим привязан к выбранному уроку.");
+      setNotice("Название обновлено.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Не удалось привязать стрим к уроку");
-    } finally { setSaving(false); }
+      setNotice(error instanceof Error ? error.message : "Не удалось переименовать запись.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const openReclassify = () => {
@@ -3136,7 +3471,10 @@ function CuratorMediaLibraryView() {
   const archiveSelected = async () => {
     if (!selected || deletingId) return;
     const title = selected.title?.trim() || "Без названия";
-    if (!window.confirm(`Убрать запись «${title}» из урока и медиатеки? Само видео Vimeo удалено не будет.`)) return;
+    const confirmMessage = selected.provider === "LIVEKIT_RECORDING"
+      ? `Удалить запись «${title}»? Видеофайл будет безвозвратно стёрт с сервера и освободит место — отменить это будет нельзя.`
+      : `Убрать запись «${title}» из урока и медиатеки? Само видео Vimeo удалено не будет.`;
+    if (!window.confirm(confirmMessage)) return;
     setNotice("");
     setDeletingId(selected.id);
     try {
@@ -3156,11 +3494,11 @@ function CuratorMediaLibraryView() {
 
   return <div className="media-library-page">
     <section className="content-panel media-editor-panel">
-       <div className="section-heading"><div><span className="section-kicker">НОВАЯ ЗАПИСЬ</span><h2>Добавить запись в медиатеку</h2><p className="section-heading-note">Тип Q&A попадёт только в блок «Q&A с куратором», тематический стрим — в центральный блок урока, а Talks останется в общей медиатеке.</p></div></div>
+       <div className="section-heading"><div><span className="section-kicker">НОВАЯ ЗАПИСЬ</span><h2>Добавить запись в медиатеку</h2><p className="section-heading-note">Тип Q&A попадёт только в блок «Q&A с куратором», тематический стрим — в центральный блок урока, а Talks останется в общей медиатеке. Урок и событие — это варианты «или-или»: запись привязывается к чему-то одному, выбор одного поля сбрасывает другое.</p></div></div>
       <form className="media-editor-body" onSubmit={(event) => { const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null; void createMedia(event, submitter?.dataset.publish === "true"); }}>
         <div className="media-editor-fields">
           <label className="form-field"><span>{isGlobalMedia ? "Привязка" : "Привязать к уроку"}</span><select value={isGlobalMedia ? "" : moduleId} onChange={(event) => { setModuleId(event.target.value); if (event.target.value) setScheduleEventId(""); }} disabled={isGlobalMedia || loading || moduleOptions.length === 0}><option value="">{isGlobalMedia ? "Без привязки · общая медиатека" : "Выбери урок"}</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label>
-          <label className="form-field"><span>Привязать к событию (необязательно)</span><select value={scheduleEventId} onChange={(event) => { setScheduleEventId(event.target.value); if (event.target.value) setModuleId(""); }} disabled={isGlobalMedia || loading}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label>
+          <label className="form-field"><span>Привязать к событию (вместо урока, необязательно)</span><select value={scheduleEventId} onChange={(event) => { setScheduleEventId(event.target.value); if (event.target.value) setModuleId(""); }} disabled={isGlobalMedia || loading}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label>
           <label className="form-field"><span>Тип</span><select value={kind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setKind(nextKind); if (nextKind !== "TALKS" && !moduleId) setModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>
           <label className="form-field"><span>Название</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Q&A по Market Logic · 05.06" /></label>
           <label className="form-field"><span>Ссылка Vimeo</span><input type="url" value={vimeoUrl} onChange={(event) => setVimeoUrl(event.target.value)} placeholder="https://vimeo.com/123456789" /></label>{normalizeVimeoUrl(vimeoUrl) && <div className="media-link-live-preview"><span>Предпросмотр новой записи</span><iframe src={normalizeVimeoUrl(vimeoUrl) ?? undefined} title="Предпросмотр Vimeo" allow="autoplay; fullscreen; picture-in-picture" /> </div>}
@@ -3172,17 +3510,18 @@ function CuratorMediaLibraryView() {
     {libraryOpen && <section className="content-panel media-library-inline">
       {allItemsSorted.length === 0
         ? <p className="media-link-note">Записей пока нет.</p>
-        : <div className="stream-grid">{allItemsSorted.map((item) => <CuratorMediaCard item={item} key={item.id} onOpen={() => { setSelectedId(item.id); setReclassifying(false); }} />)}</div>}
+        : <div className="stream-grid">{allItemsSorted.map((item) => <CuratorMediaCard item={item} key={item.id} onOpen={() => { setSelectedId(item.id); setReclassifying(false); setRenaming(false); }} />)}</div>}
     </section>}
     {/* A second, focused popup for whichever card was opened — matches the student "Записи" flow
         (grid page + a separate video-modal popup) instead of expanding in place inside the grid,
         which meant scrolling past other cards to reach the action buttons. */}
-    {selected && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Запись: ${selected.title ?? "Без названия"}`} onMouseDown={(event) => { if (event.currentTarget === event.target) { setSelectedId(""); setReclassifying(false); } }}>
+    {selected && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Запись: ${selected.title ?? "Без названия"}`} onMouseDown={(event) => { if (event.currentTarget === event.target) { setSelectedId(""); setReclassifying(false); setRenaming(false); } }}>
       <div className="video-modal">
-        <div className="video-modal-head"><div><span className="section-kicker">{(selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle)} · {mediaKindLabel(selected.kind)}</span><strong>{selected.title ?? "Без названия"}</strong></div><button className="icon-button" aria-label="Закрыть" onClick={() => { setSelectedId(""); setReclassifying(false); }}><X size={18} /></button></div>
+        <div className="video-modal-head"><div><span className="section-kicker">{(selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle)} · {mediaKindLabel(selected.kind)}{formatFileSize(selected.byteSize) && ` · ${formatFileSize(selected.byteSize)}`}</span><strong>{selected.title ?? "Без названия"}</strong></div><button className="icon-button" aria-label="Закрыть" onClick={() => { setSelectedId(""); setReclassifying(false); setRenaming(false); }}><X size={18} /></button></div>
         {selected.embedUrl ? <TrackedVideo mediaId={selected.id} src={selected.embedUrl} title={selected.title ?? "Запись"} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}
-        <div className="video-modal-foot media-preview-actions">{selected.kind !== "TALKS" && <button className="secondary-button" type="button" disabled={saving || deletingId !== "" || !moduleId || !selected.moduleId || selected.moduleId === moduleId} onClick={() => void attachSelected()}>{selected.moduleId === moduleId ? "Уже привязан" : "Привязать к выбранному уроку"}</button>}<button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => (reclassifying ? setReclassifying(false) : openReclassify())}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}{selected.provider === "LIVEKIT_RECORDING" && <a className="secondary-button" href={`/api/streams/recordings/${selected.id}/download`} target="_blank" rel="noopener noreferrer"><Download size={15} /> Скачать</a>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>
-        {reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId) setReclassifyModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyModuleId} onChange={(event) => { setReclassifyModuleId(event.target.value); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label><label className="form-field"><span>Привязать к событию (необязательно)</span><select value={reclassifyScheduleEventId} onChange={(event) => { setReclassifyScheduleEventId(event.target.value); if (event.target.value) setReclassifyModuleId(""); }}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label></>}</div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || (reclassifyKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId)} onClick={() => void saveReclassify()}>Сохранить тип</button></div></div>}
+        <div className="video-modal-foot media-preview-actions"><button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => { if (renaming) { setRenaming(false); return; } setReclassifying(false); openRename(); }}>{renaming ? "Отменить переименование" : "Переименовать"}</button><button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => { if (reclassifying) { setReclassifying(false); return; } setRenaming(false); openReclassify(); }}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}{selected.provider === "LIVEKIT_RECORDING" && <a className="secondary-button" href={`/api/streams/recordings/${selected.id}/download`} target="_blank" rel="noopener noreferrer"><Download size={15} /> Скачать</a>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>
+        {renaming && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет только отображаемое название этой записи.</p><div className="media-editor-fields"><label className="form-field"><span>Название</span><input value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} placeholder="Например, Q&A по Market Logic · 05.06" maxLength={180} /></label></div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || !renameTitle.trim()} onClick={() => void renameSelected()}>Сохранить название</button></div></div>}
+        {reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся. Урок и событие — варианты «или-или», выбор одного сбрасывает другое.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId) setReclassifyModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option><option value="TALKS">Talks · общение</option></select></label>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyModuleId} onChange={(event) => { setReclassifyModuleId(event.target.value); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option>{moduleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</select></label><label className="form-field"><span>Привязать к событию (вместо урока, необязательно)</span><select value={reclassifyScheduleEventId} onChange={(event) => { setReclassifyScheduleEventId(event.target.value); if (event.target.value) setReclassifyModuleId(""); }}><option value="">Без события</option>{course?.scheduleEvents.map((event) => <option key={event.id} value={event.id}>{event.date} · {event.title}</option>)}</select></label></>}</div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || (reclassifyKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId)} onClick={() => void saveReclassify()}>Сохранить тип</button></div></div>}
         {viewersFor === selected.id && <div className="media-viewers-panel">{viewersLoading ? <span className="media-viewers-empty">Загружаем…</span> : viewers.length === 0 ? <span className="media-viewers-empty">Пока никто не открывал эту запись.</span> : viewers.map((event) => <div className="media-viewers-row" key={event.id}><strong>{event.viewer.name}</strong><span>{event.viewer.role === "STUDENT" ? "Ученик" : event.viewer.role === "CURATOR" ? "Куратор" : "Владелец"}</span><span>{event.ipAddress ?? "IP не определён"}</span><span>{new Date(event.createdAt).toLocaleString("ru-RU")}</span></div>)}</div>}
       </div>
     </div>}
@@ -3201,7 +3540,7 @@ function CuratorMediaCard({ item, onOpen }: { item: CuratorMediaItem; onOpen: ()
     <div className="stream-card-copy">
       <span>{item.eventTitle ? `Событие · ${item.eventTitle}` : item.moduleTitle}</span>
       <h3>{item.title ?? "Без названия"}</h3>
-      <p>{mediaKindLabel(item.kind)}</p>
+      <p>{mediaKindLabel(item.kind)}{formatFileSize(item.byteSize) && ` · ${formatFileSize(item.byteSize)}`}</p>
     </div>
   </button></article>;
 }
@@ -3272,7 +3611,7 @@ function ScheduleBookingSettingsPanel() {
   </section>;
 }
 
-function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) => void }) {
+function CuratorScheduleView({ onNavigate, viewingPracticumId = null }: { onNavigate: (nextNav: CuratorNav) => void; viewingPracticumId?: string | null }) {
   const [events, setEvents] = useState<ScheduleEvent[]>([]);
   const [selectedId, setSelectedId] = useState(events[0]?.id ?? "");
   const [showForm, setShowForm] = useState(false);
@@ -3283,7 +3622,8 @@ function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav)
   const [scheduleLoadError, setScheduleLoadError] = useState("");
   useEffect(() => {
     const load = async () => {
-      const response = await fetch(`${API_ORIGIN}/api/schedule`, { credentials: "include", cache: "no-store" });
+      const url = `${API_ORIGIN}/api/schedule${viewingPracticumId ? `?viewPracticumId=${viewingPracticumId}` : ""}`;
+      const response = await fetch(url, { credentials: "include", cache: "no-store" });
       if (!response.ok) { setScheduleLoadError("Не удалось загрузить расписание с сервера. Показаны локальные/демонстрационные данные."); return; }
       setScheduleLoadError("");
       const payload = await response.json() as { data?: ScheduleApiEvent[] };
@@ -3294,7 +3634,7 @@ function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav)
       if (Array.isArray(payload.data)) setEvents(payload.data.map(scheduleApiToUi));
     };
     void load().catch(() => setScheduleLoadError("Не удалось загрузить расписание с сервера. Показаны локальные/демонстрационные данные."));
-  }, []);
+  }, [viewingPracticumId]);
 
   // Consumed once when the curator clicks a schedule row on "Кабинет куратора" — opens
   // that event's details directly instead of landing on the first event in the list.
@@ -3313,6 +3653,7 @@ function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav)
   const openCreateForDate = (date: string) => {
     const existing = events.find((event) => event.date === date);
     if (existing) { setSelectedId(existing.id); setDetailsId(existing.id); setPendingDate(null); return; }
+    if (viewingPracticumId) return; // read-only archive view — nothing to create on an empty date
     setFormDate(date); setEditingEvent(null); setShowForm(false); setPendingDate(date);
   };
   const confirmCreateForDate = () => { if (!pendingDate) return; setFormDate(pendingDate); setEditingEvent(null); setPendingDate(null); setShowForm(true); };
@@ -3337,7 +3678,7 @@ function CuratorScheduleView({ onNavigate }: { onNavigate: (nextNav: CuratorNav)
     setEvents((current) => current.map((item) => item.id === updated.id ? updated : item));
   };
 
-  return <div className="curator-schedule">{scheduleLoadError && <div className="file-error" role="alert">{scheduleLoadError}</div>}<div className="curator-schedule-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><strong>{events.length} событий опубликовано</strong><span>События видят ученики этого потока после публикации.</span></div><div className="schedule-toolbar-actions"><button className="primary-button" onClick={() => { setEditingEvent(null); setPendingDate(null); setDetailsId(null); setFormDate(toDateKey(new Date())); setShowForm((current) => !current); }}><Plus size={16} /> {showForm ? "Закрыть форму" : "Создать событие"}</button><span className="schedule-toolbar-divider" aria-hidden="true" /><button className="secondary-button" disabled={!selectedEvent} onClick={() => selectedEvent && openEdit(selectedEvent)}><Pencil size={15} /> Редактировать</button><button className="secondary-button danger-button" disabled={!selectedEvent} onClick={removeEvent}><Trash2 size={15} /> Удалить</button></div></div><ScheduleBookingSettingsPanel />{pendingDate && <div className="schedule-date-confirm"><div><strong>Добавить событие на {formatEventDate(pendingDate)}?</strong><span>Дата уже выбрана. Подтверди действие, и откроется форма с деталями.</span></div><div><button className="secondary-button" type="button" onClick={() => setPendingDate(null)}>Нет</button><button className="primary-button" type="button" onClick={confirmCreateForDate}>Да, добавить</button></div></div>}{showForm && <ScheduleEventForm initialDate={formDate} initialEvent={editingEvent} onCancel={() => { setShowForm(false); setEditingEvent(null); }} onCreate={(event) => { void saveEvent(event).catch(() => undefined); }} />}<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedEvent?.id ?? ""} onSelect={(eventId) => { const event = events.find((item) => item.id === eventId); if (event) openEvent(event); }} onDateSelect={openCreateForDate} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">ПЛАН ПОТОКА</span><h2>События и записи</h2></div><CalendarDays size={18} className="heading-icon" /></div>{events.length === 0 ? <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Кликни по дате в календаре или нажми «Создать событие».</span></div> : events.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} mode="curator" onOpen={() => openEvent(event)} key={event.id} />)}</section></div>{detailsEvent && <CuratorScheduleEventDetails event={detailsEvent} onEdit={() => openEdit(detailsEvent)} onDelete={removeEvent} onClose={() => setDetailsId(null)} onAddRecording={() => { window.sessionStorage.setItem("curator-target-event", detailsEvent.id); onNavigate("Медиатека"); }} onReleaseBooking={() => void releaseBooking(detailsEvent.id)} />}</div>;
+  return <div className="curator-schedule">{scheduleLoadError && <div className="file-error" role="alert">{scheduleLoadError}</div>}<div className="curator-schedule-toolbar"><div><span className="section-kicker">РАСПИСАНИЕ ПОТОКА</span><strong>{events.length} событий опубликовано</strong><span>События видят ученики этого потока после публикации.</span></div><div className="schedule-toolbar-actions">{!viewingPracticumId && <button className="primary-button" onClick={() => { setEditingEvent(null); setPendingDate(null); setDetailsId(null); setFormDate(toDateKey(new Date())); setShowForm((current) => !current); }}><Plus size={16} /> {showForm ? "Закрыть форму" : "Создать событие"}</button>}<span className="schedule-toolbar-divider" aria-hidden="true" /><button className="secondary-button" disabled={!selectedEvent} onClick={() => selectedEvent && openEdit(selectedEvent)}><Pencil size={15} /> Редактировать</button><button className="secondary-button danger-button" disabled={!selectedEvent} onClick={removeEvent}><Trash2 size={15} /> Удалить</button></div></div><ScheduleBookingSettingsPanel />{pendingDate && <div className="schedule-date-confirm"><div><strong>Добавить событие на {formatEventDate(pendingDate)}?</strong><span>Дата уже выбрана. Подтверди действие, и откроется форма с деталями.</span></div><div><button className="secondary-button" type="button" onClick={() => setPendingDate(null)}>Нет</button><button className="primary-button" type="button" onClick={confirmCreateForDate}>Да, добавить</button></div></div>}{showForm && <ScheduleEventForm initialDate={formDate} initialEvent={editingEvent} onCancel={() => { setShowForm(false); setEditingEvent(null); }} onCreate={(event) => { void saveEvent(event).catch(() => undefined); }} />}<div className="calendar-layout"><section className="content-panel calendar-panel"><CalendarGrid events={events} selectedId={selectedEvent?.id ?? ""} onSelect={(eventId) => { const event = events.find((item) => item.id === eventId); if (event) openEvent(event); }} onDateSelect={openCreateForDate} /></section><section className="content-panel calendar-events"><div className="section-heading"><div><span className="section-kicker">ПЛАН ПОТОКА</span><h2>События и записи</h2></div><CalendarDays size={18} className="heading-icon" /></div>{events.length === 0 ? <div className="empty-state"><CalendarDays size={22} /><strong>Событий пока нет</strong><span>Кликни по дате в календаре или нажми «Создать событие».</span></div> : events.map((event) => <ScheduleEventCard event={event} selected={event.id === selectedEvent?.id} mode="curator" onOpen={() => openEvent(event)} key={event.id} />)}</section></div>{detailsEvent && <CuratorScheduleEventDetails event={detailsEvent} onEdit={() => openEdit(detailsEvent)} onDelete={removeEvent} onClose={() => setDetailsId(null)} onAddRecording={() => { window.sessionStorage.setItem("curator-target-event", detailsEvent.id); onNavigate("Медиатека"); }} onReleaseBooking={() => void releaseBooking(detailsEvent.id)} />}</div>;
 }
 
 function CuratorScheduleEventDetails({ event, onEdit, onDelete, onClose, onAddRecording, onReleaseBooking }: { event: ScheduleEvent; onEdit: () => void; onDelete: () => void; onClose: () => void; onAddRecording: () => void; onReleaseBooking: () => void }) {
@@ -3346,9 +3687,10 @@ function CuratorScheduleEventDetails({ event, onEdit, onDelete, onClose, onAddRe
   return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal curator-event-details" role="dialog" aria-modal="true" aria-labelledby="curator-schedule-event-title"><div className="rich-event-topbar"><h2 id="curator-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>{event.type}</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong></div><h3>{event.title}</h3><div className="rich-event-line"><CalendarDays size={16} /><span>{formatEventDate(event.date)}</span></div><div className="rich-event-description">{event.description}</div>{isBookable && <div className="event-recording-note"><Target size={16} /><div><strong>{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот пока свободен"}</strong><span>{event.bookedByStudentName ? "Индивидуальный слот занят этим учеником." : "Ученик сможет записаться на этот слот из своего расписания."}</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Ученики увидят её в разделе «Стримы».</span></div></div>}</div><div className="rich-event-footer"><button className="secondary-button danger-button" onClick={onDelete}>Удалить</button><button className="secondary-button" onClick={onEdit}>Редактировать</button>{isBookable && event.bookedByStudentName && <button className="secondary-button" onClick={onReleaseBooking}>Освободить слот</button>}{!event.recordingAvailable && <button className="secondary-button" onClick={onAddRecording}><Plus size={15} /> Добавить запись Vimeo</button>}<button className="primary-button" onClick={onClose}>Закрыть</button></div></section></div>;
 }
 
+/** Interpreted as Kyiv time regardless of the viewer's own timezone — see schedule-time.ts. */
 function eventStartDate(event: ScheduleEvent): Date {
   const startTime = event.time.split(/\s*[—–-]\s*/)[0]?.trim() || "00:00";
-  return new Date(`${event.date}T${startTime}:00`);
+  return zonedTimeToUtc(event.date, startTime);
 }
 
 function formatCountdown(ms: number): string {
@@ -3456,9 +3798,26 @@ function linkifyText(text: string): ReactNode[] {
   ));
 }
 
+// While an element is in the Fullscreen API's "top layer" (e.g. theater-mode live stream, which
+// fullscreens the video+chat wrapper together), anything portaled to document.body renders
+// BEHIND it — a lightbox opened from stream chat while fullscreen would look like it never
+// opened until Esc is pressed. Portal into the fullscreen element itself when one is active.
+function useLightboxPortalTarget(open: boolean): Element | null {
+  const [target, setTarget] = useState<Element | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const update = () => setTarget(document.fullscreenElement ?? document.body);
+    update();
+    document.addEventListener("fullscreenchange", update);
+    return () => document.removeEventListener("fullscreenchange", update);
+  }, [open]);
+  return target;
+}
+
 function ChatMessageRow({ message, currentUserId, onReact, onContextMenu }: { message: StreamChatMessage; currentUserId: string; onReact: (messageId: string, emoji: string) => void; onContextMenu: (event: ReactMouseEvent<HTMLDivElement>, message: StreamChatMessage) => void }) {
   const isStaff = message.authorRole === "CURATOR" || message.authorRole === "OWNER";
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+  const lightboxPortalTarget = useLightboxPortalTarget(Boolean(lightboxImage));
   useEffect(() => {
     if (!lightboxImage) return;
     const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setLightboxImage(null); };
@@ -3499,12 +3858,12 @@ function ChatMessageRow({ message, currentUserId, onReact, onContextMenu }: { me
         <a className="live-room-chat-embed-title" href={message.linkPreview.sourceUrl} target="_blank" rel="noopener noreferrer">{message.linkPreview.title}</a>
         <button type="button" className="live-room-chat-embed-image-link" onClick={() => setLightboxImage(message.linkPreview!.imageUrl)}><img className="live-room-chat-embed-image" src={message.linkPreview.imageUrl} alt={message.linkPreview.title} loading="lazy" /></button>
       </div>}
-      {lightboxImage && typeof document !== "undefined" && createPortal(
+      {lightboxImage && lightboxPortalTarget && createPortal(
         <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxImage(null); }}>
           <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxImage(null)}><X size={22} /></button>
           <img className="chat-image-lightbox-image" src={lightboxImage} alt="Просмотр изображения" />
         </div>,
-        document.body,
+        lightboxPortalTarget,
       )}
       {message.reactions.length > 0 && <div className="live-room-chat-reactions">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={`live-room-chat-reaction ${reaction.userIds.includes(currentUserId) ? "active" : ""}`} onClick={() => onReact(message.id, reaction.emoji)}>{reaction.emoji} <span>{reaction.userIds.length}</span></button>)}</div>}
     </div>
@@ -3735,6 +4094,17 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
   const [keyVisible, setKeyVisible] = useState(false);
   const [copiedField, setCopiedField] = useState<"url" | "key" | null>(null);
   const [status, setStatus] = useState<PlaybackStatusDto | null>(null);
+  const [storageStatus, setStorageStatus] = useState<{ totalBytes: number; availableBytes: number } | null>(null);
+  useEffect(() => {
+    const loadStorageStatus = () => { void fetch(`${API_ORIGIN}/api/streams/recording-storage`, { credentials: "include", cache: "no-store" }).then(async (response) => {
+      if (!response.ok) return;
+      const payload = await response.json() as { data?: { totalBytes: number; availableBytes: number } | null };
+      if (payload.data) setStorageStatus(payload.data);
+    }).catch(() => undefined); };
+    loadStorageStatus();
+    const poll = window.setInterval(loadStorageStatus, 5 * 60 * 1000);
+    return () => window.clearInterval(poll);
+  }, []);
   useEffect(() => {
     let cancelled = false;
     void fetch(`${API_ORIGIN}/api/schedule`, { credentials: "include", cache: "no-store" }).then(async (response) => {
@@ -3859,7 +4229,7 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
 
   return <div className="live-room">
     <div className="curator-schedule-toolbar">
-      <div><span className="section-kicker">ЭФИР ПОТОКА</span><strong>Прямой эфир</strong><span>Здесь куратор будет запускать трансляцию и вести чат с учениками.</span></div>
+      <div><span className="section-kicker">ЭФИР ПОТОКА</span><strong>Прямой эфир</strong><span>Здесь куратор будет запускать трансляцию и вести чат с учениками.</span>{storageStatus && <span>Место для записей: свободно {formatFileSize(storageStatus.availableBytes)} из {formatFileSize(storageStatus.totalBytes)}</span>}</div>
       <div className="schedule-toolbar-actions">
         <button className="secondary-button" onClick={() => { window.sessionStorage.setItem("curator-target-kind", "STREAM"); onNavigate("Медиатека"); }}><Plus size={16} /> Загрузить запись в Медиатеку</button>
       </div>
@@ -4148,17 +4518,15 @@ function CuratorAssignmentManager() {
 type AssignmentMaterialDraft = {
   title: string;
   url: string;
-  file: File | null;
+  files: File[];
 };
 
-function useObjectUrl(file: File | null): string {
-  const url = useMemo(() => file ? URL.createObjectURL(file) : "", [file]);
+function useObjectUrls(files: File[]): string[] {
+  const urls = useMemo(() => files.map((file) => URL.createObjectURL(file)), [files]);
   useEffect(() => {
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [url]);
-  return url;
+    return () => { urls.forEach((url) => URL.revokeObjectURL(url)); };
+  }, [urls]);
+  return urls;
 }
 
 function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMaterialDraft }) {
@@ -4224,14 +4592,17 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
     if (!canPublish || !selectedModule || published || publishing) return;
     setPublishError("");
     setPublishing(true);
-    let uploadedFileId: string | undefined;
+    const uploadedFileIds: string[] = [];
     try {
-      if (materialDraft.file) uploadedFileId = await uploadPrivateFile(materialDraft.file);
-      const materials = uploadedFileId
-        ? [{ kind: "FILE" as const, title: materialDraft.title.trim() || materialDraft.file?.name || "Материал к заданию", fileId: uploadedFileId }]
-        : materialDraft.url.trim()
-          ? [{ kind: "LINK" as const, title: materialDraft.title.trim() || "Материал к заданию", url: materialDraft.url.trim() }]
-          : [];
+      const fileMaterials = await Promise.all(materialDraft.files.map(async (file) => {
+        const fileId = await uploadPrivateFile(file);
+        uploadedFileIds.push(fileId);
+        return { kind: "FILE" as const, title: file.name, fileId };
+      }));
+      const materials = [
+        ...fileMaterials,
+        ...(materialDraft.url.trim() ? [{ kind: "LINK" as const, title: materialDraft.title.trim() || "Материал к заданию", url: materialDraft.url.trim() }] : []),
+      ];
       const response = await fetch(`${API_ORIGIN}/api/assignments`, {
         method: "POST",
         credentials: "include",
@@ -4252,7 +4623,7 @@ function AssignmentCreatorForm({ materialDraft }: { materialDraft: AssignmentMat
       window.sessionStorage.removeItem(ASSIGNMENT_TARGET_MODULE_KEY);
       window.dispatchEvent(new CustomEvent<Assignment & { materialsHandled: true; moduleId: string }>(assignmentPublishedEvent, { detail: { ...payload.data, materialsHandled: true, moduleId: selectedModule.id } }));
     } catch (error) {
-      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
+      for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
       setPublishError(error instanceof Error ? error.message : "Не удалось опубликовать задание.");
     } finally {
       setPublishing(false);
@@ -4297,26 +4668,27 @@ function CreateAssignmentMaterialPanel() {
   const [expanded, setExpanded] = useState(false);
   const [title, setTitle] = useState("");
   const [url, setUrl] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const materialFiles = useDiscussionAttachments();
   const [status, setStatus] = useState("");
   const handled = useRef(new Set<string>());
+  const files = useMemo(() => materialFiles.attachments.map((attachment) => attachment.file), [materialFiles.attachments]);
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent<AssignmentMaterialDraft>("assignment-material-draft", {
-      detail: { title, url, file },
+      detail: { title, url, files },
     }));
-  }, [title, url, file]);
+  }, [title, url, files]);
 
   useEffect(() => {
     const handlePublished = (event: Event) => {
       if (!(event instanceof CustomEvent) || !isAssignment(event.detail) || Boolean((event.detail as Assignment & { materialsHandled?: boolean }).materialsHandled) || handled.current.has(event.detail.id)) return;
-      if (!file && !url.trim()) return;
+      if (files.length === 0 && !url.trim()) return;
       handled.current.add(event.detail.id);
       void (async () => {
         try {
           const materials = [
             ...(url.trim() ? [{ kind: "LINK" as const, title: title.trim() || "Ссылка к заданию", url: url.trim() }] : []),
-            ...(file ? [{ kind: "FILE" as const, title: file.name, fileId: await uploadPrivateFile(file) }] : []),
+            ...(await Promise.all(files.map(async (file) => ({ kind: "FILE" as const, title: file.name, fileId: await uploadPrivateFile(file) })))),
           ];
           if (materials.length === 0) return;
           const response = await fetch(`${API_ORIGIN}/api/assignments/${event.detail.id}`, { method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ materials }) });
@@ -4330,40 +4702,42 @@ function CreateAssignmentMaterialPanel() {
     };
     window.addEventListener(assignmentPublishedEvent, handlePublished);
     return () => window.removeEventListener(assignmentPublishedEvent, handlePublished);
-  }, [file, title, url]);
+  }, [files, title, url]);
 
-  return <section className="content-panel assignment-material-panel"><div className="section-heading"><div><span className="section-kicker">ДОПОЛНИТЕЛЬНЫЕ МАТЕРИАЛЫ</span><h2>Что увидит ученик перед ответом</h2><p className="section-heading-note">Не обязательно — можно добавить ссылку Vimeo/Notion и файлы, если они нужны для этого задания.</p></div><button type="button" className="secondary-button" onClick={() => setExpanded((current) => !current)}>{expanded ? "Скрыть" : "Прикрепить материал"}</button></div>{expanded && <div className="assignment-material-editor"><div className="form-grid"><label className="form-field"><span>Название материала</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Запись разбора или пример" /></label><label className="form-field"><span>Ссылка Vimeo/Notion</span><input type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://vimeo.com/..." /></label></div><label className={`file-dropzone ${file ? "has-file" : ""}`} htmlFor="curator-assignment-material"><FileCheck2 size={17} /><span>{file?.name || "Прикрепить изображение, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ</small><input id="curator-assignment-material" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { const next = event.target.files?.[0] ?? null; if (next && next.size > 10 * 1024 * 1024) { setStatus("Файл слишком большой. Максимальный размер — 10 МБ."); return; } setStatus(""); setFile(next); }} /></label>{status && <div className="detail-feedback"><Target size={17} /><div><strong>{status}</strong><p>Сначала опубликуй задание основной кнопкой выше. Материалы сохранятся в защищённом хранилище.</p></div></div>}</div>}</section>;
+  return <section className="content-panel assignment-material-panel"><div className="section-heading"><div><span className="section-kicker">ДОПОЛНИТЕЛЬНЫЕ МАТЕРИАЛЫ</span><h2>Что увидит ученик перед ответом</h2><p className="section-heading-note">Не обязательно — можно добавить ссылку Vimeo/Notion и файлы, если они нужны для этого задания.</p></div><button type="button" className="secondary-button" onClick={() => setExpanded((current) => !current)}>{expanded ? "Скрыть" : "Прикрепить материал"}</button></div>{expanded && <div className="assignment-material-editor"><div className="form-grid"><label className="form-field"><span>Название ссылки</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Запись разбора или пример" /></label><label className="form-field"><span>Ссылка Vimeo/Notion</span><input type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://vimeo.com/..." /></label></div><label className={`file-dropzone ${materialFiles.attachments.length > 0 ? "has-file" : ""}`} htmlFor="curator-assignment-material"><FileCheck2 size={17} /><span>{materialFiles.attachments.length > 0 ? `Прикреплено файлов: ${materialFiles.attachments.length}` : "Прикрепить изображение, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ за файл · можно прикрепить сразу несколько</small><input id="curator-assignment-material" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { materialFiles.addFiles(event.target.files); event.target.value = ""; }} /></label>{materialFiles.error && <div className="file-error" role="alert">{materialFiles.error}</div>}<DiscussionAttachmentPreviewList attachments={materialFiles.attachments} onRemove={materialFiles.removeAt} />{status && <div className="detail-feedback"><Target size={17} /><div><strong>{status}</strong><p>Сначала опубликуй задание основной кнопкой выше. Материалы сохранятся в защищённом хранилище.</p></div></div>}</div>}</section>;
 }
 
 function AssignmentMaterialLivePreview({ draft }: { draft: AssignmentMaterialDraft }) {
-  const previewUrl = useObjectUrl(draft.file);
+  const previewUrls = useObjectUrls(draft.files);
   const embedUrl = draft.url.trim() ? assignmentMaterialEmbed(draft.url.trim()) : null;
   const host = typeof document === "undefined" ? null : document.querySelector<HTMLElement>(".assignment-preview .preview-body");
 
-  if ((!draft.file && !draft.url.trim()) || !host) return null;
+  if ((draft.files.length === 0 && !draft.url.trim()) || !host) return null;
 
   return createPortal(<div className="assignment-material-live-preview">
     <div className="assignment-material-live-heading"><span className="section-kicker">МАТЕРИАЛ К ЗАДАНИЮ</span><strong>Предпросмотр для ученика</strong></div>
-    <div className="assignment-material-live-body">
-      <div className="assignment-material-live-head"><strong>{draft.title.trim() || draft.file?.name || "Материал к заданию"}</strong><span>{draft.file?.type || "Ссылка"}</span></div>
-      {draft.file && previewUrl && draft.file.type.startsWith("image/") && <div className="assignment-material-live-image"><Image src={previewUrl} alt="Предпросмотр материала" fill sizes="(max-width: 900px) 100vw, 560px" unoptimized /></div>}
-      {draft.file && previewUrl && draft.file.type.startsWith("video/") && <video className="assignment-material-live-video" src={previewUrl} controls preload="metadata" />}
-      {draft.file && previewUrl && draft.file.type === "application/pdf" && <iframe className="assignment-material-live-pdf" src={previewUrl} title="Предпросмотр PDF" />}
-      {embedUrl && <iframe className="assignment-material-live-embed" src={embedUrl} title="Предпросмотр ссылки" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}
-      {!embedUrl && draft.url.trim() && <a className="secondary-button" href={draft.url} target="_blank" rel="noreferrer">Открыть ссылку <ArrowUpRight size={15} /></a>}
-    </div>
+    {draft.files.map((file, index) => <div className="assignment-material-live-body" key={`${file.name}-${index}`}>
+      <div className="assignment-material-live-head"><strong>{file.name}</strong><span>{file.type}</span></div>
+      {previewUrls[index] && file.type.startsWith("image/") && <div className="assignment-material-live-image"><Image src={previewUrls[index]} alt="Предпросмотр материала" fill sizes="(max-width: 900px) 100vw, 560px" unoptimized /></div>}
+      {previewUrls[index] && file.type.startsWith("video/") && <video className="assignment-material-live-video" src={previewUrls[index]} controls preload="metadata" />}
+      {previewUrls[index] && file.type === "application/pdf" && <iframe className="assignment-material-live-pdf" src={previewUrls[index]} title="Предпросмотр PDF" />}
+    </div>)}
+    {(embedUrl || draft.url.trim()) && <div className="assignment-material-live-body">
+      <div className="assignment-material-live-head"><strong>{draft.title.trim() || "Ссылка к заданию"}</strong><span>Ссылка</span></div>
+      {embedUrl ? <iframe className="assignment-material-live-embed" src={embedUrl} title="Предпросмотр ссылки" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /> : <a className="secondary-button" href={draft.url} target="_blank" rel="noreferrer">Открыть ссылку <ArrowUpRight size={15} /></a>}
+    </div>}
   </div>, host);
 }
 
 function CreateAssignmentForm() {
-  const [materialDraft, setMaterialDraft] = useState<AssignmentMaterialDraft>({ title: "", url: "", file: null });
+  const [materialDraft, setMaterialDraft] = useState<AssignmentMaterialDraft>({ title: "", url: "", files: [] });
 
   useEffect(() => {
     const handleDraft = (event: Event) => {
       if (!(event instanceof CustomEvent) || !event.detail || typeof event.detail !== "object") return;
       const draft = event.detail as Partial<AssignmentMaterialDraft>;
-      if (typeof draft.title !== "string" || typeof draft.url !== "string" || !(draft.file === null || draft.file instanceof File)) return;
-      setMaterialDraft({ title: draft.title, url: draft.url, file: draft.file });
+      if (typeof draft.title !== "string" || typeof draft.url !== "string" || !Array.isArray(draft.files) || !draft.files.every((file) => file instanceof File)) return;
+      setMaterialDraft({ title: draft.title, url: draft.url, files: draft.files });
     };
     window.addEventListener("assignment-material-draft", handleDraft);
     return () => window.removeEventListener("assignment-material-draft", handleDraft);
@@ -4446,19 +4820,6 @@ function CourseView({ unlockedModuleIds: initialUnlockedModuleIds, onOpenAssignm
   const selectedContent = moduleContents.find((item) => item.id === selectedContentId) ?? moduleContents[0];
   const moduleUnlocked = effectiveUnlockedModuleIds.has(selectedModule.id);
 
-  useEffect(() => {
-    const moduleRows = document.querySelectorAll<HTMLButtonElement>(".learner-course-view .course-map .module-row");
-    moduleRows.forEach((row) => {
-      const title = row.querySelector<HTMLElement>(".module-copy strong")?.textContent?.trim() ?? "";
-      const moduleRecord = practicumModules.find((item) => item.title === title);
-      if (moduleRecord) {
-        row.setAttribute("data-module-description", moduleRecord.description);
-        row.setAttribute("data-module-number", moduleRecord.number);
-        row.querySelector<HTMLElement>(".module-copy strong")?.setAttribute("data-module-number", moduleRecord.number);
-      }
-    });
-  }, [practicumModules]);
-
   if (moduleToOpen) return <ModuleOverviewPage module={moduleToOpen} content={courseContent[moduleToOpen.id]} onOpenAssignment={onOpenAssignment} onOpenDiscussion={onOpenDiscussion} onBack={() => { setOpenedModuleId(null); setContinued(false); }} />;
 
   const moduleSteps = [
@@ -4475,7 +4836,7 @@ function CourseView({ unlockedModuleIds: initialUnlockedModuleIds, onOpenAssignm
       <div className="course-progress-fact"><span>ДОСТУП</span><div className="course-progress-fact-highlight"><strong>Материалы останутся после завершения</strong><small>Записи, уроки и проверенные работы будут сохранены в профиле.</small></div></div>
     </section>
 
-    <div className="course-workspace"><section className="content-panel course-map"><div className="section-heading"><div><h2>Структура курса</h2></div><span className="progress-inline">{pluralizeLessons(practicumModules.length)}</span></div><div className="module-sections">{sectionOrder.map((section) => { const sectionModules = practicumModules.filter((module) => module.section === section); return <section className="module-section" key={section}><div className="module-section-heading"><strong>{section}</strong><span>{pluralizeLessons(sectionModules.length)}</span></div><div className="module-list">{sectionModules.map((module) => { const unlocked = unlockedModuleIds.has(module.id); return <button className={`module-row ${hasUserSelectedModule && selectedModule.id === module.id ? "selected" : ""} ${unlocked ? "" : "locked"}`} key={module.id} onClick={() => { if (unlocked) { setSelectedId(module.id); setSelectedContentId(`${module.id}-lesson`); setOpenedModuleId(module.id); setHasUserSelectedModule(true); } }} aria-pressed={hasUserSelectedModule && selectedModule.id === module.id} disabled={!unlocked}><span className="module-number">{module.number}</span><div className="module-copy"><strong>{module.title}</strong><span>{unlocked ? module.status : "Закрыт"} · {pluralizeMaterials(module.lessons)}</span></div><div className="module-progress"><span>{module.progress}%</span><i><b style={{ width: `${module.progress}%` }} /></i></div>{unlocked ? <ChevronRight size={16} /> : <LockKeyhole size={15} />}</button>; })}</div></section>; })}</div><div className="course-map-footer"><span>Закрытые уроки откроются после завершения предыдущего этапа и разблокировки куратором.</span><button className="text-button" onClick={() => { setSelectedId("week-1"); setSelectedContentId("week-1-lesson"); setHasUserSelectedModule(true); }}>Вернуться к текущему <ChevronRight size={15} /></button></div></section><section className="content-panel module-detail"><div className="module-detail-head"><div><span className="section-kicker">УРОК {selectedModule.number}</span><h2>{selectedModule.title}</h2></div>{moduleUnlocked ? <Target size={19} className="heading-icon" /> : <LockKeyhole size={19} className="heading-icon" />}</div><div className="module-detail-body"><div className="module-detail-summary"><div className="module-progress-large"><strong>{selectedModule.progress}%</strong><span>пройдено</span></div><p>{selectedModule.description}</p></div><div className="module-detail-meta"><span><BookOpen size={14} /> {pluralizeMaterials(selectedModule.lessons)}</span><span><FileCheck2 size={14} /> {moduleUnlocked ? "Материалы доступны" : "Доступ ограничен"}</span></div><div className="module-content-block"><div className="module-content-heading"><span>СОДЕРЖАНИЕ УРОКА</span><small>{moduleContents.length} элемента</small></div><div className="module-content-list">{moduleContents.map((item) => <button className={`module-content-item ${item.tone} ${selectedContent.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedContentId(item.id)} disabled={!moduleUnlocked}><span className="module-content-kind">{item.kind}</span><span className="module-content-copy"><strong>{item.title}</strong><small>{item.meta}</small></span><ChevronRight size={16} /></button>)}</div><div className="module-content-preview"><span>ВЫБРАНО</span><strong>{selectedContent.title}</strong><small>{selectedContent.kind} · {selectedContent.meta} · Откроется внутри платформы</small></div></div><div className="module-steps"><span className="detail-label">КАК ПРОХОДИТ УРОК</span>{moduleSteps.map((step, index) => <div className={`module-step ${step.complete ? "complete" : ""} ${moduleUnlocked ? "" : "locked"}`} key={step.label}><div className="module-step-icon">{moduleUnlocked ? step.icon : <LockKeyhole size={15} />}</div><div><strong>{String(index + 1).padStart(2, "0")} · {step.label}</strong><span>{step.description}</span></div><small>{moduleUnlocked ? (step.complete ? "Готово" : "Дальше") : "Закрыто"}</small></div>)}</div>{moduleUnlocked ? <><div className="next-lesson"><span className="section-kicker">СЛЕДУЮЩИЙ ШАГ</span><strong>{selectedModule.progress === 100 ? "Повторить ключевые уроки" : "Продолжить с последнего урока"}</strong><span>{continued ? "Шаг отмечен для продолжения" : "Материалы и прогресс сохранятся в профиле"}</span></div><button className="primary-button open-module-button" onClick={() => setContinued(true)}><span>{continued ? "Продолжение открыто" : selectedModule.progress === 100 ? "Открыть урок" : "Продолжить обучение"}</span><span className="open-module-button-arrow" aria-hidden="true"><ChevronRight size={17} /></span></button></> : <div className="locked-note"><LockKeyhole size={17} /><div><strong>Урок пока закрыт</strong><span>Дождись разблокировки куратором, чтобы открыть материалы.</span></div></div>}</div></section></div>
+    <div className="course-workspace"><section className="content-panel course-map"><div className="section-heading"><div><h2>Структура курса</h2></div><span className="progress-inline">{pluralizeLessons(practicumModules.length)}</span></div><div className="module-sections">{sectionOrder.map((section) => { const sectionModules = practicumModules.filter((module) => module.section === section); return <section className="module-section" key={section}><div className="module-section-heading"><strong>{section}</strong><span>{pluralizeLessons(sectionModules.length)}</span></div><div className="module-list">{sectionModules.map((module) => { const unlocked = unlockedModuleIds.has(module.id); return <button className={`module-row ${hasUserSelectedModule && selectedModule.id === module.id ? "selected" : ""} ${unlocked ? "" : "locked"}`} key={module.id} onClick={() => { if (unlocked) { setSelectedId(module.id); setSelectedContentId(`${module.id}-lesson`); setOpenedModuleId(module.id); setHasUserSelectedModule(true); } }} aria-pressed={hasUserSelectedModule && selectedModule.id === module.id} disabled={!unlocked}><div className="module-copy"><strong>{module.title}</strong><span>{unlocked ? module.status : "Закрыт"} · {pluralizeMaterials(module.lessons)}</span></div><div className="module-progress"><span>{module.progress}%</span><i><b style={{ width: `${module.progress}%` }} /></i></div>{unlocked ? <ChevronRight size={16} /> : <LockKeyhole size={15} />}</button>; })}</div></section>; })}</div><div className="course-map-footer"><span>Закрытые уроки откроются после завершения предыдущего этапа и разблокировки куратором.</span><button className="text-button" onClick={() => { setSelectedId("week-1"); setSelectedContentId("week-1-lesson"); setHasUserSelectedModule(true); }}>Вернуться к текущему <ChevronRight size={15} /></button></div></section><section className="content-panel module-detail"><div className="module-detail-head"><div><span className="section-kicker">УРОК {selectedModule.number}</span><h2>{selectedModule.title}</h2></div>{moduleUnlocked ? <Target size={19} className="heading-icon" /> : <LockKeyhole size={19} className="heading-icon" />}</div><div className="module-detail-body"><div className="module-detail-summary"><div className="module-progress-large"><strong>{selectedModule.progress}%</strong><span>пройдено</span></div><p>{selectedModule.description}</p></div><div className="module-detail-meta"><span><BookOpen size={14} /> {pluralizeMaterials(selectedModule.lessons)}</span><span><FileCheck2 size={14} /> {moduleUnlocked ? "Материалы доступны" : "Доступ ограничен"}</span></div><div className="module-content-block"><div className="module-content-heading"><span>СОДЕРЖАНИЕ УРОКА</span><small>{moduleContents.length} элемента</small></div><div className="module-content-list">{moduleContents.map((item) => <button className={`module-content-item ${item.tone} ${selectedContent.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedContentId(item.id)} disabled={!moduleUnlocked}><span className="module-content-kind">{item.kind}</span><span className="module-content-copy"><strong>{item.title}</strong><small>{item.meta}</small></span><ChevronRight size={16} /></button>)}</div><div className="module-content-preview"><span>ВЫБРАНО</span><strong>{selectedContent.title}</strong><small>{selectedContent.kind} · {selectedContent.meta} · Откроется внутри платформы</small></div></div><div className="module-steps"><span className="detail-label">КАК ПРОХОДИТ УРОК</span>{moduleSteps.map((step, index) => <div className={`module-step ${step.complete ? "complete" : ""} ${moduleUnlocked ? "" : "locked"}`} key={step.label}><div className="module-step-icon">{moduleUnlocked ? step.icon : <LockKeyhole size={15} />}</div><div><strong>{String(index + 1).padStart(2, "0")} · {step.label}</strong><span>{step.description}</span></div><small>{moduleUnlocked ? (step.complete ? "Готово" : "Дальше") : "Закрыто"}</small></div>)}</div>{moduleUnlocked ? <><div className="next-lesson"><span className="section-kicker">СЛЕДУЮЩИЙ ШАГ</span><strong>{selectedModule.progress === 100 ? "Повторить ключевые уроки" : "Продолжить с последнего урока"}</strong><span>{continued ? "Шаг отмечен для продолжения" : "Материалы и прогресс сохранятся в профиле"}</span></div><button className="primary-button open-module-button" onClick={() => setContinued(true)}><span>{continued ? "Продолжение открыто" : selectedModule.progress === 100 ? "Открыть урок" : "Продолжить обучение"}</span><span className="open-module-button-arrow" aria-hidden="true"><ChevronRight size={17} /></span></button></> : <div className="locked-note"><LockKeyhole size={17} /><div><strong>Урок пока закрыт</strong><span>Дождись разблокировки куратором, чтобы открыть материалы.</span></div></div>}</div></section></div>
   </div>;
 }
 
@@ -4518,7 +4879,7 @@ function ModuleOverviewPage({ module, content: courseContent, onOpenAssignment, 
     <header className="module-page-header"><div><span className="eyebrow"><BookOpen size={14} /> УРОК {module.number}</span><h2>{module.title}</h2><p>{module.description}</p></div><div className="module-page-progress"><strong>{module.progress}%</strong><span>пройдено</span><i><b style={{ width: `${module.progress}%` }} /></i></div></header>
     <div className="module-resource-grid">
       <section className="module-resource-card module-stream-card"><div className="module-resource-heading"><Play size={17} /><h3>Тематические записи</h3><span>{thematicMediaEntries.length} {thematicMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{thematicMediaEntries.length === 0 ? <div className="module-media-empty"><Play size={20} /><strong>Тематических записей пока нет</strong><span>Куратор опубликует их по ходу этого урока.</span></div> : <div className="module-video-stack">{thematicMediaEntries.map((media) => <div className="module-video-item" key={media.id}><div className="module-video-stage">{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? module.title} />}<span className="module-video-label">{media.title ?? module.title}</span><span className="stream-duration">{formatDuration(media.durationSec)}</span></div><ArchivedChatPanel mediaId={media.id} /></div>)}</div>}</section>
-      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{hasRealAssignments ? (assignments.length === 1 ? "1 задание" : `${assignments.length} задания`) : `${baseContent.homework.length} пункта`}</span></div>{hasRealAssignments ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}<button className="primary-button resource-action-button" onClick={() => onOpenAssignment(assignment.id)}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></article>)}</div> : <><ol>{baseContent.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button resource-action-button" onClick={() => onOpenAssignment("")}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></>}</section>
+      <section className="module-resource-card module-homework-card"><div className="module-resource-heading"><FileCheck2 size={17} /><h3>Домашнее задание</h3><span>{hasRealAssignments ? (assignments.length === 1 ? "1 задание" : `${assignments.length} задания`) : `${baseContent.homework.length} пункта`}</span></div>{hasRealAssignments ? <div className="curator-assignment-list">{assignments.map((assignment) => <article className="curator-assignment-card" key={assignment.id}><div><strong>{assignment.title}</strong><p>{assignment.description}</p></div>{assignment.requirements.length > 0 && <ol>{assignment.requirements.map((requirement, index) => <li key={`${assignment.id}-${index}`}>{requirement}</li>)}</ol>}<AssignmentMaterialsInline materials={assignment.materials} /><button className="primary-button resource-action-button" onClick={() => onOpenAssignment(assignment.id)}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></article>)}</div> : <><ol>{baseContent.homework.map((item) => <li key={item}>{item}</li>)}</ol><p className="module-resource-note">К каждому вопросу требуется как текстовое описание, так и схема с графическим описанием вопроса.</p><button className="primary-button resource-action-button" onClick={() => onOpenAssignment("")}><span>Открыть задание</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button></>}</section>
       <section className="module-resource-card module-qa-card"><div className="module-resource-heading"><MessageSquareText size={17} /><h3>Q&A с куратором</h3><span>{qaMediaEntries.length} {qaMediaEntries.length === 1 ? "запись" : "записей"}</span></div>{qaMediaEntries.length > 0 && <div className="module-video-stack">{qaMediaEntries.map((media) => <div className="module-video-item" key={media.id}><div className="module-qa-video-stage">{media.embedUrl && <TrackedVideo mediaId={media.id} src={media.embedUrl} title={media.title ?? "Q&A с куратором"} />}<span>{media.title ?? "Q&A с куратором"}</span></div><ArchivedChatPanel mediaId={media.id} /></div>)}</div>}<ul>{baseContent.questions.map((question) => <li key={question}>{question}</li>)}</ul><button className="secondary-button resource-action-button" onClick={() => setDiscussionOpened((current) => !current)}><span>{discussionOpened ? "Обсуждение открыто" : "Открыть обсуждение"}</span><span className="resource-action-button-arrow" aria-hidden="true"><ChevronRight size={16} /></span></button>{qaMediaEntries.length === 0 && <div className="module-action-feedback">Здесь появится Q&A-запись, когда куратор добавит её к этому уроку.</div>}</section>
     </div>
   </div>;
@@ -4910,7 +5271,7 @@ function StreamsView() {
        const lessonStreams: Array<StreamItem & { sortAt: number }> = (payload.data?.modules ?? []).flatMap((module) => module.media.filter((media) => media.status === "PUBLISHED" && media.embedUrl).map((media) => ({
          id: media.id,
          title: media.title ?? module.title,
-         kind: (media.kind === "BREAKDOWN" ? "Разбор" : media.kind === "TALKS" ? "Talks" : "Стрим") as StreamKind,
+         kind: (media.kind === "BREAKDOWN" ? "Разбор" : media.kind === "TALKS" ? "Talks" : media.kind === "QA" ? "Q&A" : "Стрим") as StreamKind,
         module: `${String(module.position).padStart(2, "0")} · ${module.title}`,
         date: media.publishedAt ? new Date(media.publishedAt).toLocaleDateString("ru-RU") : "Опубликовано",
         sortAt: media.publishedAt ? new Date(media.publishedAt).getTime() : 0,
@@ -4970,7 +5331,10 @@ function StreamsView() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [courseStreams]);
-  const allStreams: readonly StreamItem[] = courseStreams ?? studentDashboard.streams;
+  // Empty (not seeded with demo rows) while the real fetch is in flight — a demo recording here
+  // used to flash on screen for a moment before the actual API response landed, same class of
+  // bug `events` above already had to be fixed for.
+  const allStreams: readonly StreamItem[] = courseStreams ?? [];
   const moduleOptions = Array.from(new Set(allStreams.map((stream) => stream.module)));
   const streams = allStreams.filter((stream) => (filter === "all" || stream.kind === filter) && (moduleFilter === "all" || stream.module === moduleFilter));
   const selectedStream = streams.find((stream) => stream.id === selectedId) ?? streams[0];
@@ -4983,7 +5347,7 @@ function StreamsView() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [playerOpen]);
 
-  return <div className="stream-library">{streamsLoadError && <div className="file-error" role="alert">{streamsLoadError}</div>}<div className="stream-library-toolbar"><div className="assignment-filter"><button className={`filter-chip ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>Все <span>{allStreams.length}</span></button><button className={`filter-chip ${filter === "Разбор" ? "active" : ""}`} onClick={() => setFilter("Разбор")}>Разборы <span>{allStreams.filter((stream) => stream.kind === "Разбор").length}</span></button><button className={`filter-chip ${filter === "Стрим" ? "active" : ""}`} onClick={() => setFilter("Стрим")}>Стримы <span>{allStreams.filter((stream) => stream.kind === "Стрим").length}</span></button><button className={`filter-chip ${filter === "Talks" ? "active" : ""}`} onClick={() => setFilter("Talks")}>Talks <span>{allStreams.filter((stream) => stream.kind === "Talks").length}</span></button></div><label className="stream-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map((module) => <option value={module} key={module}>{module}</option>)}</select></label><span className="stream-count">{streams.length} записи</span></div><section className="stream-grid">{streams.length > 0 ? streams.map((stream) => <StreamCard stream={stream} selected={stream.id === selectedStream?.id} key={stream.id} onOpen={() => openStream(stream.id)} />) : <div className="empty-state"><Play size={22} /><strong>В этом уроке пока нет записей</strong><span>Выбери другой урок или сбрось фильтр.</span></div>}</section>{playerOpen && selectedStream && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${selectedStream.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">{selectedStream.kind.toUpperCase()} · {selectedStream.module}</span><strong>{selectedStream.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{selectedStream.embedUrl ? <TrackedVideo mediaId={selectedStream.id} src={selectedStream.embedUrl} title={selectedStream.title} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}<div className="video-modal-foot"><span>{selectedStream.description}</span><ArchivedChatPanel mediaId={selectedStream.id} /></div></div></div>}</div>;
+  return <div className="stream-library">{streamsLoadError && <div className="file-error" role="alert">{streamsLoadError}</div>}<div className="stream-library-toolbar"><div className="assignment-filter"><button className={`filter-chip ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>Все <span>{allStreams.length}</span></button><button className={`filter-chip ${filter === "Разбор" ? "active" : ""}`} onClick={() => setFilter("Разбор")}>Разборы <span>{allStreams.filter((stream) => stream.kind === "Разбор").length}</span></button><button className={`filter-chip ${filter === "Стрим" ? "active" : ""}`} onClick={() => setFilter("Стрим")}>Стримы <span>{allStreams.filter((stream) => stream.kind === "Стрим").length}</span></button><button className={`filter-chip ${filter === "Q&A" ? "active" : ""}`} onClick={() => setFilter("Q&A")}>Q&A <span>{allStreams.filter((stream) => stream.kind === "Q&A").length}</span></button><button className={`filter-chip ${filter === "Talks" ? "active" : ""}`} onClick={() => setFilter("Talks")}>Talks <span>{allStreams.filter((stream) => stream.kind === "Talks").length}</span></button></div><label className="stream-module-filter"><span>Урок</span><select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)}><option value="all">Все уроки</option>{moduleOptions.map((module) => <option value={module} key={module}>{module}</option>)}</select></label><span className="stream-count">{streams.length} записи</span></div><section className="stream-grid">{streams.length > 0 ? streams.map((stream) => <StreamCard stream={stream} selected={stream.id === selectedStream?.id} key={stream.id} onOpen={() => openStream(stream.id)} />) : courseStreams === null ? <div className="empty-state"><Play size={22} /><strong>Загружаем записи…</strong></div> : <div className="empty-state"><Play size={22} /><strong>В этом уроке пока нет записей</strong><span>Выбери другой урок или сбрось фильтр.</span></div>}</section>{playerOpen && selectedStream && <div className="video-modal-backdrop" role="dialog" aria-modal="true" aria-label={`Плеер: ${selectedStream.title}`} onMouseDown={(event) => { if (event.currentTarget === event.target) closePlayer(); }}><div className="video-modal"><div className="video-modal-head"><div><span className="section-kicker">{selectedStream.kind.toUpperCase()} · {selectedStream.module}</span><strong>{selectedStream.title}</strong></div><button className="icon-button" aria-label="Закрыть плеер" onClick={closePlayer}><X size={18} /></button></div>{selectedStream.embedUrl ? <TrackedVideo mediaId={selectedStream.id} src={selectedStream.embedUrl} title={selectedStream.title} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}<div className="video-modal-foot"><span>{selectedStream.description}</span><ArchivedChatPanel mediaId={selectedStream.id} /></div></div></div>}</div>;
 }
 
 function StreamCard({ stream, selected, onOpen }: { stream: StreamItem; selected: boolean; onOpen: () => void }) {
@@ -5024,75 +5388,51 @@ function DiscussionCreatedState({ thread, context, onOpenHistory }: { thread: Di
 function DiscussionContextBanner({ context, onOpenHistory }: { context: DiscussionContext; onOpenHistory: () => void }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
-  const [attachmentName, setAttachmentName] = useState("");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [attachmentPreviewUrl, setAttachmentPreviewUrl] = useState("");
-  const [attachmentType, setAttachmentType] = useState<"image" | "video" | "file" | "">("");
-  const [attachmentError, setAttachmentError] = useState("");
+  const attachments = useDiscussionAttachments();
   const [submitError, setSubmitError] = useState("");
   const [saving, setSaving] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [createdThread, setCreatedThread] = useState<DiscussionApiThread | null>(null);
   const canSubmit = title.trim().length > 0 && body.trim().length > 0;
 
-  useEffect(() => () => {
-    if (attachmentPreviewUrl) URL.revokeObjectURL(attachmentPreviewUrl);
-  }, [attachmentPreviewUrl]);
-
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!canSubmit || saving) return;
     setSaving(true);
     setSubmitError("");
-    let uploadedFileId = "";
+    let uploadedFileIds: string[] = [];
     try {
-      if (selectedFile) {
-        const createResponse = await fetch(`${API_ORIGIN}/api/files`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalName: selectedFile.name, mimeType: selectedFile.type, byteSize: selectedFile.size }) });
-        const createPayload = await createResponse.json().catch(() => ({})) as { message?: string; data?: { id: string; uploadUrl: string } };
-        if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
-        uploadedFileId = createPayload.data.id;
-        const uploadResponse = await fetch(createPayload.data.uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": selectedFile.type }, body: selectedFile });
-        if (!uploadResponse.ok) throw new Error("Не удалось загрузить файл.");
-      }
-      const response = await fetch(`${API_ORIGIN}/api/discussions`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, body, moduleId: context.moduleId, assignmentId: context.assignmentId, attachments: selectedFile && uploadedFileId ? [{ fileId: uploadedFileId, originalName: selectedFile.name, mimeType: selectedFile.type, byteSize: selectedFile.size }] : [] }) });
+      const uploaded = await attachments.uploadAll();
+      uploadedFileIds = uploaded.uploadedFileIds;
+      const response = await fetch(`${API_ORIGIN}/api/discussions`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, body, moduleId: context.moduleId, assignmentId: context.assignmentId, attachments: uploaded.payload }) });
       const payload = await response.json().catch(() => ({})) as { message?: string; data?: DiscussionApiThread };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось создать тему.");
       setCreatedThread(payload.data);
       setSubmitted(true);
     } catch (error: unknown) {
-      if (uploadedFileId) void fetch(`${API_ORIGIN}/api/files/${uploadedFileId}`, { method: "DELETE", credentials: "include" });
+      for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
       setSubmitError(error instanceof Error ? error.message : "Не удалось создать тему.");
     } finally {
       setSaving(false);
     }
   };
 
-  const selectAttachment = (file: File | undefined) => {
-    if (!file) return;
-    if (file.size > 10 * 1024 * 1024) {
-      setAttachmentError("Файл слишком большой. Максимальный размер — 10 МБ.");
-      return;
-    }
-    setAttachmentError("");
-    setAttachmentName(file.name);
-    setSelectedFile(file);
-    setAttachmentType(file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "file");
-    setAttachmentPreviewUrl(URL.createObjectURL(file));
-  };
-
   const handleBodyPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const imageItem = Array.from(event.clipboardData.items).find((item) => item.type.startsWith("image/"));
-    if (!imageItem) return;
-    const file = imageItem.getAsFile();
-    if (!file) return;
+    const imageItems = Array.from(event.clipboardData.items).filter((item) => item.type.startsWith("image/"));
+    if (imageItems.length === 0) return;
     event.preventDefault();
-    const extension = imageItem.type.split("/")[1] || "png";
-    selectAttachment(new File([file], `screenshot-${Date.now()}.${extension}`, { type: imageItem.type }));
+    const files = imageItems.map((item, index) => {
+      const file = item.getAsFile();
+      if (!file) return null;
+      const extension = item.type.split("/")[1] || "png";
+      return new File([file], `screenshot-${Date.now()}-${index}.${extension}`, { type: item.type });
+    }).filter((file): file is File => file !== null);
+    attachments.addFiles(files);
   };
 
   if (createdThread) return <DiscussionCreatedState thread={createdThread} context={context} onOpenHistory={onOpenHistory} />;
 
-  return <section className="content-panel discussion-context-banner"><div className="discussion-context-heading"><h2>Задать вопрос куратору</h2></div><div className="discussion-context-chips"><span><BookOpen size={14} /> {context.module}</span></div><form className="discussion-composer" onSubmit={submit}><label className="form-field"><span>Тема вопроса</span><input value={title} onChange={(event) => { setTitle(event.target.value); setSubmitted(false); }} placeholder="Например: Как определить точку входа в этом сценарии?" /></label><label className="form-field"><span>Вопрос и описание</span><textarea value={body} onChange={(event) => { setBody(event.target.value); setSubmitted(false); }} onPaste={handleBodyPaste} rows={6} placeholder="Опиши, что именно непонятно. Можно добавить уровни, таймфрейм и свои наблюдения… Скриншот можно вставить сюда через Ctrl+V" /></label><label className={`discussion-attachment-picker ${attachmentName ? "has-file" : ""}`} htmlFor="discussion-attachment"><FileCheck2 size={17} /><span>{attachmentName || "Прикрепить скриншот, график, PDF или видео"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле вопроса</small><input id="discussion-attachment" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => selectAttachment(event.target.files?.[0])} /></label>{attachmentError && <div className="file-error" role="alert">{attachmentError}</div>}{attachmentPreviewUrl && <div className="discussion-selected-preview">{attachmentType === "image" && <div className="discussion-selected-image" role="img" aria-label={`Предпросмотр файла ${attachmentName}`} style={{ backgroundImage: `url("${attachmentPreviewUrl}")` }} />}{attachmentType === "video" && <video src={attachmentPreviewUrl} controls playsInline preload="metadata" />}{attachmentType === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{attachmentName}</span></div>}</div>}<div className="discussion-composer-actions"><button className="support-card" type="submit" disabled={!canSubmit || submitted || saving}><span className="support-card-label">{saving ? "Сохраняем…" : submitted ? "Вопрос отправлен" : "Задать вопрос"}</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button></div>{submitError && <div className="file-error" role="alert">{submitError}</div>}{submitted && <div className="detail-feedback accepted"><Target size={16} /><div><strong>Тема сохранена</strong><p>Вопрос записан в базу и появится у куратора.</p></div></div>}</form></section>;
+  return <section className="content-panel discussion-context-banner"><div className="discussion-context-heading"><h2>Задать вопрос куратору</h2></div><div className="discussion-context-chips"><span><BookOpen size={14} /> {context.module}</span></div><form className="discussion-composer" onSubmit={submit}><label className="form-field"><span>Тема вопроса</span><input value={title} onChange={(event) => { setTitle(event.target.value); setSubmitted(false); }} placeholder="Например: Как определить точку входа в этом сценарии?" /></label><label className="form-field"><span>Вопрос и описание</span><textarea value={body} onChange={(event) => { setBody(event.target.value); setSubmitted(false); }} onPaste={handleBodyPaste} rows={6} placeholder="Опиши, что именно непонятно. Можно добавить уровни, таймфрейм и свои наблюдения… Скриншот можно вставить сюда через Ctrl+V" /></label><label className={`discussion-attachment-picker ${attachments.attachments.length > 0 ? "has-file" : ""}`} htmlFor="discussion-attachment"><FileCheck2 size={17} /><span>{attachments.attachments.length > 0 ? `Прикреплено файлов: ${attachments.attachments.length}` : "Прикрепить скриншот, график, PDF или видео"}</span><small>PNG, JPG, PDF, MP4, WebM · до 10 МБ за файл · можно прикрепить сразу несколько, или вставить скриншот через Ctrl+V в поле вопроса</small><input id="discussion-attachment" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { attachments.addFiles(event.target.files); event.target.value = ""; }} /></label>{attachments.error && <div className="file-error" role="alert">{attachments.error}</div>}<DiscussionAttachmentPreviewList attachments={attachments.attachments} onRemove={attachments.removeAt} /><div className="discussion-composer-actions"><button className="support-card" type="submit" disabled={!canSubmit || submitted || saving}><span className="support-card-label">{saving ? "Сохраняем…" : submitted ? "Вопрос отправлен" : "Задать вопрос"}</span><span className="support-card-arrow" aria-hidden="true"><ArrowRight size={16} /></span></button></div>{submitError && <div className="file-error" role="alert">{submitError}</div>}{submitted && <div className="detail-feedback accepted"><Target size={16} /><div><strong>Тема сохранена</strong><p>Вопрос записан в базу и появится у куратора.</p></div></div>}</form></section>;
 }
 
 function DiscussionViewDb({ onOpenDiscussion }: { onOpenDiscussion: (context: DiscussionContext) => void }) {
@@ -5277,87 +5617,69 @@ function assignmentHint(status: AssignmentStatus) {
 
 function LegacyAssignmentDetail({ assignment }: { assignment: Assignment }) {
   const [draft, setDraft] = useState("");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [filePreviewUrl, setFilePreviewUrl] = useState("");
+  const attachments = useDiscussionAttachments();
   const [fileError, setFileError] = useState("");
   const [saved, setSaved] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const isAccepted = assignment.status === "Принято";
-  const fileName = selectedFile?.name ?? "";
-  const fileType = selectedFile?.type ?? "";
-  useEffect(() => () => {
-    if (filePreviewUrl) URL.revokeObjectURL(filePreviewUrl);
-  }, [filePreviewUrl]);
-  useEffect(() => {
-    if (!submitted || !assignment.id) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        let fileIds: string[] = [];
-        if (selectedFile) {
-          const createResponse = await fetch(`${API_ORIGIN}/api/files`, {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ originalName: selectedFile.name, mimeType: selectedFile.type, byteSize: selectedFile.size }),
-          });
-          const createPayload = await createResponse.json() as { message?: string; data?: { id: string; uploadUrl: string } };
-          if (!createResponse.ok || !createPayload.data?.id || !createPayload.data.uploadUrl) throw new Error(createPayload.message ?? "Не удалось подготовить файл.");
-          const uploadUrl = createPayload.data.uploadUrl.startsWith("http") ? createPayload.data.uploadUrl : `${API_ORIGIN}${createPayload.data.uploadUrl}`;
-          const uploadResponse = await fetch(uploadUrl, { method: "PUT", credentials: "include", headers: { "Content-Type": selectedFile.type }, body: selectedFile });
-          if (!uploadResponse.ok) {
-            const uploadPayload = await uploadResponse.json().catch(() => ({})) as { message?: string };
-            throw new Error(uploadPayload.message ?? "Не удалось загрузить файл.");
-          }
-          fileIds = [createPayload.data.id];
-        }
-        const response = await fetch(`${API_ORIGIN}/api/assignments/${assignment.id}/submissions`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ answerText: draft.trim(), fileIds }),
-        });
-        if (!response.ok) {
-          const payload = await response.json().catch(() => ({})) as { message?: string };
-          throw new Error(payload.message ?? "Не удалось отправить работу.");
-        }
-        if (!cancelled) window.dispatchEvent(new Event(assignmentSubmittedEvent));
-      } catch (error: unknown) {
-        if (!cancelled) setSubmitted(false);
-        if (!cancelled) setFileError(error instanceof Error ? error.message : "Не удалось отправить работу.");
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [assignment.id, draft, selectedFile, submitted]);
-  const handleFileChange = (file: File | undefined) => {
-    if (!file) return;
-    if (file.size > 10 * 1024 * 1024) {
-      setSelectedFile(null);
-      setFilePreviewUrl("");
-      setFileError("Файл слишком большой. Максимальный размер — 10 МБ.");
-      return;
-    }
+  // The backend rejects a second submission outright while one is already SUBMITTED/IN_REVIEW
+  // (see assignment-service.ts) — the "Можно отправлять заново после доработки" copy only applies
+  // once a curator has actually responded, so the editable form stays hidden until then. Without
+  // this, a student could type a new answer, hit submit, and land on a raw "already awaiting
+  // review" error with no form left to explain why.
+  const isPending = submitted || assignment.status === "На проверке";
+  const submitWork = async () => {
+    if (!assignment.id || submitted) return;
     setFileError("");
-    setSelectedFile(file);
-    setFilePreviewUrl(URL.createObjectURL(file));
+    try {
+      const uploaded = await attachments.uploadAll();
+      const fileIds = uploaded.payload.map((item) => item.fileId);
+      const response = await fetch(`${API_ORIGIN}/api/assignments/${assignment.id}/submissions`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answerText: draft.trim(), fileIds }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { message?: string };
+        // The form being hidden while isPending is the main guard against ever hitting this —
+        // this translation is just a fallback for a stale second tab or similar edge case.
+        throw new Error(payload.message === "Submission is already awaiting review" ? "Работа уже на проверке — дождитесь ответа куратора." : payload.message ?? "Не удалось отправить работу.");
+      }
+      setSubmitted(true);
+      // Clears the composer so a fresh attempt doesn't start pre-filled with what was just sent —
+      // the form itself is now hidden while isPending (see below), so this only matters for
+      // whenever it next reappears (after a curator requests revision).
+      setDraft("");
+      attachments.clear();
+      window.dispatchEvent(new Event(assignmentSubmittedEvent));
+    } catch (error: unknown) {
+      setFileError(error instanceof Error ? error.message : "Не удалось отправить работу.");
+    }
+  };
+  const handleFileChange = (fileList: FileList | File[] | null | undefined) => {
+    attachments.addFiles(fileList);
     setSaved(false);
     setSubmitted(false);
   };
   const handleAnswerPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const imageItem = Array.from(event.clipboardData.items).find((item) => item.type.startsWith("image/"));
-    if (!imageItem) return;
-    const file = imageItem.getAsFile();
-    if (!file) return;
+    const imageItems = Array.from(event.clipboardData.items).filter((item) => item.type.startsWith("image/"));
+    if (imageItems.length === 0) return;
     event.preventDefault();
-    const extension = imageItem.type.split("/")[1] || "png";
-    handleFileChange(new File([file], `screenshot-${Date.now()}.${extension}`, { type: imageItem.type }));
+    const files = imageItems.map((item, index) => {
+      const file = item.getAsFile();
+      if (!file) return null;
+      const extension = item.type.split("/")[1] || "png";
+      return new File([file], `screenshot-${Date.now()}-${index}.${extension}`, { type: item.type });
+    }).filter((file): file is File => file !== null);
+    handleFileChange(files);
   };
 
   if (!assignment.id) {
     return <section className="content-panel assignment-detail directory-empty"><div className="empty-state"><FileCheck2 size={24} /><strong>Выбери опубликованное задание</strong><span>Когда куратор опубликует ДЗ, оно появится в этом списке.</span></div></section>;
   }
 
-  return <section className="content-panel assignment-detail"><div className="detail-header"><div><span className="section-kicker">{assignment.module}</span><h2>{assignment.title}</h2></div><div className={`assignment-badge ${assignment.status === "Принято" ? "green" : assignment.tone}`}>{submitted ? "На проверке" : assignment.status}</div></div><div className="detail-meta"><span><Clock3 size={14} /> {assignment.deadline}</span><span><FileCheck2 size={14} /> {isAccepted ? "Проверено куратором" : "Можно отправлять заново после доработки"}</span></div><div className="detail-body"><p className="detail-description">{assignment.description}</p><div className="detail-section"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span><ul className="detail-checklist">{assignment.requirements.map((requirement) => <li key={requirement}><span />{requirement}</li>)}</ul></div>{isAccepted ? <div className="detail-feedback accepted"><CheckCircle2 size={17} /><div><strong>Задание принято</strong><p>Куратор подтвердил работу. Материал сохранён в истории практикума.</p></div></div> : assignment.blockedByModuleTitle ? <div className="detail-feedback locked"><LockKeyhole size={17} /><div><strong>Пока недоступно</strong><p>Сначала сдайте ДЗ урока «{assignment.blockedByModuleTitle}» — вернитесь туда и отправьте работу, тогда это задание откроется.</p></div></div> : <><div className="detail-section"><label className="detail-label" htmlFor="assignment-answer">ТВОЙ КОММЕНТАРИЙ</label><textarea id="assignment-answer" value={draft} onChange={(event) => { setDraft(event.target.value); setSaved(false); setSubmitted(false); }} onPaste={handleAnswerPaste} placeholder="Опиши логику решения или добавь контекст к файлу... Скриншот можно вставить сюда через Ctrl+V" rows={5} /></div><label className={`file-dropzone ${fileName ? "has-file" : ""}`} htmlFor="assignment-file"><FileCheck2 size={19} /><span>{fileName || "Прикрепить разметку, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ · или вставь скриншот через Ctrl+V в поле комментария</small><input id="assignment-file" type="file" accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => handleFileChange(event.target.files?.[0])} /></label>{fileError && <div className="file-error" role="alert">{fileError}</div>}{filePreviewUrl && <div className="assignment-preview"><div className="assignment-preview-heading"><span>ПРЕДПРОСМОТР</span><strong>{fileName}</strong></div>{fileType.startsWith("image/") && <div className="assignment-preview-image-wrap"><Image src={filePreviewUrl} alt={`Предпросмотр файла ${fileName}`} fill sizes="(max-width: 700px) 100vw, 420px" unoptimized className="assignment-preview-image" /></div>}{fileType === "application/pdf" && <iframe src={filePreviewUrl} title={`Предпросмотр PDF ${fileName}`} />}{fileType.startsWith("video/") && <video src={filePreviewUrl} controls preload="metadata" />}</div>}{(saved || submitted) && <div className="detail-feedback"><Target size={17} /><div><strong>{submitted ? "Работа отправлена куратору" : "Черновик сохранён в этой сессии"}</strong><p>{submitted ? "Ответ и вложение сохранены. Куратор увидит их в очереди проверки." : "Можно вернуться к заданию и продолжить подготовку ответа."}</p></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={() => setSaved(true)} disabled={!draft.trim() && !fileName}>Сохранить черновик</button><button className="primary-button" onClick={() => setSubmitted(true)} disabled={!draft.trim() && !fileName}>Отправить на проверку <ChevronRight size={16} /></button></div></>}</div></section>;
+  return <section className="content-panel assignment-detail"><div className="detail-header"><div><span className="section-kicker">{assignment.module}</span><h2>{assignment.title}</h2></div><div className={`assignment-badge ${assignment.status === "Принято" ? "green" : assignment.tone}`}>{submitted ? "На проверке" : assignment.status}</div></div><div className="detail-meta"><span><Clock3 size={14} /> {assignment.deadline}</span><span><FileCheck2 size={14} /> {isAccepted ? "Проверено куратором" : isPending ? "Ждёт решения куратора" : "Можно отправлять заново после доработки"}</span></div><div className="detail-body"><p className="detail-description">{assignment.description}</p><div className="detail-section"><span className="detail-label">ЧТО НУЖНО СДЕЛАТЬ</span><ul className="detail-checklist">{assignment.requirements.map((requirement) => <li key={requirement}><span />{requirement}</li>)}</ul></div>{isAccepted ? <div className="detail-feedback accepted"><CheckCircle2 size={17} /><div><strong>Задание принято</strong><p>Куратор подтвердил работу. Материал сохранён в истории практикума.</p></div></div> : isPending ? <div className="detail-feedback submitted"><CheckCircle2 size={17} /><div><strong>Работа отправлена куратору</strong><p>Ответ и вложения сохранены и ждут очереди проверки. Новый ответ можно будет отправить, если куратор попросит доработку — статус обновится здесь автоматически.</p></div></div> : assignment.blockedByModuleTitle ? <div className="detail-feedback locked"><LockKeyhole size={17} /><div><strong>Пока недоступно</strong><p>Сначала сдайте ДЗ урока «{assignment.blockedByModuleTitle}» — вернитесь туда и отправьте работу, тогда это задание откроется.</p></div></div> : <><div className="detail-section"><label className="detail-label" htmlFor="assignment-answer">ТВОЙ КОММЕНТАРИЙ</label><textarea id="assignment-answer" value={draft} onChange={(event) => { setDraft(event.target.value); setSaved(false); setSubmitted(false); }} onPaste={handleAnswerPaste} placeholder="Опиши логику решения или добавь контекст к файлу... Скриншот можно вставить сюда через Ctrl+V" rows={5} /></div><label className={`file-dropzone ${attachments.attachments.length > 0 ? "has-file" : ""}`} htmlFor="assignment-file"><FileCheck2 size={19} /><span>{attachments.attachments.length > 0 ? `Прикреплено файлов: ${attachments.attachments.length}` : "Прикрепить разметку, PDF или видео"}</span><small>PNG, JPG, PDF, MP4 или WebM · до 10 МБ за файл · можно прикрепить сразу несколько, или вставить скриншот через Ctrl+V в поле комментария</small><input id="assignment-file" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { handleFileChange(event.target.files); event.target.value = ""; }} /></label>{(attachments.error || fileError) && <div className="file-error" role="alert">{attachments.error || fileError}</div>}{attachments.attachments.map((attachment, index) => <div className="assignment-preview" key={`${attachment.file.name}-${index}`}><div className="assignment-preview-heading"><span>ПРЕДПРОСМОТР</span><div className="assignment-preview-heading-row"><strong>{attachment.file.name}</strong><button type="button" className="icon-button compact" onClick={() => attachments.removeAt(index)} aria-label={`Убрать файл ${attachment.file.name}`}><X size={14} /></button></div></div>{attachment.kind === "image" && <div className="assignment-preview-image-wrap"><Image src={attachment.previewUrl} alt={`Предпросмотр файла ${attachment.file.name}`} fill sizes="(max-width: 700px) 100vw, 420px" unoptimized className="assignment-preview-image" /></div>}{attachment.kind === "file" && <iframe src={attachment.previewUrl} title={`Предпросмотр файла ${attachment.file.name}`} />}{attachment.kind === "video" && <video src={attachment.previewUrl} controls preload="metadata" />}</div>)}{saved && <div className="detail-feedback"><Target size={17} /><div><strong>Черновик сохранён в этой сессии</strong><p>Можно вернуться к заданию и продолжить подготовку ответа.</p></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={() => setSaved(true)} disabled={!draft.trim() && attachments.attachments.length === 0}>Сохранить черновик</button><button className="primary-button" onClick={() => void submitWork()} disabled={!draft.trim() && attachments.attachments.length === 0}>Отправить на проверку <ChevronRight size={16} /></button></div></>}</div></section>;
 }
 
 function assignmentMaterialEmbed(url: string): string | null {
@@ -5376,9 +5698,32 @@ function assignmentMaterialEmbed(url: string): string | null {
   return null;
 }
 
-function AssignmentMaterials({ materials }: { materials: Assignment["materials"] }) {
+// Compact preview for a summary card (curator's "Программа" lesson editor, the student's
+// per-module homework card) — the full-size version with embeds lives in AssignmentMaterials
+// below, reserved for the actual assignment detail page.
+function AssignmentMaterialsInline({ materials }: { materials: Assignment["materials"] }) {
   if (!materials || materials.length === 0) return null;
-  return <section className="content-panel assignment-materials-panel"><div className="section-heading"><div><span className="section-kicker">МАТЕРИАЛ К ЗАДАНИЮ</span><h2>Перед началом работы</h2><p className="section-heading-note">Материалы, которые добавил куратор к этому заданию.</p></div></div><div className="assignment-materials-list">{materials.map((material) => { const url = material.url?.startsWith("http") ? material.url : material.url ? `${API_ORIGIN}${material.url}` : ""; const embedUrl = material.kind === "LINK" && material.url ? assignmentMaterialEmbed(material.url) : null; return <article className="assignment-material-card" key={material.id}><div className="assignment-material-card-head"><strong>{material.title}</strong><span>{material.kind === "LINK" ? "Ссылка" : material.mimeType ?? "Файл"}</span></div>{embedUrl && <iframe src={embedUrl} title={material.title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}{!embedUrl && material.kind === "FILE" && material.mimeType?.startsWith("image/") && <div className="assignment-material-image"><Image src={url} alt={material.title} fill sizes="(max-width: 950px) 100vw, 50vw" unoptimized /></div>}{!embedUrl && material.kind === "FILE" && material.mimeType?.startsWith("video/") && <video src={url} controls preload="metadata" />}{!embedUrl && material.kind === "FILE" && material.mimeType === "application/pdf" && <iframe src={url} title={material.title} />}{!embedUrl && material.kind === "LINK" && <a className="secondary-button" href={material.url} target="_blank" rel="noreferrer">Открыть материал <ArrowUpRight size={15} /></a>}</article>; })}</div></section>;
+  return <div className="assignment-materials-inline">{materials.map((material) => {
+    const url = material.url?.startsWith("http") ? material.url : material.url ? `${API_ORIGIN}${material.url}` : "";
+    const isImage = material.kind === "FILE" && material.mimeType?.startsWith("image/");
+    return isImage
+      ? <a className="assignment-materials-inline-image" key={material.id} href={url} target="_blank" rel="noreferrer" aria-label={material.title}><Image src={url} alt={material.title} fill sizes="80px" unoptimized /></a>
+      : <a className="assignment-materials-inline-file" key={material.id} href={material.kind === "LINK" ? material.url : url} target="_blank" rel="noreferrer">{material.kind === "LINK" ? <ArrowUpRight size={13} /> : <FileCheck2 size={13} />}<span>{material.title}</span></a>;
+  })}</div>;
+}
+
+function AssignmentMaterials({ materials }: { materials: Assignment["materials"] }) {
+  const [zoomImageUrl, setZoomImageUrl] = useState("");
+  if (!materials || materials.length === 0) return null;
+  return <section className="content-panel assignment-materials-panel"><div className="section-heading"><div><span className="section-kicker">МАТЕРИАЛ К ЗАДАНИЮ</span><h2>Перед началом работы</h2><p className="section-heading-note">Материалы, которые добавил куратор к этому заданию.</p></div></div><div className="assignment-materials-list">{materials.map((material) => { const url = material.url?.startsWith("http") ? material.url : material.url ? `${API_ORIGIN}${material.url}` : ""; const embedUrl = material.kind === "LINK" && material.url ? assignmentMaterialEmbed(material.url) : null; return <article className="assignment-material-card" key={material.id}><div className="assignment-material-card-head"><strong>{material.title}</strong><span>{material.kind === "LINK" ? "Ссылка" : material.mimeType ?? "Файл"}</span></div>{embedUrl && <iframe src={embedUrl} title={material.title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}{!embedUrl && material.kind === "FILE" && material.mimeType?.startsWith("image/") && <button type="button" className="assignment-material-image assignment-material-image-button" aria-label={`Увеличить изображение ${material.title}`} onClick={() => setZoomImageUrl(url)}><Image src={url} alt={material.title} fill sizes="(max-width: 950px) 100vw, 50vw" unoptimized /></button>}{!embedUrl && material.kind === "FILE" && material.mimeType?.startsWith("video/") && <video src={url} controls preload="metadata" />}{!embedUrl && material.kind === "FILE" && material.mimeType === "application/pdf" && <iframe src={url} title={material.title} />}{!embedUrl && material.kind === "LINK" && <a className="secondary-button" href={material.url} target="_blank" rel="noreferrer">Открыть материал <ArrowUpRight size={15} /></a>}</article>; })}</div>
+    {zoomImageUrl && typeof document !== "undefined" && createPortal(
+      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
+        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
+        <img className="chat-image-lightbox-image" src={zoomImageUrl} alt="Просмотр материала" />
+      </div>,
+      document.body,
+    )}
+  </section>;
 }
 
 function AssignmentModuleCover({ assignment }: { assignment: Assignment }) {
@@ -5392,6 +5737,7 @@ function AssignmentDetail({ assignment }: { assignment: Assignment }) {
 }
 
 function AssignmentSubmissionSummary({ assignment }: { assignment: Assignment }) {
+  const [zoomImageUrl, setZoomImageUrl] = useState("");
   const submission = assignment.submission;
   if (!submission) return null;
   const history = assignment.submissionHistory?.length
@@ -5406,10 +5752,17 @@ function AssignmentSubmissionSummary({ assignment }: { assignment: Assignment })
         <div className="assignment-history-attempt-head"><span className={`attempt-dot ${dotTone}`} /><strong>Попытка {attempt.attempt}{isCurrent && history.length > 1 ? " · текущая" : ""}</strong></div>
         <div className="assignment-history-grid">
           <div><span className="detail-label">ТВОЙ ОТВЕТ</span><p>{attempt.answerText || "Ответ отправлен вложением."}</p></div>
-          {attempt.feedback.length > 0 && <div className="assignment-history-feedback"><span className="detail-label">ОТВЕТ КУРАТОРА</span>{attempt.feedback.map((item) => <div key={item.id}>{item.text && <p>{item.text}</p>}{item.attachments.map((file) => file.mimeType.startsWith("image/") ? <a key={file.id} className="assignment-history-feedback-image" href={`${API_ORIGIN}${file.url}`} target="_blank" rel="noreferrer"><Image src={`${API_ORIGIN}${file.url}`} alt={file.originalName} fill sizes="320px" unoptimized /></a> : <a key={file.id} className="submission-file" href={`${API_ORIGIN}${file.url}`} target="_blank" rel="noreferrer"><FileCheck2 size={14} /><span>{file.originalName}</span><ArrowUpRight size={12} /></a>)}<small>{new Date(item.createdAt).toLocaleString("ru-RU")}</small></div>)}</div>}
+          {attempt.feedback.length > 0 && <div className="assignment-history-feedback"><span className="detail-label">ОТВЕТ КУРАТОРА</span>{attempt.feedback.map((item) => <div key={item.id}>{item.text && <p>{item.text}</p>}{item.attachments.map((file) => file.mimeType.startsWith("image/") ? <button type="button" key={file.id} className="assignment-history-feedback-image assignment-history-feedback-image-button" aria-label={`Увеличить изображение ${file.originalName}`} onClick={() => setZoomImageUrl(`${API_ORIGIN}${file.url}`)}><Image src={`${API_ORIGIN}${file.url}`} alt={file.originalName} fill sizes="320px" unoptimized /></button> : <a key={file.id} className="submission-file" href={`${API_ORIGIN}${file.url}`} target="_blank" rel="noreferrer"><FileCheck2 size={14} /><span>{file.originalName}</span><ArrowUpRight size={12} /></a>)}<small>{new Date(item.createdAt).toLocaleString("ru-RU")}</small></div>)}</div>}
         </div>
       </div>;
     })}</div>
+    {zoomImageUrl && typeof document !== "undefined" && createPortal(
+      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
+        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
+        <img className="chat-image-lightbox-image" src={zoomImageUrl} alt="Просмотр вложения" />
+      </div>,
+      document.body,
+    )}
   </section>;
 }
 

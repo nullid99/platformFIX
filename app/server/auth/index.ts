@@ -32,4 +32,5 @@ export type {
   SecuritySessionRecord,
   StudentDirectoryRecord,
   StudentSecurityOverview,
+  TeamMemberDirectoryRecord,
 } from "./types";

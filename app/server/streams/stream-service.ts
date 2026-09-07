@@ -1,9 +1,11 @@
 import { MediaAssetKind, MediaAssetStatus, UserRole, UserStatus } from "@/app/generated/prisma/enums";
+import { formatZonedDateTime } from "@/app/domain/schedule-time";
 import { AuthServiceError } from "@/app/server/auth";
 import { prisma } from "@/app/server/db";
-import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
+import { activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { sendNewMediaNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
+import { isModuleOpenForStudent } from "@/app/server/course/module-access";
 import { assertPracticumViewer } from "./access";
 import {
   EgressStatus,
@@ -46,6 +48,8 @@ export type PlaybackStatusDto = {
   liveScheduleEventId: string | null;
 };
 
+export type RecordingStorageStatusDto = { totalBytes: number; usedBytes: number; availableBytes: number; updatedAt: string } | null;
+
 export type StreamTargetDto = {
   moduleId: string | null;
   moduleTitle: string | null;
@@ -65,8 +69,15 @@ function ingressDto(info: IngressInfo, isLive: boolean): IngressDto {
 }
 
 export class StreamService {
-  /** In-memory only — the currently-recording egress for the live broadcast, if any. Single-instance API process, same assumption stream-live-notifier's own in-memory state already relies on. */
-  private activeRecording: { egressId: string; objectKey: string } | null = null;
+  /**
+   * Only guards against two track_published webhooks racing within the same still-running
+   * process — never trusted across a restart. Whether a recording is already running, and what
+   * to write into MediaAsset when one ends, are both re-derived from LiveKit itself (see
+   * maybeStartRecording's listEgress check and finishRecording's use of the webhook's own
+   * EgressInfo) specifically so a mid-broadcast deploy can't orphan a recording: LiveKit keeps
+   * recording through our restart regardless, so our side just needs to stop assuming it
+   * remembers anything about what's in flight.
+   */
   private recordingStartInFlight = false;
 
   public async getIngress(actorId: string): Promise<IngressDto | null> {
@@ -262,74 +273,104 @@ export class StreamService {
    * when no target was picked, then notifies students. Idempotent on (provider, providerKey) so a
    * retried webhook/reconciliation is safe.
    */
-  private async createMediaAssetFromRecording(input: { provider: string; providerKey: string; durationSec: number | null; preciseStart: Date | null; preciseEnd: Date | null }): Promise<void> {
-    const existing = await prisma.mediaAsset.findFirst({ where: { provider: input.provider, providerKey: input.providerKey }, select: { id: true } });
-    if (existing) return;
+  private async createMediaAssetFromRecording(input: { provider: string; providerKey: string; durationSec: number | null; byteSize: bigint | null; preciseStart: Date | null; preciseEnd: Date | null }): Promise<void> {
+    // LiveKit's webhook delivery is at-least-once, so egress_ended can arrive twice for the same
+    // recording. The existence check below is otherwise a check-then-insert race, and the
+    // (provider, providerKey, moduleId) unique constraint doesn't save us here: an unassigned
+    // recording has moduleId NULL on both attempted rows, and Postgres never treats two NULLs as
+    // equal for uniqueness — so a redelivered webhook could sail past it and create a duplicate
+    // MediaAsset for the exact same file. The advisory lock (held for the transaction's lifetime,
+    // keyed on the object key) serializes any overlapping delivery around that check.
+    const lockKey = `${input.provider}:${input.providerKey}`;
+    const result = await prisma.$transaction(async (tx) => {
+      // $queryRaw here throws — pg_advisory_xact_lock returns void, and the adapter-pg driver
+      // can't deserialize a void-typed result column ("UnsupportedNativeDataType"). $executeRaw
+      // doesn't try to decode the row at all, only the affected count, so it's the one that
+      // actually works for a call made purely for its side effect.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      const existing = await tx.mediaAsset.findFirst({ where: { provider: input.provider, providerKey: input.providerKey }, select: { id: true } });
+      if (existing) return null;
 
-    // The broadcast that just finished recording was necessarily live on the active practicum —
-    // that's whichever row setStreamTarget/ensureIngress wrote pendingStream*/liveKitIngressId onto.
-    const practicum = await prisma.practicum.findFirst({
-      where: { isActive: true },
-      select: { id: true, pendingStreamModuleId: true, pendingStreamScheduleEventId: true, pendingStreamMediaKind: true, currentStreamSessionStartedAt: true },
+      // The broadcast that just finished recording was necessarily live on the active practicum —
+      // that's whichever row setStreamTarget/ensureIngress wrote pendingStream*/liveKitIngressId onto.
+      const practicum = await tx.practicum.findFirst({
+        where: { isActive: true },
+        select: { id: true, pendingStreamModuleId: true, pendingStreamScheduleEventId: true, pendingStreamMediaKind: true, currentStreamSessionStartedAt: true },
+      });
+      if (!practicum) {
+        console.error("Recording ready: no practicum found for", input.providerKey);
+        return null;
+      }
+
+      let targetModule: { id: string; title: string } | null = null;
+      let targetScheduleEvent: { id: string; title: string } | null = null;
+      if (practicum.pendingStreamModuleId) {
+        const courseModule = await tx.module.findUnique({ where: { id: practicum.pendingStreamModuleId }, select: { id: true, title: true, practicumId: true } });
+        if (courseModule && courseModule.practicumId === practicum.id) targetModule = courseModule;
+      } else if (practicum.pendingStreamScheduleEventId) {
+        const scheduleEvent = await tx.scheduleEvent.findUnique({ where: { id: practicum.pendingStreamScheduleEventId }, select: { id: true, title: true, practicumId: true } });
+        if (scheduleEvent && scheduleEvent.practicumId === practicum.id) targetScheduleEvent = scheduleEvent;
+      }
+      // A module target additionally picks which of its two stream blocks this recording belongs
+      // in — "Тематические записи" (STREAM) vs "Q&A с куратором" (QA). Irrelevant otherwise.
+      const mediaKind = targetModule && practicum.pendingStreamMediaKind === MediaAssetKind.QA ? MediaAssetKind.QA : MediaAssetKind.STREAM;
+      // The picked target is one-shot — consumed here regardless of whether it still resolved to
+      // something valid, so a stale/deleted target doesn't keep silently failing every webhook.
+      if (practicum.pendingStreamModuleId || practicum.pendingStreamScheduleEventId) {
+        await tx.practicum.update({ where: { id: practicum.id }, data: { pendingStreamModuleId: null, pendingStreamScheduleEventId: null, pendingStreamMediaKind: null } });
+      }
+
+      const isAutoPublished = Boolean(targetModule || targetScheduleEvent);
+      const lastMedia = await tx.mediaAsset.findFirst({
+        where: targetScheduleEvent ? { scheduleEventId: targetScheduleEvent.id } : targetModule ? { moduleId: targetModule.id } : { practicumId: practicum.id, moduleId: null, scheduleEventId: null },
+        orderBy: { position: "desc" },
+        select: { position: true },
+      });
+      const media = await tx.mediaAsset.create({
+        data: {
+          practicumId: practicum.id,
+          provider: input.provider,
+          providerKey: input.providerKey,
+          kind: mediaKind,
+          moduleId: targetModule?.id,
+          scheduleEventId: targetScheduleEvent?.id,
+          status: isAutoPublished ? MediaAssetStatus.PUBLISHED : MediaAssetStatus.DRAFT,
+          publishedAt: isAutoPublished ? new Date() : undefined,
+          // Unassigned recordings get a "date + time" title instead of a bare null (which the
+          // frontend renders as "Без названия") so the curator can tell drafts apart in Медиатека.
+          title: targetScheduleEvent
+            ? targetScheduleEvent.title
+            : targetModule
+              ? `${targetModule.title} — ${mediaKind === MediaAssetKind.QA ? "Q&A" : "запись эфира"}`
+              : `Запись ${formatZonedDateTime(input.preciseStart ?? new Date())}`,
+          chatSessionStartedAt: isAutoPublished ? (input.preciseStart ?? practicum.currentStreamSessionStartedAt) : undefined,
+          chatSessionEndedAt: isAutoPublished ? (input.preciseEnd ?? new Date()) : undefined,
+          durationSec: input.durationSec != null ? Math.round(input.durationSec) : undefined,
+          byteSize: input.byteSize ?? undefined,
+          position: (lastMedia?.position ?? -1) + 1,
+        },
+      });
+      return { media, practicumId: practicum.id, isAutoPublished };
     });
-    if (!practicum) {
-      console.error("Recording ready: no practicum found for", input.providerKey);
-      return;
-    }
 
-    let targetModule: { id: string; title: string } | null = null;
-    let targetScheduleEvent: { id: string; title: string } | null = null;
-    if (practicum.pendingStreamModuleId) {
-      const courseModule = await prisma.module.findUnique({ where: { id: practicum.pendingStreamModuleId }, select: { id: true, title: true, practicumId: true } });
-      if (courseModule && courseModule.practicumId === practicum.id) targetModule = courseModule;
-    } else if (practicum.pendingStreamScheduleEventId) {
-      const scheduleEvent = await prisma.scheduleEvent.findUnique({ where: { id: practicum.pendingStreamScheduleEventId }, select: { id: true, title: true, practicumId: true } });
-      if (scheduleEvent && scheduleEvent.practicumId === practicum.id) targetScheduleEvent = scheduleEvent;
-    }
-    // A module target additionally picks which of its two stream blocks this recording belongs
-    // in — "Тематические записи" (STREAM) vs "Q&A с куратором" (QA). Irrelevant otherwise.
-    const mediaKind = targetModule && practicum.pendingStreamMediaKind === MediaAssetKind.QA ? MediaAssetKind.QA : MediaAssetKind.STREAM;
-    // The picked target is one-shot — consumed here regardless of whether it still resolved to
-    // something valid, so a stale/deleted target doesn't keep silently failing every webhook.
-    if (practicum.pendingStreamModuleId || practicum.pendingStreamScheduleEventId) {
-      await prisma.practicum.update({ where: { id: practicum.id }, data: { pendingStreamModuleId: null, pendingStreamScheduleEventId: null, pendingStreamMediaKind: null } });
-    }
-
-    const isAutoPublished = Boolean(targetModule || targetScheduleEvent);
-    const lastMedia = await prisma.mediaAsset.findFirst({
-      where: targetScheduleEvent ? { scheduleEventId: targetScheduleEvent.id } : targetModule ? { moduleId: targetModule.id } : { practicumId: practicum.id, moduleId: null, scheduleEventId: null },
-      orderBy: { position: "desc" },
-      select: { position: true },
-    });
-    const media = await prisma.mediaAsset.create({
-      data: {
-        practicumId: practicum.id,
-        provider: input.provider,
-        providerKey: input.providerKey,
-        kind: mediaKind,
-        moduleId: targetModule?.id,
-        scheduleEventId: targetScheduleEvent?.id,
-        status: isAutoPublished ? MediaAssetStatus.PUBLISHED : MediaAssetStatus.DRAFT,
-        publishedAt: isAutoPublished ? new Date() : undefined,
-        title: targetScheduleEvent
-          ? targetScheduleEvent.title
-          : targetModule
-            ? `${targetModule.title} — ${mediaKind === MediaAssetKind.QA ? "Q&A" : "запись эфира"}`
-            : null,
-        chatSessionStartedAt: isAutoPublished ? (input.preciseStart ?? practicum.currentStreamSessionStartedAt) : undefined,
-        chatSessionEndedAt: isAutoPublished ? (input.preciseEnd ?? new Date()) : undefined,
-        durationSec: input.durationSec != null ? Math.round(input.durationSec) : undefined,
-        position: (lastMedia?.position ?? -1) + 1,
-      },
-    });
-
-    if (!isAutoPublished) return;
-    void activeStudentEmails(practicum.id)
-      .then((emails) => Promise.all(emails.map((to) => sendNewMediaNotification({ to, mediaTitle: media.title ?? "Новая запись", kind: media.kind, mediaId: media.id }))))
-      .catch((error: unknown) => console.error("Media recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-    void activeStudentIds(practicum.id)
-      .then((studentIds) => notificationService.createMany(studentIds, "NEW_MEDIA", `Новая запись: ${media.title ?? "без названия"}`, undefined, media.id))
-      .catch((error: unknown) => console.error("Media notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    if (!result || !result.isAutoPublished) return;
+    const { media, practicumId } = result;
+    const moduleId = media.moduleId;
+    // Same per-student gate as course-service.ts#publishMedia — a recording landing straight
+    // into a module a student hasn't unlocked yet must not tell them about it early. A
+    // schedule-event target (Q&A recordings, mostly) has no "closed lesson" to gate on.
+    void (async () => {
+      const candidateIds = await activeStudentIds(practicumId);
+      const notifiableIds = moduleId
+        ? (await Promise.all(candidateIds.map(async (studentId) => ({ studentId, open: await isModuleOpenForStudent(prisma, studentId, practicumId, moduleId) }))))
+            .filter((entry) => entry.open)
+            .map((entry) => entry.studentId)
+        : candidateIds;
+      if (notifiableIds.length === 0) return;
+      const recipients = await prisma.user.findMany({ where: { id: { in: notifiableIds }, email: { not: null } }, select: { email: true } });
+      await Promise.all(recipients.map((recipient) => recipient.email && sendNewMediaNotification({ to: recipient.email, mediaTitle: media.title ?? "Новая запись", kind: media.kind, mediaId: media.id })));
+      await notificationService.createMany(notifiableIds, "NEW_MEDIA", `Новая запись: ${media.title ?? "без названия"}`, undefined, media.id);
+    })().catch((error: unknown) => console.error("Media notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
   }
 
   /**
@@ -340,9 +381,14 @@ export class StreamService {
    * correlate two possibly-out-of-order events (same reasoning as reconcileLiveStatus).
    */
   private async maybeStartRecording(): Promise<void> {
-    if (this.activeRecording || this.recordingStartInFlight) return;
+    if (this.recordingStartInFlight) return;
     this.recordingStartInFlight = true;
     try {
+      // Ask LiveKit rather than trusting our own memory — after a mid-broadcast API restart this
+      // is the only way to know a recording is already running, and skipping it would start a
+      // second, overlapping egress for the same broadcast.
+      const alreadyRecording = await egressClient().listEgress({ roomName: LIVEKIT_ROOM_NAME, active: true }).catch(() => []);
+      if (alreadyRecording.length > 0) return;
       const participants = await roomServiceClient().listParticipants(LIVEKIT_ROOM_NAME).catch(() => []);
       const ingress = participants.find((participant) => participant.identity === LIVEKIT_INGRESS_PARTICIPANT_IDENTITY);
       const videoTrackId = ingress?.tracks.find((track) => track.type === TrackType.VIDEO)?.sid;
@@ -350,8 +396,7 @@ export class StreamService {
       if (!videoTrackId || !audioTrackId) return; // the other track hasn't published yet — the next track_published retries this
       const objectKey = newRecordingObjectKey();
       const output = { file: recordingFileOutput(objectKey), images: recordingImageOutput(recordingThumbnailObjectKey(objectKey)) };
-      const info = await egressClient().startTrackCompositeEgress(LIVEKIT_ROOM_NAME, output, { videoTrackId, audioTrackId, encodingOptions: RECORDING_ENCODING_OPTIONS });
-      this.activeRecording = { egressId: info.egressId, objectKey };
+      await egressClient().startTrackCompositeEgress(LIVEKIT_ROOM_NAME, output, { videoTrackId, audioTrackId, encodingOptions: RECORDING_ENCODING_OPTIONS });
     } catch (error) {
       console.error("LiveKit recording start failed", error instanceof Error ? error.message : "unknown error");
     } finally {
@@ -359,21 +404,37 @@ export class StreamService {
     }
   }
 
-  /** Finalizes a completed recording into a MediaAsset, and restarts a fresh segment if egress ended while OBS was still connected (no crash-resume exists in the SDK — this accepts a gap at the failure point instead of losing the rest of the broadcast). */
+  /**
+   * Finalizes a completed recording into a MediaAsset, and restarts a fresh segment if egress
+   * ended while OBS was still connected (no crash-resume exists in the SDK — this accepts a gap
+   * at the failure point instead of losing the rest of the broadcast). Reads the object key and
+   * timing straight off the webhook's own EgressInfo instead of matching against in-memory
+   * state, so a recording that outlives an API restart (a deploy mid-broadcast) still lands in
+   * the Медиатека instead of silently vanishing — createMediaAssetFromRecording is idempotent on
+   * (provider, providerKey), so a redelivered egress_ended is harmless too.
+   */
   private async finishRecording(info: EgressInfo): Promise<void> {
-    const recording = this.activeRecording;
-    if (!recording || info.egressId !== recording.egressId) return;
-    this.activeRecording = null;
+    if (info.roomName !== LIVEKIT_ROOM_NAME) return;
 
     if (info.status === EgressStatus.EGRESS_COMPLETE) {
-      const durationSec = info.startedAt && info.endedAt ? Number(info.endedAt - info.startedAt) / 1_000_000_000 : null;
-      await this.createMediaAssetFromRecording({
-        provider: LIVEKIT_RECORDING_PROVIDER,
-        providerKey: recording.objectKey,
-        durationSec,
-        preciseStart: info.startedAt ? new Date(Number(info.startedAt) / 1_000_000) : null,
-        preciseEnd: info.endedAt ? new Date(Number(info.endedAt) / 1_000_000) : null,
-      });
+      const objectKey = info.fileResults[0]?.filename;
+      if (!objectKey) {
+        console.error("LiveKit recording completed without a file result", info.egressId);
+      } else {
+        const durationSec = info.startedAt && info.endedAt ? Number(info.endedAt - info.startedAt) / 1_000_000_000 : null;
+        // Uncaught here means this whole method (called via `void` from the webhook handler)
+        // rejects silently — the recording finished and is safe in storage, but the Медиатека
+        // row that makes it visible never gets written and nothing surfaces beyond an unhandled
+        // rejection warning easy to miss in the logs. Catch and log loudly instead.
+        await this.createMediaAssetFromRecording({
+          provider: LIVEKIT_RECORDING_PROVIDER,
+          providerKey: objectKey,
+          durationSec,
+          byteSize: info.fileResults[0]?.size ?? null,
+          preciseStart: info.startedAt ? new Date(Number(info.startedAt) / 1_000_000) : null,
+          preciseEnd: info.endedAt ? new Date(Number(info.endedAt) / 1_000_000) : null,
+        }).catch((error: unknown) => console.error("Recording media asset creation failed", info.egressId, error instanceof Error ? error.message : error));
+      }
     } else {
       console.error("LiveKit recording ended without completing", EgressStatus[info.status], info.error);
     }
@@ -381,6 +442,32 @@ export class StreamService {
     const participants = await roomServiceClient().listParticipants(LIVEKIT_ROOM_NAME).catch(() => []);
     const stillLive = participants.some((participant) => participant.identity === LIVEKIT_INGRESS_PARTICIPANT_IDENTITY);
     if (stillLive) void this.maybeStartRecording();
+  }
+
+  /**
+   * Disk usage for the recording storage box (LiveKit + MinIO), read from a static JSON file a
+   * cron job on that box refreshes every 5 minutes — see /opt/livekit/status/disk-status.sh there.
+   * That box is separate from this API's own host, so this is a plain HTTPS fetch rather than a
+   * DB read. Cached briefly since several curators loading "Стримы" shouldn't each trigger a
+   * fetch, and a stale cached value beats none if the fetch itself fails.
+   */
+  private storageStatusCache: { value: RecordingStorageStatusDto; fetchedAt: number } | null = null;
+
+  public async getRecordingStorageStatus(actorId: string): Promise<RecordingStorageStatusDto> {
+    await this.assertCuratorPracticum(actorId);
+    if (this.storageStatusCache && Date.now() - this.storageStatusCache.fetchedAt < 30_000) return this.storageStatusCache.value;
+    const host = process.env.LIVEKIT_HOST?.trim();
+    if (!host) return null;
+    try {
+      const response = await fetch(`${host}/status/disk.json`, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) throw new Error(`status ${response.status}`);
+      const data = await response.json() as RecordingStorageStatusDto;
+      this.storageStatusCache = { value: data, fetchedAt: Date.now() };
+      return data;
+    } catch (error) {
+      console.error("Recording storage status fetch failed", error instanceof Error ? error.message : "unknown error");
+      return this.storageStatusCache?.value ?? null;
+    }
   }
 
   private async assertCuratorPracticum(userId: string) {

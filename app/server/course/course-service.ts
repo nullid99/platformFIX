@@ -9,11 +9,13 @@ import {
 } from "@/app/generated/prisma/enums";
 import { AuthServiceError } from "@/app/server/auth";
 import { prisma } from "@/app/server/db";
-import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
-import { sendNewMediaNotification } from "@/app/server/notifications/email-service";
+import { activeStudentIds } from "@/app/server/notifications/recipient-service";
+import { sendNewModuleNotification, sendNewMediaNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { fileService } from "@/app/server/files";
-import { getActivePracticumId } from "./practicum-service";
+import { deleteRecordingObjects } from "@/app/server/streams/livekit-client";
+import { getWorkingPracticumId } from "./practicum-service";
+import { isModuleOpenForStudent } from "./module-access";
 
 type CourseAccess = {
   locked: boolean;
@@ -66,6 +68,11 @@ function mediaEmbedUrl(provider: string, providerKey: string, assetId: string): 
   return null;
 }
 
+/** BigInt doesn't survive JSON.stringify — every media DTO converts it to a plain number here (safe well past any realistic file size, unlike Postgres's own 2GB Int limit this column exists to avoid). */
+function mediaByteSize(byteSize: bigint | null): number | null {
+  return byteSize != null ? Number(byteSize) : null;
+}
+
 function mediaThumbnailUrl(provider: string, providerKey: string, assetId: string): string | null {
   if (provider.toUpperCase() === "VIMEO") {
     const videoId = providerKey.split("?", 1)[0];
@@ -109,9 +116,9 @@ function requiredText(value: string, field: string, maximumLength: number): stri
 }
 
 export class CourseService {
-  public async getForCurator(userId: string) {
+  public async getForCurator(userId: string, options?: { viewPracticumId?: string }) {
     await this.assertCurator(userId);
-    return this.getForUser(userId);
+    return this.getForUser(userId, options);
   }
 
   public async createModule(actorId: string, input: CreateModuleInput) {
@@ -123,11 +130,12 @@ export class CourseService {
     if (coverPath && (!coverPath.startsWith("/") || coverPath.length > 500)) {
       throw new AuthServiceError("INVALID_INPUT", "coverPath is invalid");
     }
-    const practicumId = await getActivePracticumId();
+    const practicumId = await getWorkingPracticumId(actorId);
     if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
 
+    let created;
     try {
-      return await prisma.$transaction(async (tx) => {
+      created = await prisma.$transaction(async (tx) => {
         const lastModule = await tx.module.findFirst({ where: { practicumId }, orderBy: { position: "desc" }, select: { position: true } });
         const position = (lastModule?.position ?? -1) + 1;
         const courseModule = await tx.module.create({ data: { practicumId, title, description, section, coverPath, position } });
@@ -152,6 +160,18 @@ export class CourseService {
       }
       throw error;
     }
+    // Announced to everyone immediately, unlike NEW_ASSIGNMENT/NEW_MEDIA — a fresh module is
+    // always LOCKED by default (nobody has an EnrollmentModuleAccess row for it yet), so gating
+    // this on isModuleOpenForStudent would mean it never fires at all. This is curriculum news
+    // ("a new lesson exists"), not content-visibility news ("you can watch/submit this now").
+    void (async () => {
+      const studentIds = await activeStudentIds(practicumId);
+      if (studentIds.length === 0) return;
+      const recipients = await prisma.user.findMany({ where: { id: { in: studentIds }, email: { not: null } }, select: { email: true } });
+      await Promise.all(recipients.map((recipient) => recipient.email && sendNewModuleNotification({ to: recipient.email, moduleTitle: created.title, moduleId: created.id })));
+      await notificationService.createMany(studentIds, "NEW_MODULE", `Новый урок: ${created.title}`, undefined, created.id);
+    })().catch((error: unknown) => console.error("Module notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    return created;
   }
 
   /**
@@ -163,12 +183,13 @@ export class CourseService {
    */
   public async setModuleAccess(actorId: string, moduleId: string, unlocked: boolean) {
     await this.assertCurator(actorId);
-    const courseModule = await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true } });
+    const courseModule = await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true, title: true } });
     if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
     const now = new Date();
-    return prisma.$transaction(async (tx) => {
+    const newlyOpenedStudentIds: string[] = [];
+    const result = await prisma.$transaction(async (tx) => {
       await tx.module.update({ where: { id: moduleId }, data: { defaultAccess: unlocked ? ModuleAccessStatus.UNLOCKED : ModuleAccessStatus.LOCKED } });
-      const enrollments = await tx.enrollment.findMany({ where: { practicumId: courseModule.practicumId, status: EnrollmentStatus.ACTIVE, OR: [{ accessUntil: null }, { accessUntil: { gt: now } }] }, select: { id: true } });
+      const enrollments = await tx.enrollment.findMany({ where: { practicumId: courseModule.practicumId, status: EnrollmentStatus.ACTIVE, OR: [{ accessUntil: null }, { accessUntil: { gt: now } }] }, select: { id: true, studentId: true } });
       let affected = 0;
       for (const enrollment of enrollments) {
         const existing = await tx.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, select: { status: true, isOverride: true } });
@@ -176,9 +197,11 @@ export class CourseService {
         if (!existing) {
           await tx.enrollmentModuleAccess.create({ data: { enrollmentId: enrollment.id, moduleId, status: unlocked ? ModuleAccessStatus.UNLOCKED : ModuleAccessStatus.LOCKED, unlockedAt: unlocked ? now : null } });
           affected += 1;
+          if (unlocked) newlyOpenedStudentIds.push(enrollment.studentId);
         } else if (unlocked && existing.status === ModuleAccessStatus.LOCKED) {
           await tx.enrollmentModuleAccess.update({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, data: { status: ModuleAccessStatus.UNLOCKED, unlockedAt: now } });
           affected += 1;
+          newlyOpenedStudentIds.push(enrollment.studentId);
         } else if (!unlocked && existing.status === ModuleAccessStatus.UNLOCKED) {
           await tx.enrollmentModuleAccess.update({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, data: { status: ModuleAccessStatus.LOCKED, unlockedAt: null } });
           affected += 1;
@@ -186,6 +209,11 @@ export class CourseService {
       }
       return { moduleId, unlocked, affectedEnrollments: affected };
     });
+    if (newlyOpenedStudentIds.length > 0) {
+      void notificationService.createMany(newlyOpenedStudentIds, "MODULE_OPENED", `Открыт урок: ${courseModule.title}`, undefined, moduleId)
+        .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    }
+    return result;
   }
 
   /**
@@ -195,7 +223,7 @@ export class CourseService {
    */
   public async setStudentModuleAccess(actorId: string, studentId: string, moduleId: string, unlocked: boolean) {
     await this.assertCurator(actorId);
-    const courseModule = await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true } });
+    const courseModule = await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true, title: true } });
     if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
     const enrollment = await prisma.enrollment.findFirst({
       where: { studentId, practicumId: courseModule.practicumId, status: EnrollmentStatus.ACTIVE },
@@ -203,12 +231,18 @@ export class CourseService {
     });
     if (!enrollment) throw new AuthServiceError("INVALID_INPUT", "Student is not enrolled in this practicum");
     const now = new Date();
+    const previous = await prisma.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, select: { status: true } });
+    const wasOpen = previous?.status === ModuleAccessStatus.UNLOCKED || previous?.status === ModuleAccessStatus.COMPLETED;
     const access = await prisma.enrollmentModuleAccess.upsert({
       where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } },
       update: { status: unlocked ? ModuleAccessStatus.UNLOCKED : ModuleAccessStatus.LOCKED, unlockedAt: unlocked ? now : null, isOverride: true },
       create: { enrollmentId: enrollment.id, moduleId, status: unlocked ? ModuleAccessStatus.UNLOCKED : ModuleAccessStatus.LOCKED, unlockedAt: unlocked ? now : null, isOverride: true },
       select: { status: true, isOverride: true },
     });
+    if (unlocked && !wasOpen) {
+      void notificationService.create(studentId, "MODULE_OPENED", `Открыт урок: ${courseModule.title}`, undefined, moduleId)
+        .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    }
     return { moduleId, studentId, status: access.status, isOverride: access.isOverride };
   }
 
@@ -231,14 +265,15 @@ export class CourseService {
     });
     if (!enrollment) throw new AuthServiceError("INVALID_INPUT", "Student is not enrolled in this practicum");
     const now = new Date();
-    return prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       await tx.enrollmentModuleAccess.upsert({
         where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } },
         update: { status: ModuleAccessStatus.COMPLETED, progress: 100, completedAt: now },
         create: { enrollmentId: enrollment.id, moduleId, status: ModuleAccessStatus.COMPLETED, progress: 100, unlockedAt: now, completedAt: now },
       });
-      const nextModule = await tx.module.findFirst({ where: { practicumId: courseModule.practicumId, position: { gt: courseModule.position } }, orderBy: { position: "asc" }, select: { id: true } });
+      const nextModule = await tx.module.findFirst({ where: { practicumId: courseModule.practicumId, position: { gt: courseModule.position } }, orderBy: { position: "asc" }, select: { id: true, title: true } });
       let nextModuleId: string | null = null;
+      let nextModuleTitle: string | null = null;
       if (nextModule) {
         // Skips a next-module row the curator already set by hand (isOverride) — completing
         // the previous module shouldn't silently reopen something they deliberately closed.
@@ -246,13 +281,20 @@ export class CourseService {
         if (!existingNext) {
           await tx.enrollmentModuleAccess.create({ data: { enrollmentId: enrollment.id, moduleId: nextModule.id, status: ModuleAccessStatus.UNLOCKED, unlockedAt: now } });
           nextModuleId = nextModule.id;
+          nextModuleTitle = nextModule.title;
         } else if (!existingNext.isOverride && existingNext.status === ModuleAccessStatus.LOCKED) {
           await tx.enrollmentModuleAccess.update({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId: nextModule.id } }, data: { status: ModuleAccessStatus.UNLOCKED, unlockedAt: now } });
           nextModuleId = nextModule.id;
+          nextModuleTitle = nextModule.title;
         }
       }
-      return { moduleId, studentId, status: ModuleAccessStatus.COMPLETED, nextModuleUnlocked: nextModuleId };
+      return { moduleId, studentId, status: ModuleAccessStatus.COMPLETED, nextModuleUnlocked: nextModuleId, nextModuleTitle };
     });
+    if (result.nextModuleUnlocked) {
+      void notificationService.create(studentId, "MODULE_OPENED", `Открыт урок: ${result.nextModuleTitle}`, undefined, result.nextModuleUnlocked)
+        .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    }
+    return result;
   }
 
   /**
@@ -266,10 +308,11 @@ export class CourseService {
     const courseModule = await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true, position: true } });
     if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
     const now = new Date();
-    const enrollments = await prisma.enrollment.findMany({ where: { practicumId: courseModule.practicumId, status: EnrollmentStatus.ACTIVE }, select: { id: true } });
-    const nextModule = await prisma.module.findFirst({ where: { practicumId: courseModule.practicumId, position: { gt: courseModule.position } }, orderBy: { position: "asc" }, select: { id: true } });
+    const enrollments = await prisma.enrollment.findMany({ where: { practicumId: courseModule.practicumId, status: EnrollmentStatus.ACTIVE }, select: { id: true, studentId: true } });
+    const nextModule = await prisma.module.findFirst({ where: { practicumId: courseModule.practicumId, position: { gt: courseModule.position } }, orderBy: { position: "asc" }, select: { id: true, title: true } });
 
     let completedCount = 0;
+    const newlyOpenedStudentIds: string[] = [];
     await prisma.$transaction(async (tx) => {
       for (const enrollment of enrollments) {
         const existing = await tx.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, select: { status: true } });
@@ -285,12 +328,18 @@ export class CourseService {
           const existingNext = await tx.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId: nextModule.id } }, select: { isOverride: true, status: true } });
           if (!existingNext) {
             await tx.enrollmentModuleAccess.create({ data: { enrollmentId: enrollment.id, moduleId: nextModule.id, status: ModuleAccessStatus.UNLOCKED, unlockedAt: now } });
+            newlyOpenedStudentIds.push(enrollment.studentId);
           } else if (!existingNext.isOverride && existingNext.status === ModuleAccessStatus.LOCKED) {
             await tx.enrollmentModuleAccess.update({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId: nextModule.id } }, data: { status: ModuleAccessStatus.UNLOCKED, unlockedAt: now } });
+            newlyOpenedStudentIds.push(enrollment.studentId);
           }
         }
       }
     });
+    if (newlyOpenedStudentIds.length > 0 && nextModule) {
+      void notificationService.createMany(newlyOpenedStudentIds, "MODULE_OPENED", `Открыт урок: ${nextModule.title}`, undefined, nextModule.id)
+        .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    }
     return { moduleId, completedCount, totalEnrollments: enrollments.length, nextModuleId: nextModule?.id ?? null };
   }
 
@@ -327,7 +376,7 @@ export class CourseService {
     });
   }
 
-  public async getForUser(userId: string) {
+  public async getForUser(userId: string, options?: { viewPracticumId?: string }) {
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { role: true, status: true },
@@ -353,7 +402,16 @@ export class CourseService {
       throw new AuthServiceError("FORBIDDEN", "Student is not enrolled in a practicum");
     }
 
-    const practicumId = enrollment?.practicumId ?? (await getActivePracticumId());
+    // Staff-only "просмотр архива": browse a specific (typically non-active) practicum's
+    // content read-only, without touching which one is active — see practicum-service.ts and
+    // the "Потоки" card. Ignored for a student session, so a stray/forged query param can't
+    // redirect a student's own dashboard this way.
+    let practicumId = enrollment?.practicumId ?? (await getWorkingPracticumId(userId));
+    if (options?.viewPracticumId && (user.role === UserRole.OWNER || user.role === UserRole.CURATOR)) {
+      const viewed = await prisma.practicum.findUnique({ where: { id: options.viewPracticumId }, select: { id: true } });
+      if (!viewed) throw new AuthServiceError("INVALID_INPUT", "Practicum does not exist");
+      practicumId = viewed.id;
+    }
 
     if (!practicumId) {
       throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
@@ -396,6 +454,7 @@ export class CourseService {
                 ? { status: AssignmentStatus.PUBLISHED }
                 : { status: { not: AssignmentStatus.ARCHIVED } },
               orderBy: { createdAt: "asc" },
+              include: { materials: { orderBy: { position: "asc" } } },
             },
             // Only the current student's own row is ever needed — a curator/owner has no
             // enrollment of their own, so this resolves to zero rows for them; their view
@@ -423,6 +482,7 @@ export class CourseService {
         title: asset.title,
         description: asset.description,
         durationSec: asset.durationSec,
+        byteSize: mediaByteSize(asset.byteSize),
         position: asset.position,
         publishedAt: asset.publishedAt,
         embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey, asset.id),
@@ -446,6 +506,7 @@ export class CourseService {
           title: asset.title,
           description: asset.description,
           durationSec: asset.durationSec,
+          byteSize: mediaByteSize(asset.byteSize),
           position: asset.position,
           status: asset.status,
           publishedAt: asset.publishedAt,
@@ -466,6 +527,7 @@ export class CourseService {
             title: asset.title,
             description: asset.description,
             durationSec: asset.durationSec,
+            byteSize: mediaByteSize(asset.byteSize),
             position: asset.position,
             publishedAt: asset.publishedAt,
             embedUrl: mediaEmbedUrl(asset.provider, asset.providerKey, asset.id),
@@ -480,6 +542,14 @@ export class CourseService {
             requirements: jsonStrings(assignment.requirements),
             allowedFormats: jsonStrings(assignment.allowedFormats),
             deadline: assignment.deadline,
+            materials: assignment.materials.map((material) => ({
+              id: material.id,
+              kind: material.kind,
+              title: material.title,
+              url: material.kind === "FILE" && material.fileId ? `/api/files/${material.fileId}/content` : material.url,
+              mimeType: material.mimeType,
+              byteSize: material.byteSize,
+            })),
           }));
 
         return {
@@ -515,7 +585,7 @@ export class CourseService {
     const scheduleEvent = scheduleEventId ? await prisma.scheduleEvent.findUnique({ where: { id: scheduleEventId }, select: { id: true, practicumId: true } }) : null;
     if (scheduleEventId && !scheduleEvent) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
     if (courseModule && scheduleEvent && courseModule.practicumId !== scheduleEvent.practicumId) throw new AuthServiceError("INVALID_INPUT", "Module and event belong to different practicums");
-    const practicumId = courseModule?.practicumId ?? scheduleEvent?.practicumId ?? (await getActivePracticumId());
+    const practicumId = courseModule?.practicumId ?? scheduleEvent?.practicumId ?? (await getWorkingPracticumId(actorId));
     if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
 
     const lastMedia = await prisma.mediaAsset.findFirst({
@@ -624,12 +694,24 @@ export class CourseService {
     if (!media) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     if (existing.status !== MediaAssetStatus.PUBLISHED) {
       const practicumId = media.module?.practicumId ?? media.scheduleEvent?.practicumId ?? media.practicumId;
-      void activeStudentEmails(practicumId)
-        .then((emails) => Promise.all(emails.map((to) => sendNewMediaNotification({ to, mediaTitle: media.title ?? "Новая запись", kind: media.kind, mediaId: media.id }))))
-        .catch((error: unknown) => console.error("Media recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-      void activeStudentIds(practicumId)
-        .then((studentIds) => notificationService.createMany(studentIds, "NEW_MEDIA", `Новая запись: ${media.title ?? "без названия"}`, undefined, media.id))
-        .catch((error: unknown) => console.error("Media notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+      const moduleId = media.moduleId;
+      // Gated the same way as NEW_ASSIGNMENT: a recording published into a module a student
+      // hasn't unlocked yet must not tell them about it before it's actually visible to them —
+      // that mismatch (notification arrives, item isn't in the list) was the reported bug. Media
+      // attached to a schedule event instead of a module (Q&A recordings, mostly) has no
+      // "closed lesson" to gate on, so those still go out to everyone, same as before.
+      void (async () => {
+        const candidateIds = await activeStudentIds(practicumId);
+        const notifiableIds = moduleId
+          ? (await Promise.all(candidateIds.map(async (studentId) => ({ studentId, open: await isModuleOpenForStudent(prisma, studentId, practicumId, moduleId) }))))
+              .filter((entry) => entry.open)
+              .map((entry) => entry.studentId)
+          : candidateIds;
+        if (notifiableIds.length === 0) return;
+        const recipients = await prisma.user.findMany({ where: { id: { in: notifiableIds }, email: { not: null } }, select: { email: true } });
+        await Promise.all(recipients.map((recipient) => recipient.email && sendNewMediaNotification({ to: recipient.email, mediaTitle: media.title ?? "Новая запись", kind: media.kind, mediaId: media.id })));
+        await notificationService.createMany(notifiableIds, "NEW_MEDIA", `Новая запись: ${media.title ?? "без названия"}`, undefined, media.id);
+      })().catch((error: unknown) => console.error("Media notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     }
     return this.toMediaDto(media);
   }
@@ -651,6 +733,7 @@ export class CourseService {
         title: true,
         description: true,
         durationSec: true,
+        byteSize: true,
         position: true,
         publishedAt: true,
         moduleId: true,
@@ -673,6 +756,7 @@ export class CourseService {
           title: true,
           description: true,
           durationSec: true,
+          byteSize: true,
           position: true,
           publishedAt: true,
         },
@@ -694,6 +778,19 @@ export class CourseService {
       return media;
     });
 
+    // A recording can be attached to several modules at once (attachMediaToModule copies
+    // provider+providerKey onto a new row per module) — only wipe the actual file once none of
+    // its sibling rows still need it. Best-effort: the row is already archived either way, so a
+    // storage hiccup here just leaves an orphaned file for later cleanup rather than blocking.
+    if (existing.provider.toUpperCase() === "LIVEKIT_RECORDING") {
+      const stillReferenced = await prisma.mediaAsset.count({
+        where: { provider: existing.provider, providerKey: existing.providerKey, status: { not: MediaAssetStatus.ARCHIVED }, id: { not: normalizedMediaId } },
+      });
+      if (stillReferenced === 0) {
+        await deleteRecordingObjects(existing.providerKey).catch((error: unknown) => console.error("Recording storage cleanup failed", error instanceof Error ? error.message : "unknown error"));
+      }
+    }
+
     return this.toMediaDto(archived);
   }
 
@@ -704,10 +801,10 @@ export class CourseService {
     const courseModule = await prisma.module.findUnique({ where: { id: normalizedModuleId }, select: { id: true, practicumId: true } });
     if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
     const lastMedia = await prisma.mediaAsset.findFirst({ where: { moduleId: normalizedModuleId }, orderBy: { position: "desc" }, select: { position: true } });
-    const source = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, publishedAt: true } });
+    const source = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, byteSize: true, publishedAt: true } });
     if (!source) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     if (source.kind === MediaAssetKind.TALKS) throw new AuthServiceError("INVALID_INPUT", "Talks-запись нельзя привязать к уроку");
-    const media = await prisma.mediaAsset.create({ data: { practicumId: courseModule.practicumId, moduleId: normalizedModuleId, provider: source.provider, providerKey: source.providerKey, kind: source.kind, status: source.status, title: source.title, description: source.description, durationSec: source.durationSec, publishedAt: source.publishedAt, position: (lastMedia?.position ?? -1) + 1 }, select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, position: true, publishedAt: true } }).catch(() => null);
+    const media = await prisma.mediaAsset.create({ data: { practicumId: courseModule.practicumId, moduleId: normalizedModuleId, provider: source.provider, providerKey: source.providerKey, kind: source.kind, status: source.status, title: source.title, description: source.description, durationSec: source.durationSec, byteSize: source.byteSize, publishedAt: source.publishedAt, position: (lastMedia?.position ?? -1) + 1 }, select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, byteSize: true, position: true, publishedAt: true } }).catch(() => null);
     if (!media) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     return this.toMediaDto(media);
   }
@@ -756,12 +853,29 @@ export class CourseService {
         practicumId,
         position: (lastMedia?.position ?? -1) + 1,
       },
-      select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, position: true, publishedAt: true, scheduleEventId: true },
+      select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, byteSize: true, position: true, publishedAt: true, scheduleEventId: true },
     }).catch((error: unknown) => {
       if (error instanceof Error && error.message.includes("Unique constraint")) {
         throw new AuthServiceError("INVALID_INPUT", "Эта запись уже есть в выбранном уроке");
       }
       throw error;
+    });
+
+    return this.toMediaDto(media);
+  }
+
+  public async renameMedia(actorId: string, mediaId: string, title: string) {
+    await this.assertCurator(actorId);
+    const normalizedMediaId = requiredText(mediaId, "mediaId", 100);
+    const normalizedTitle = requiredText(title, "title", 180);
+
+    const existing = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { id: true } });
+    if (!existing) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
+
+    const media = await prisma.mediaAsset.update({
+      where: { id: normalizedMediaId },
+      data: { title: normalizedTitle },
+      select: { id: true, provider: true, providerKey: true, kind: true, status: true, title: true, description: true, durationSec: true, byteSize: true, position: true, publishedAt: true, scheduleEventId: true },
     });
 
     return this.toMediaDto(media);
@@ -862,6 +976,7 @@ export class CourseService {
     title: string | null;
     description: string | null;
     durationSec: number | null;
+    byteSize: bigint | null;
     position: number;
     publishedAt: Date | null;
   }) {
@@ -874,6 +989,7 @@ export class CourseService {
       title: media.title,
       description: media.description,
       durationSec: media.durationSec,
+      byteSize: mediaByteSize(media.byteSize),
       position: media.position,
       publishedAt: media.publishedAt,
       embedUrl: mediaEmbedUrl(media.provider, media.providerKey, media.id),

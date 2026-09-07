@@ -8,6 +8,7 @@ import {
   Patch,
   Param,
   Post,
+  Query,
   Req,
   UnauthorizedException,
 } from "@nestjs/common";
@@ -38,22 +39,11 @@ function mapSecurityError(error: unknown): never {
 @Controller("security/students")
 export class SecurityController {
   @Get()
-  public async getStudents(@Req() request: RequestWithCookies) {
+  public async getStudents(@Req() request: RequestWithCookies, @Query("practicumId") practicumId?: string) {
     const session = await this.requireSession(request);
 
     try {
-      return { data: await authService.getStudentDirectory(session.userId) };
-    } catch (error) {
-      mapSecurityError(error);
-    }
-  }
-
-  @Get("/curators")
-  public async getCurators(@Req() request: RequestWithCookies) {
-    const session = await this.requireSession(request);
-
-    try {
-      return { data: await authService.getCuratorDirectory(session.userId) };
+      return { data: await authService.getStudentDirectory(session.userId, { practicumId }) };
     } catch (error) {
       mapSecurityError(error);
     }
@@ -85,35 +75,6 @@ export class SecurityController {
     const email = typeof body.email === "string" ? body.email.slice(0, 320) : "";
     try {
       return { data: { email: await authService.updateStudentEmail(session.userId, studentId, email) } };
-    } catch (error) {
-      mapSecurityError(error);
-    }
-  }
-
-  @Post(":studentId/claim")
-  public async claimStudent(
-    @Req() request: RequestWithCookies,
-    @Param("studentId") studentId: string,
-  ) {
-    const session = await this.requireSession(request);
-    try {
-      return { data: await authService.claimStudent(session.userId, studentId) };
-    } catch (error) {
-      mapSecurityError(error);
-    }
-  }
-
-  @Patch(":studentId/assignment")
-  public async transferStudent(
-    @Req() request: RequestWithCookies,
-    @Param("studentId") studentId: string,
-    @Body() body: { curatorId?: unknown },
-  ) {
-    const session = await this.requireSession(request);
-    const curatorId = typeof body.curatorId === "string" ? body.curatorId.slice(0, 100) : "";
-
-    try {
-      return { data: await authService.transferStudent(session.userId, studentId, curatorId) };
     } catch (error) {
       mapSecurityError(error);
     }
@@ -195,6 +156,28 @@ export class SecurityController {
     }
   }
 
+  /**
+   * Owner-only student <-> curator switch. Path stays under /security/students for both
+   * directions (the :userId is just an id, not required to already be a student) so the same
+   * endpoint serves the button on both the "Ученики" and "Команда" profile cards.
+   */
+  @Post(":userId/role")
+  public async setRole(
+    @Req() request: RequestWithCookies,
+    @Param("userId") userId: string,
+    @Body() body: { role?: unknown },
+  ) {
+    const session = await this.requireSession(request);
+    if (session.role !== UserRole.OWNER) throw new ForbiddenException("Owner access required");
+    if (body.role !== "STUDENT" && body.role !== "CURATOR") throw new BadRequestException("role must be STUDENT or CURATOR");
+
+    try {
+      return { data: await authService.setUserRole(session.userId, userId, body.role) };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
   @Post(":studentId/suspend")
   public async suspendStudent(
     @Req() request: RequestWithCookies,
@@ -215,10 +198,120 @@ export class SecurityController {
     }
   }
 
+  /** Owner or curator — permanent, unlike suspend. Client is expected to confirm with the human first. */
+  @Post(":studentId/delete")
+  public async deleteStudent(
+    @Req() request: RequestWithCookies,
+    @Param("studentId") studentId: string,
+  ) {
+    const session = await this.requireSession(request);
+    try {
+      await authService.deleteStudent(session.userId, studentId);
+      return { data: { deleted: true } };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
   private async requireSession(request: RequestWithCookies) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
     if (!token) throw new UnauthorizedException("Session is required");
 
+    try {
+      return await authService.validateSession(token);
+    } catch {
+      throw new UnauthorizedException("Session is invalid or expired");
+    }
+  }
+}
+
+/**
+ * Owner-only staff-security roster: a curator's devices are no longer reachable from
+ * /security/students once they're promoted (getStudentSecurityOverview/assertCanManage*
+ * on the student side reject a non-student target), so this is where a stuck 3rd-device
+ * approval for a curator gets granted. Session approve/revoke reuse the exact same
+ * authService calls as the student controller — assertCanManageDeviceSecurity there already
+ * accepts any target role, only the *listing/overview* endpoints needed a staff-side home.
+ */
+@Controller("security/team")
+export class TeamSecurityController {
+  @Get()
+  public async getTeam(@Req() request: RequestWithCookies) {
+    const session = await this.requireSession(request);
+    try {
+      return { data: await authService.getTeamDirectory(session.userId) };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  @Get(":memberId")
+  public async getTeamMemberSecurity(@Req() request: RequestWithCookies, @Param("memberId") memberId: string) {
+    const session = await this.requireSession(request);
+    try {
+      return { data: await authService.getTeamMemberSecurityOverview(session.userId, memberId) };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  @Post(":memberId/revoke-sessions")
+  public async revokeAllSessions(
+    @Req() request: RequestWithCookies,
+    @Param("memberId") memberId: string,
+    @Body() body: { reason?: unknown },
+  ) {
+    const session = await this.requireSession(request);
+    if (session.role !== UserRole.OWNER) throw new ForbiddenException("Owner access required");
+    const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 200) : "Owner action";
+    if (!reason) throw new ForbiddenException("A reason is required");
+    try {
+      const revokedCount = await authService.revokeUserSessions(session.userId, memberId, reason);
+      return { data: { revokedCount } };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  @Post(":memberId/sessions/:sessionId/revoke")
+  public async revokeSession(
+    @Req() request: RequestWithCookies,
+    @Param("memberId") memberId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: { reason?: unknown },
+  ) {
+    const session = await this.requireSession(request);
+    const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 200) : "Security review";
+    if (!reason) throw new ForbiddenException("A reason is required");
+    try {
+      await authService.revokeUserSession(session.userId, memberId, sessionId, reason);
+      return { data: { revoked: true } };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  @Post(":memberId/sessions/:sessionId/approve")
+  public async approveSession(
+    @Req() request: RequestWithCookies,
+    @Param("memberId") memberId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: { reason?: unknown },
+  ) {
+    const session = await this.requireSession(request);
+    const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 200) : "Security review";
+    if (!reason) throw new ForbiddenException("A reason is required");
+    try {
+      await authService.approveUserSession(session.userId, memberId, sessionId, reason);
+      return { data: { approved: true } };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  private async requireSession(request: RequestWithCookies) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
     try {
       return await authService.validateSession(token);
     } catch {

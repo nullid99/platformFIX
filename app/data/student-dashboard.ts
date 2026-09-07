@@ -81,7 +81,7 @@ export const practicumModules = [
 
 const practicumProgress = calculatePracticumProgress(practicumModules);
 
-export type StreamKind = "Разбор" | "Стрим" | "Talks";
+export type StreamKind = "Разбор" | "Стрим" | "Talks" | "Q&A";
 
 export type StreamItem = {
   id: string;

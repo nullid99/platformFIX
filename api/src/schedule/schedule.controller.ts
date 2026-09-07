@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Delete, Get, InternalServerErrorException, Param, Post, Put, Req, UnauthorizedException, ForbiddenException } from "@nestjs/common";
+import { BadRequestException, Body, ConflictException, Controller, Delete, Get, InternalServerErrorException, Param, Post, Put, Query, Req, UnauthorizedException, ForbiddenException } from "@nestjs/common";
 import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { scheduleService } from "@/app/server/schedule";
@@ -23,8 +23,8 @@ async function sessionUser(request: RequestWithCookies): Promise<string> {
 @Controller("schedule")
 export class ScheduleController {
   @Get()
-  public async list(@Req() request: RequestWithCookies) {
-    try { return { data: await scheduleService.getForUser(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  public async list(@Req() request: RequestWithCookies, @Query("viewPracticumId") viewPracticumId?: string) {
+    try { return { data: await scheduleService.getForUser(await sessionUser(request), { viewPracticumId }) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
   @Post()

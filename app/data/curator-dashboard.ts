@@ -1,6 +1,6 @@
-import type { AssignmentStatus, AssignmentTone } from "./student-dashboard";
+import type { AssignmentFeedback, AssignmentStatus, AssignmentTone } from "./student-dashboard";
 
-export type CuratorNav = "Кабинет куратора" | "Очередь проверки" | "Создать задание" | "Ученики" | "Программа" | "Приглашения" | "Расписание" | "Стримы" | "Медиатека" | "Обсуждения";
+export type CuratorNav = "Кабинет куратора" | "Очередь проверки" | "Создать задание" | "Ученики" | "Программа" | "Приглашения" | "Расписание" | "Стримы" | "Медиатека" | "Обсуждения" | "Команда";
 
 export type ReviewQueueItem = {
   id: string;
@@ -19,8 +19,16 @@ export type ReviewQueueItem = {
   requirements?: readonly string[];
   attachments: readonly string[];
   attachmentFiles?: readonly { id: string; name: string; type: string; size: number; url: string }[];
-  /** All submissions for this assignment/student pair, oldest first. */
-  attemptHistory?: readonly { attempt: number; status: AssignmentStatus; submittedAt: string }[];
+  /** All submissions for this assignment/student pair, oldest first — each carries its own
+   * answer/files/feedback so a resubmission's review can show what happened last round. */
+  attemptHistory?: readonly {
+    attempt: number;
+    status: AssignmentStatus;
+    submittedAt: string;
+    answerText: string | null;
+    files: readonly { id: string; name: string; type: string; size: number; url: string }[];
+    feedback: readonly AssignmentFeedback[];
+  }[];
   progress: string;
   reviewerId?: string | null;
   reviewerName?: string | null;

@@ -7,6 +7,7 @@ import {
   InternalServerErrorException,
   Req,
   Param,
+  Query,
   Body,
   UnauthorizedException,
   ForbiddenException,
@@ -14,9 +15,9 @@ import {
 } from "@nestjs/common";
 import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
-import { courseService, createNewPracticum, listPracticums, setActivePracticum } from "@/app/server/course";
+import { courseService, createNewPracticum, listPracticums, setActivePracticum, setWorkingPracticum } from "@/app/server/course";
 import { getRequestContext } from "../common/request-context";
-import { parseCreateModuleBody, parseCreateVimeoMediaBody, parseUpdateMediaKindBody } from "./course-input";
+import { parseCreateModuleBody, parseCreateVimeoMediaBody, parseRenameMediaBody, parseUpdateMediaKindBody } from "./course-input";
 
 type RequestWithCookies = Request & { cookies?: Record<string, string | undefined> };
 
@@ -30,13 +31,13 @@ function mapError(error: unknown): never {
 @Controller("course")
 export class CourseController {
   @Get("manage")
-  public async manage(@Req() request: RequestWithCookies) {
+  public async manage(@Req() request: RequestWithCookies, @Query("viewPracticumId") viewPracticumId?: string) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
     if (!token) throw new UnauthorizedException("Session is required");
 
     try {
       const session = await authService.validateSession(token);
-      return { data: await courseService.getForCurator(session.userId) };
+      return { data: await courseService.getForCurator(session.userId, { viewPracticumId }) };
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       throw new UnauthorizedException("Session is invalid or expired");
@@ -174,6 +175,20 @@ export class CourseController {
     }
   }
 
+  @Put("media/:mediaId/title")
+  public async renameMedia(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await courseService.renameMedia(session.userId, mediaId, parseRenameMediaBody(body).title) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Course media operation failed");
+    }
+  }
+
   @Post("media/:mediaId/access")
   public async recordMediaAccess(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
@@ -299,6 +314,29 @@ export class CourseController {
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       throw new InternalServerErrorException("Practicum list failed");
+    }
+  }
+
+  /**
+   * Owner or curator — points the caller's own content creation at a practicum, independent of
+   * which one is active for live streaming. `practicumId: null` clears the pick (falls back to
+   * the active practicum again).
+   */
+  @Post("working-practicum")
+  public async setWorkingPracticum(@Req() request: RequestWithCookies, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    const practicumId = body && typeof body === "object" && "practicumId" in body
+      ? (body as { practicumId: unknown }).practicumId
+      : undefined;
+    if (practicumId !== null && typeof practicumId !== "string") throw new BadRequestException("practicumId must be a string or null");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await setWorkingPracticum(session.userId, practicumId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Setting the working practicum failed");
     }
   }
 

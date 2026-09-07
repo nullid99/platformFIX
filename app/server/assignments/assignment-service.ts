@@ -11,8 +11,7 @@ import { AuthServiceError } from "@/app/server/auth";
 import { assignmentPrerequisiteGate, isModuleOpenForStudent, seedOpenModuleAccess } from "@/app/server/course/module-access";
 import { courseService } from "@/app/server/course/course-service";
 import { sendReviewNotification } from "@/app/server/notifications/email-service";
-import { sendNewAssignmentNotification } from "@/app/server/notifications/email-service";
-import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
+import { activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { nextSubmissionStatus } from "./assignment-transition";
 
@@ -75,6 +74,9 @@ type QueueAttempt = {
   attempt: number;
   status: SubmissionStatus;
   submittedAt: Date | null;
+  answerText: string | null;
+  fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>;
+  feedback: readonly { id: string; text: string; createdAt: Date; attachments: readonly { id: string; originalName: string; mimeType: string; byteSize: number; fileId: string; file: { status: StoredFileStatus } | null }[] }[];
 };
 
 const MAX_TEXT_LENGTH = 10_000;
@@ -218,6 +220,18 @@ function toneFromStatus(status: ReturnType<typeof assignmentStatusFromSubmission
   return "blue";
 }
 
+// "Мои задания" ordering for a student: whatever still needs their attention first (a
+// resubmission is more urgent than a first attempt), then in lesson order so it reads as a
+// to-do list instead of a feed sorted by whenever the curator happened to publish each one —
+// previously createdAt desc could put a far-later, not-yet-started lesson's ДЗ above one the
+// student had already submitted that same day.
+const ASSIGNMENT_STATUS_PRIORITY: Record<ReturnType<typeof assignmentStatusFromSubmission>, number> = {
+  "Нужна доработка": 0,
+  "Не начато": 1,
+  "На проверке": 2,
+  "Принято": 3,
+};
+
 function latestSubmission<T extends { attempt: number }>(submissions: readonly T[]): T | undefined {
   return [...submissions].sort((left, right) => right.attempt - left.attempt)[0];
 }
@@ -246,7 +260,13 @@ export class AssignmentService {
     // needs its own gate check against the module before it, not just "is the module open."
     const gateCache = new Map<string, string | null>();
     const openCache = new Map<string, boolean>();
-    const results = await Promise.all(assignments.map(async (assignment) => {
+    const orderedAssignments = [...assignments].sort((left, right) => {
+      const leftStatus = assignmentStatusFromSubmission(latestSubmission(left.submissions)?.status);
+      const rightStatus = assignmentStatusFromSubmission(latestSubmission(right.submissions)?.status);
+      const priorityDiff = ASSIGNMENT_STATUS_PRIORITY[leftStatus] - ASSIGNMENT_STATUS_PRIORITY[rightStatus];
+      return priorityDiff !== 0 ? priorityDiff : left.module.position - right.module.position;
+    });
+    const results = await Promise.all(orderedAssignments.map(async (assignment) => {
       if (!openCache.has(assignment.moduleId)) {
         openCache.set(assignment.moduleId, await isModuleOpenForStudent(prisma, studentId, assignment.module.practicumId, assignment.moduleId));
       }
@@ -344,12 +364,21 @@ export class AssignmentService {
         materials: { orderBy: { position: "asc" } },
       },
     });
-    void activeStudentEmails(created.module.practicumId)
-      .then((emails) => Promise.all(emails.map((to) => sendNewAssignmentNotification({ to, assignmentTitle: created.title, moduleTitle: created.module.title, assignmentId: created.id }))))
-      .catch((error: unknown) => console.error("Assignment recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-    void activeStudentIds(created.module.practicumId)
-      .then((studentIds) => notificationService.createMany(studentIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.module.title, created.id))
-      .catch((error: unknown) => console.error("Assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    // Bell only, deliberately no email — see email-service.ts's curated list. Notifying a
+    // student about an assignment sitting behind a module they haven't unlocked yet produces
+    // exactly "the notification arrived but the item isn't in my list" — listForStudent hides
+    // the same assignment under this same isModuleOpenForStudent check, so this makes the two
+    // agree on who's actually told about it.
+    void (async () => {
+      const candidateIds = await activeStudentIds(created.module.practicumId);
+      const openChecks = await Promise.all(candidateIds.map(async (studentId) => ({
+        studentId,
+        open: await isModuleOpenForStudent(prisma, studentId, created.module.practicumId, created.moduleId),
+      })));
+      const notifiableIds = openChecks.filter((entry) => entry.open).map((entry) => entry.studentId);
+      if (notifiableIds.length === 0) return;
+      await notificationService.createMany(notifiableIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.module.title, created.id);
+    })().catch((error: unknown) => console.error("Assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     return this.toStudentDto(created);
   }
 
@@ -455,19 +484,20 @@ export class AssignmentService {
       include: {
         assignment: { include: { module: { select: { title: true, position: true, coverPath: true } } } },
         fileAttachments: { orderBy: { position: "asc" }, include: { file: { select: { id: true, originalName: true, mimeType: true, byteSize: true } } } },
+        feedback: { select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
         student: { include: { externalIdentities: { orderBy: { createdAt: "asc" } } } },
         reviewer: { include: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1 } } },
       },
     });
-    // The review queue is an action list, not an attempt history. Keep only the
-    // newest attempt for each student/assignment; the full history is exposed
-    // from the student profile and assignment history endpoints.
+    // The review queue is an action list, not an attempt history — but a curator picking up a
+    // resubmission still needs to see what the student answered (and what an earlier reviewer
+    // said) in prior rounds, so each past attempt's own answer/files/feedback rides along too.
     const latestByWork = new Map<string, (typeof submissions)[number]>();
     const historyByWork = new Map<string, QueueAttempt[]>();
     for (const submission of submissions) {
       const key = `${submission.assignmentId}:${submission.studentId}`;
       const history = historyByWork.get(key) ?? [];
-      history.push({ attempt: submission.attempt, status: submission.status, submittedAt: submission.submittedAt });
+      history.push({ attempt: submission.attempt, status: submission.status, submittedAt: submission.submittedAt, answerText: submission.answerText, fileAttachments: submission.fileAttachments, feedback: submission.feedback });
       historyByWork.set(key, history);
       const current = latestByWork.get(key);
       if (!current || submission.attempt > current.attempt) latestByWork.set(key, submission);
@@ -476,7 +506,7 @@ export class AssignmentService {
   }
 
   public async claim(actorId: string, submissionId: string) {
-    const actor = await this.assertCurator(actorId);
+    await this.assertCurator(actorId);
     try {
       return await prisma.$transaction(async (tx) => {
         const current = await tx.submission.findUnique({
@@ -487,7 +517,12 @@ export class AssignmentService {
         if (current.status !== SubmissionStatus.SUBMITTED && current.status !== SubmissionStatus.NEEDS_REVISION && current.status !== SubmissionStatus.IN_REVIEW) {
           throw new AuthServiceError("INVALID_INPUT", "Submission is not awaiting review");
         }
-        if (current.reviewerId && current.reviewerId !== actorId && actor.role !== UserRole.OWNER) {
+        // No owner bypass here (unlike releaseClaim below) — otherwise a stale page (owner
+        // hasn't refreshed since a curator claimed this) lets the owner silently steal the
+        // claim with no error and no confirmation, while the same race the other way around
+        // correctly rejects the curator. An owner who actually wants to take over already has
+        // releaseClaim for that — two deliberate actions instead of an accidental one.
+        if (current.reviewerId && current.reviewerId !== actorId) {
           throw new AuthServiceError("AUTH_CONFLICT", "Work is already being checked by another curator");
         }
         const updated = await tx.submission.update({
@@ -566,15 +601,18 @@ export class AssignmentService {
       .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime());
   }
 
-  public async decide(actorId: string, submissionId: string, decision: "accepted" | "revision", feedback?: string, checkedRequirements?: string[], attachment?: FeedbackAttachmentInput) {
+  public async decide(actorId: string, submissionId: string, decision: "accepted" | "revision", feedback?: string, checkedRequirements?: string[], attachments?: FeedbackAttachmentInput[]) {
     const actor = await this.assertCurator(actorId);
-    if (attachment) {
-      requiredText(attachment.originalName, "attachment.originalName", MAX_ATTACHMENT_NAME_LENGTH);
-      if (!Number.isSafeInteger(attachment.byteSize) || attachment.byteSize < 1 || attachment.byteSize > MAX_ATTACHMENT_SIZE) {
-        throw new AuthServiceError("INVALID_INPUT", "attachment is invalid");
+    if (attachments && attachments.length > 0) {
+      for (const attachment of attachments) {
+        requiredText(attachment.originalName, "attachment.originalName", MAX_ATTACHMENT_NAME_LENGTH);
+        if (!Number.isSafeInteger(attachment.byteSize) || attachment.byteSize < 1 || attachment.byteSize > MAX_ATTACHMENT_SIZE) {
+          throw new AuthServiceError("INVALID_INPUT", "attachment is invalid");
+        }
       }
-      const file = await prisma.storedFile.findFirst({ where: { id: attachment.fileId, ownerId: actorId, status: StoredFileStatus.UPLOADED }, select: { id: true } });
-      if (!file) throw new AuthServiceError("FORBIDDEN", "Attachment ownership is invalid");
+      const fileIds = attachments.map((attachment) => attachment.fileId);
+      const files = await prisma.storedFile.findMany({ where: { id: { in: fileIds }, ownerId: actorId, status: StoredFileStatus.UPLOADED }, select: { id: true } });
+      if (files.length !== new Set(fileIds).size) throw new AuthServiceError("FORBIDDEN", "Attachment ownership is invalid");
     }
     try {
       const result = await prisma.$transaction(async (tx) => {
@@ -594,13 +632,13 @@ export class AssignmentService {
           data: { status: nextStatus, checkedRequirements: checkedRequirements ? (checkedRequirements as Prisma.InputJsonValue) : undefined },
           select: { id: true, status: true },
         });
-        if (feedback?.trim() || attachment) {
+        if (feedback?.trim() || (attachments && attachments.length > 0)) {
           await tx.feedback.create({
             data: {
               submissionId,
               authorId: actorId,
               text: feedback?.trim().slice(0, MAX_TEXT_LENGTH) ?? "",
-              attachments: attachment ? { create: { fileId: attachment.fileId, originalName: attachment.originalName, mimeType: attachment.mimeType, byteSize: attachment.byteSize } } : undefined,
+              attachments: attachments && attachments.length > 0 ? { create: attachments.map((attachment) => ({ fileId: attachment.fileId, originalName: attachment.originalName, mimeType: attachment.mimeType, byteSize: attachment.byteSize })) } : undefined,
             },
           });
         }
@@ -739,6 +777,9 @@ export class AssignmentService {
         attempt: attempt.attempt,
         status: assignmentStatusFromSubmission(attempt.status),
         submittedAt: attempt.submittedAt ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(attempt.submittedAt) : "Без даты",
+        answerText: attempt.answerText,
+        files: attempt.fileAttachments.map((item) => ({ id: item.file.id, name: item.file.originalName, type: item.file.mimeType, size: item.file.byteSize, url: `/api/files/${item.file.id}/content` })),
+        feedback: mapFeedback(attempt.feedback),
       })),
       reviewerId,
       reviewerName,

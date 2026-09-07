@@ -50,6 +50,11 @@ export class StreamsController {
     } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
+  @Get("recording-storage")
+  public async getRecordingStorage(@Req() request: RequestWithCookies) {
+    try { return { data: await streamService.getRecordingStorageStatus(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
   @Get("media/:mediaId/chat")
   public async getMediaChat(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string) {
     try { return { data: await streamChatService.getArchivedMessages(await sessionUser(request), mediaId) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }

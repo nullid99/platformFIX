@@ -3,7 +3,7 @@
 ## Roles
 
 - `OWNER` is an internal platform role. It creates invitations, sees security data for all students, revokes sessions, and can suspend an account.
-- `CURATOR` works with assigned students. A curator can see login history only for students linked through `CuratorAssignment`.
+- `CURATOR` works with the whole cohort — any active curator can see login history for any student.
 - `STUDENT` can access only the practicum and media granted to the account.
 
 The owner role is not shown as an education role in the student interface.

@@ -31,6 +31,7 @@ export type InvitationCredentials = {
   expiresAt: Date;
   practicumId: string | null;
   emailSent?: boolean;
+  emailError?: string;
 };
 
 export type AcceptInvitationInput = AuthRequestContext & {
@@ -123,13 +124,9 @@ export type StudentDirectoryRecord = {
   activeSessionCount: number;
   loginEventCount: number;
   submissionCount: number;
-  assignedCurator: { id: string; name: string } | null;
-  /** Whether the current curator/owner already has this student assigned. */
-  isAssignedToActor: boolean;
-  /** Owners may reassign a student; curators may claim only unassigned students. */
-  canClaim: boolean;
-  /** Only an active owner can transfer a student to another curator. */
-  canTransfer: boolean;
+  /** The practicum this student's active enrollment belongs to — null if they have none
+    * (e.g. access expired). Lets the roster show/filter which stream a student is actually in. */
+  practicum: { id: string; title: string } | null;
   canViewDetails: boolean;
   lastSession: {
     lastActiveAt: Date;
@@ -139,8 +136,25 @@ export type StudentDirectoryRecord = {
   } | null;
 };
 
-export type CuratorDirectoryRecord = {
+/** A curator or owner in the "Команда" security roster — same shape of security signal as
+  * StudentDirectoryRecord, minus the student-only assignment fields. */
+export type TeamMemberDirectoryRecord = {
   id: string;
-  name: string;
+  role: UserRole;
   email: string | null;
+  status: UserStatus;
+  createdAt: Date;
+  identities: Array<{
+    provider: IdentityProvider;
+    username: string | null;
+    displayName: string | null;
+  }>;
+  activeSessionCount: number;
+  loginEventCount: number;
+  lastSession: {
+    lastActiveAt: Date;
+    deviceName: string | null;
+    ipAddress: string | null;
+    city: string | null;
+  } | null;
 };

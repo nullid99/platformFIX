@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { AccessToken, EgressClient, IngressClient, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
 import { EgressStatus, EncodedFileOutput, EncodedFileType, EncodingOptions, ImageCodec, ImageFileSuffix, ImageOutput, IngressInput, IngressVideoEncodingOptions, IngressVideoOptions, S3Upload, TrackType, VideoLayer, VideoQuality } from "@livekit/protocol";
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { AuthServiceError } from "@/app/server/auth";
 
@@ -111,9 +111,15 @@ export function recordingFileOutput(objectKey: string): EncodedFileOutput {
   });
 }
 
-/** The thumbnail lives alongside its recording under the same random id — no separate DB column needed, mediaThumbnailUrl (course-service.ts) just swaps the extension on providerKey. */
+/**
+ * The thumbnail lives alongside its recording under the same random id — no separate DB column
+ * needed, mediaThumbnailUrl (course-service.ts) just swaps the extension on providerKey. The
+ * trailing ".jpeg" isn't a typo: LiveKit's ImageOutput appends its own codec extension onto
+ * whatever filenamePrefix it's given (see recordingImageOutput's ".jpg" prefix below), so the
+ * object actually lands as "<id>.jpg.jpeg" — verified directly against the uploaded files.
+ */
 export function recordingThumbnailObjectKey(videoObjectKey: string): string {
-  return videoObjectKey.replace(/\.mp4$/, ".jpg");
+  return `${videoObjectKey.replace(/\.mp4$/, ".jpg")}.jpeg`;
 }
 
 /**
@@ -157,4 +163,18 @@ export async function mintRecordingDownloadUrl(objectKey: string, filename: stri
   const { client, bucket } = recordingS3Client();
   const safeName = filename.replace(/["\r\n]/g, "");
   return getSignedUrl(client, new GetObjectCommand({ Bucket: bucket, Key: objectKey, ResponseContentDisposition: `attachment; filename="${safeName}"` }), { expiresIn: 6 * 60 * 60 });
+}
+
+/**
+ * Permanently removes a recording's video and thumbnail from storage — irreversible. Multiple
+ * MediaAsset rows can share one recording (course-service.ts#attachMediaToModule copies
+ * provider+providerKey onto a new row per module it's reattached to), so the caller must confirm
+ * no other row still references this objectKey before calling this.
+ */
+export async function deleteRecordingObjects(objectKey: string): Promise<void> {
+  const { client, bucket } = recordingS3Client();
+  await Promise.all([
+    client.send(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey })),
+    client.send(new DeleteObjectCommand({ Bucket: bucket, Key: recordingThumbnailObjectKey(objectKey) })),
+  ]);
 }

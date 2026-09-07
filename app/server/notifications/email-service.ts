@@ -1,3 +1,5 @@
+import { areNotificationsEnabled } from "./notification-settings";
+
 const RESEND_ENDPOINT = "https://api.resend.com/emails";
 
 type EmailMessage = {
@@ -83,8 +85,22 @@ export async function sendEmail(message: EmailMessage): Promise<boolean> {
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ from, to: [message.to], subject: message.subject, html, text: message.text }),
   });
-  if (!response.ok) throw new Error(`Resend request failed with status ${response.status}`);
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => null) as { message?: string } | null;
+    throw new Error(errorBody?.message ?? `Resend request failed with status ${response.status}`);
+  }
   return true;
+}
+
+/**
+ * The gated path — everything below except invitations and email verification goes through
+ * this instead of sendEmail directly, so a curator's "pause notifications" switch (see
+ * notification-settings.ts) silences it without touching the two account-critical flows that
+ * must never go dark mid-migration.
+ */
+async function sendMutableEmail(message: EmailMessage): Promise<boolean> {
+  if (!(await areNotificationsEnabled())) return false;
+  return sendEmail(message);
 }
 
 export async function sendReviewNotification(input: ReviewNotificationInput): Promise<void> {
@@ -95,7 +111,7 @@ export async function sendReviewNotification(input: ReviewNotificationInput): Pr
   const logoUrl = process.env.EMAIL_LOGO_URL?.trim() || `${webOrigin.replace(/\/$/, "")}/fix-logo.jpg`;
   const accent = accepted ? "#58d3c7" : "#eab46b";
   try {
-    await sendEmail({
+    await sendMutableEmail({
       to: input.to,
       subject: `${title} · ${input.assignmentTitle}`,
       html: `<!doctype html><html><body style="margin:0;background:#080d14;font-family:Arial,sans-serif;color:#dce8f5"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#080d14;padding:28px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#101923;border:1px solid #29405a"><tr><td style="padding:22px 26px;background:#14263e;border-bottom:1px solid #315b88"><img src="${escapeHtml(logoUrl)}" width="42" height="42" alt="FIX" style="display:block;border-radius:8px;margin-bottom:14px"><div style="font-size:11px;letter-spacing:2px;color:#82b4ff">FIX PLATFORM</div><h1 style="margin:10px 0 0;font-size:24px;color:#fff">${title}</h1></td></tr><tr><td style="padding:26px"><div style="display:inline-block;padding:7px 10px;border:1px solid ${accent};color:${accent};font-size:11px;letter-spacing:1px">${accepted ? "ПРИНЯТО" : "НУЖНА ДОРАБОТКА"}</div><p style="margin:22px 0 8px;color:#8297ad;font-size:12px">ДОМАШНЕЕ ЗАДАНИЕ</p><h2 style="margin:0;color:#fff;font-size:20px">${escapeHtml(input.assignmentTitle)}</h2>${feedback ? `<div style="margin-top:22px;padding:16px;background:#152333;border-left:3px solid ${accent}"><div style="margin-bottom:8px;color:#8297ad;font-size:11px">КОММЕНТАРИЙ КУРАТОРА</div><div style="color:#dce8f5;font-size:14px;line-height:1.6">${escapeHtml(feedback)}</div></div>` : ""}<a href="${escapeHtml(webOrigin)}" style="display:inline-block;margin-top:24px;padding:12px 18px;background:#78adff;color:#08111b;text-decoration:none;font-weight:bold;font-size:13px">Открыть платформу</a></td></tr><tr><td style="padding:16px 26px;border-top:1px solid #22354a;color:#63778d;font-size:11px">FIX Platform · Это автоматическое уведомление, отвечать на него не нужно.</td></tr></table></td></tr></table></body></html>`,
@@ -106,20 +122,23 @@ export async function sendReviewNotification(input: ReviewNotificationInput): Pr
   }
 }
 
-export async function sendInvitationNotification(input: InvitationNotificationInput): Promise<boolean> {
+export async function sendInvitationNotification(input: InvitationNotificationInput): Promise<{ sent: boolean; error?: string }> {
+  if (!process.env.RESEND_API_KEY?.trim()) return { sent: false, error: "Рассылка писем не настроена (нет RESEND_API_KEY на сервере)." };
   const webOrigin = process.env.PUBLIC_WEB_ORIGIN?.trim() || process.env.WEB_ORIGIN?.trim() || "http://localhost:3000";
   const logoUrl = process.env.EMAIL_LOGO_URL?.trim() || `${webOrigin.replace(/\/$/, "")}/fix-logo.jpg`;
   const inviteUrl = `${webOrigin.replace(/\/$/, "")}/?invite=${encodeURIComponent(input.token)}`;
   try {
-    return await sendEmail({
+    const sent = await sendEmail({
       to: input.to,
       subject: "Персональное приглашение в FIX Platform",
       html: `<!doctype html><html><body style="margin:0;background:#080d14;font-family:Arial,sans-serif;color:#dce8f5"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#080d14;padding:28px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#101923;border:1px solid #29405a"><tr><td style="padding:22px 26px;background:#14263e;border-bottom:1px solid #315b88"><img src="${escapeHtml(logoUrl)}" width="42" height="42" alt="FIX" style="display:block;border-radius:8px;margin-bottom:14px"><div style="font-size:11px;letter-spacing:2px;color:#82b4ff">FIX PLATFORM</div><h1 style="margin:10px 0 0;font-size:24px;color:#fff">Тебя пригласили в практикум</h1></td></tr><tr><td style="padding:26px"><p style="margin:0;color:#a9bdd2;font-size:14px;line-height:1.6">Персональная ссылка готова. Подтверди вход через Discord, чтобы открыть учебное пространство.</p><div style="margin-top:20px;padding:15px;background:#102b2c;border-left:3px solid #58d3c7;color:#bcece7;font-size:13px">Роль: ${input.role === "STUDENT" ? "Ученик" : "Куратор"}<br>Ссылка действует до: ${escapeHtml(input.expiresAt.toLocaleString("ru-RU"))}</div><a href="${escapeHtml(inviteUrl)}" style="display:inline-block;margin-top:24px;padding:12px 18px;background:#78adff;color:#08111b;text-decoration:none;font-weight:bold;font-size:13px">Активировать приглашение</a></td></tr><tr><td style="padding:16px 26px;border-top:1px solid #22354a;color:#63778d;font-size:11px">FIX Platform · Ссылка одноразовая.</td></tr></table></td></tr></table></body></html>`,
       text: `Тебя пригласили в практикум FIX Platform.\n\nРоль: ${input.role === "STUDENT" ? "Ученик" : "Куратор"}\nСсылка действует до: ${input.expiresAt.toLocaleString("ru-RU")}\n\nАктивировать приглашение: ${inviteUrl}\n\n—\nFIX Platform. Ссылка одноразовая.`,
     });
+    return { sent };
   } catch (error) {
-    console.error("Invitation email delivery failed", error instanceof Error ? error.message : "unknown error");
-    return false;
+    const message = error instanceof Error ? error.message : "unknown error";
+    console.error("Invitation email delivery failed", message);
+    return { sent: false, error: message };
   }
 }
 
@@ -140,23 +159,19 @@ export async function sendEmailVerificationNotification(input: EmailVerification
   }
 }
 
-export async function sendNewAssignmentNotification(input: { to: string; assignmentTitle: string; moduleTitle: string; assignmentId: string }): Promise<void> {
+export async function sendNewModuleNotification(input: { to: string; moduleTitle: string; moduleId: string }): Promise<void> {
   try {
     const content: ContentNotificationInput = {
-      eyebrow: "НОВОЕ ДОМАШНЕЕ ЗАДАНИЕ",
-      title: input.assignmentTitle,
-      body: `В модуле «${input.moduleTitle}» опубликовано новое задание. Откройте платформу, чтобы посмотреть условия и срок сдачи.`,
-      ctaLabel: "Открыть задания",
-      // The app is a single-page client (only "/" is a real route — /assignments,
-      // /schedule, /streams, /discussions all 404). Deep-link targets are passed as
-      // query params on "/" and resolved client-side once the session loads, same as
-      // the existing ?invite= handling.
-      ctaPath: `/?assignmentId=${encodeURIComponent(input.assignmentId)}`,
-      accent: "#eab46b",
+      eyebrow: "НОВЫЙ УРОК",
+      title: input.moduleTitle,
+      body: "В программе практикума появился новый урок. Он откроется, когда куратор даст доступ.",
+      ctaLabel: "Открыть программу",
+      ctaPath: `/?moduleId=${encodeURIComponent(input.moduleId)}`,
+      accent: "#78adff",
     };
-    await sendEmail({ to: input.to, subject: `Новое домашнее задание · ${input.assignmentTitle}`, html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: `Новый урок · ${input.moduleTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
-    console.error("Assignment email delivery failed", error instanceof Error ? error.message : "unknown error");
+    console.error("Module email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
 }
 
@@ -170,7 +185,7 @@ export async function sendNewEventNotification(input: { to: string; eventTitle: 
       ctaPath: `/?eventId=${encodeURIComponent(input.eventId)}`,
       accent: "#58d3c7",
     };
-    await sendEmail({ to: input.to, subject: `Новое событие · ${input.eventTitle}`, html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: `Новое событие · ${input.eventTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Schedule event email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
@@ -186,7 +201,7 @@ export async function sendScheduleReminderNotification(input: { to: string; even
       ctaPath: `/?eventId=${encodeURIComponent(input.eventId)}`,
       accent: "#eab46b",
     };
-    await sendEmail({ to: input.to, subject: `Через 15 минут · ${input.eventTitle}`, html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: `Через 15 минут · ${input.eventTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Schedule reminder email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
@@ -202,7 +217,7 @@ export async function sendStreamLiveNotification(input: { to: string; topic: str
       ctaPath: "/",
       accent: "#ed7777",
     };
-    await sendEmail({ to: input.to, subject: input.topic ? `Эфир начался · ${input.topic}` : "Эфир начался", html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: input.topic ? `Эфир начался · ${input.topic}` : "Эфир начался", html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Stream live email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
@@ -218,7 +233,7 @@ export async function sendNewMediaNotification(input: { to: string; mediaTitle: 
       ctaPath: `/?mediaId=${encodeURIComponent(input.mediaId)}`,
       accent: "#58d3c7",
     };
-    await sendEmail({ to: input.to, subject: `Новая запись · ${input.mediaTitle}`, html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: `Новая запись · ${input.mediaTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Media email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
@@ -234,7 +249,7 @@ export async function sendDiscussionNotification(input: DiscussionNotificationIn
       ctaPath: `/?threadId=${encodeURIComponent(input.threadId)}`,
       accent: "#78adff",
     };
-    await sendEmail({ to: input.to, subject: `Новое сообщение в обсуждении · ${input.threadTitle}`, html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: `Новое сообщение в обсуждении · ${input.threadTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Discussion email delivery failed", error instanceof Error ? error.message : "unknown error");
   }

@@ -1,6 +1,7 @@
 import { Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { ScheduleEventType } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
+import { zonedTimeToUtc } from "@/app/domain/schedule-time";
 import { activeCuratorEmails, activeCuratorIds } from "@/app/server/notifications/recipient-service";
 import { sendScheduleReminderNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
@@ -17,12 +18,12 @@ const EVENT_TYPE_LABELS: Record<ScheduleEventType, string> = {
   PRE_SESSION: "Пресессия",
 };
 
-/** Combines the date-only column with the free-text "HH:MM — HH:MM" time label, same convention the frontend uses (ScheduleEvent.eventStartDate). */
+/** Combines the date-only column with the free-text "HH:MM — HH:MM" time label, same convention the frontend uses (ScheduleEvent.eventStartDate). Interpreted as Kyiv time (see schedule-time.ts) — this runs inside a UTC container, so a plain unzoned `new Date(...)` would fire reminders hours late. */
 function eventStartsAt(event: { date: Date; time: string }): Date | null {
   const startLabel = event.time.split(/\s*[—–-]\s*/)[0]?.trim();
   if (!startLabel) return null;
   const dateKey = event.date.toISOString().slice(0, 10);
-  const start = new Date(`${dateKey}T${startLabel}:00`);
+  const start = zonedTimeToUtc(dateKey, startLabel);
   return Number.isNaN(start.getTime()) ? null : start;
 }
 

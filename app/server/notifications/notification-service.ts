@@ -1,16 +1,25 @@
-import { NotificationType, UserStatus } from "@/app/generated/prisma/enums";
+import { NotificationType, UserRole, UserStatus } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
 import { AuthServiceError } from "@/app/server/auth";
+import { areNotificationsEnabled, setNotificationsEnabled } from "./notification-settings";
 
 const MAX_LIST = 30;
 
+// A curator's "pause everything" switch (see PlatformSettings) is for content-change noise —
+// stream/media/assignment/module chatter — while they migrate recordings between cohorts.
+// Account security stays on regardless: a new-device alert going silent because someone was
+// mid-migration would be a much worse outcome than one extra email.
+const ALWAYS_DELIVERED: ReadonlySet<NotificationType> = new Set([NotificationType.SECURITY_ALERT]);
+
 export class NotificationService {
   public async create(userId: string, type: NotificationType, title: string, body?: string, entityId?: string): Promise<void> {
+    if (!ALWAYS_DELIVERED.has(type) && !(await areNotificationsEnabled())) return;
     await prisma.notification.create({ data: { userId, type, title, body, entityId } });
   }
 
   public async createMany(userIds: readonly string[], type: NotificationType, title: string, body?: string, entityId?: string): Promise<void> {
     if (userIds.length === 0) return;
+    if (!ALWAYS_DELIVERED.has(type) && !(await areNotificationsEnabled())) return;
     await prisma.notification.createMany({ data: userIds.map((userId) => ({ userId, type, title, body, entityId })) });
   }
 
@@ -30,6 +39,24 @@ export class NotificationService {
 
   public async markAllRead(userId: string): Promise<void> {
     await prisma.notification.updateMany({ where: { userId, read: false }, data: { read: true } });
+  }
+
+  /** Curator/owner only — backs the toggle in the dashboard settings. */
+  public async getGlobalSettings(actorId: string): Promise<{ notificationsEnabled: boolean }> {
+    await this.assertCurator(actorId);
+    return { notificationsEnabled: await areNotificationsEnabled() };
+  }
+
+  public async updateGlobalSettings(actorId: string, enabled: boolean): Promise<{ notificationsEnabled: boolean }> {
+    await this.assertCurator(actorId);
+    return { notificationsEnabled: await setNotificationsEnabled(enabled) };
+  }
+
+  private async assertCurator(userId: string): Promise<void> {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true, status: true } });
+    if (!user || user.status !== UserStatus.ACTIVE || (user.role !== UserRole.CURATOR && user.role !== UserRole.OWNER)) {
+      throw new AuthServiceError("FORBIDDEN", "Curator access required");
+    }
   }
 }
 

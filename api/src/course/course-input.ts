@@ -77,6 +77,15 @@ export function parseCreateVimeoMediaBody(value: unknown): CreateVimeoMediaBody 
   };
 }
 
+export function parseRenameMediaBody(value: unknown): { title: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BadRequestException("body must be an object");
+  }
+
+  const body = value as Record<string, unknown>;
+  return { title: text(body.title, "title", 180)! };
+}
+
 export function parseUpdateMediaKindBody(value: unknown): UpdateMediaKindBody {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new BadRequestException("body must be an object");

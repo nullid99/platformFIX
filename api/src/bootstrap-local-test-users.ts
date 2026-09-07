@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   const practicum = await prisma.practicum.findFirst({ where: { isActive: true }, select: { id: true } });
   if (!practicum) throw new Error("Bootstrap the course before creating local test users");
 
-  const curatorId = await ensureLocalUser(UserRole.CURATOR, "local-curator", "local-curator", "Тестовый куратор");
+  await ensureLocalUser(UserRole.CURATOR, "local-curator", "local-curator", "Тестовый куратор");
   const studentId = await ensureLocalUser(UserRole.STUDENT, "local-student", "local-student", "Тестовый ученик");
 
   const enrollment = await prisma.enrollment.upsert({
@@ -51,11 +51,6 @@ async function main(): Promise<void> {
   // in module-access.ts returns false with no access row), and e.g. a freshly published
   // assignment never appears in "Задания" for them.
   await seedOpenModuleAccess(prisma, enrollment.id, practicum.id);
-  await prisma.curatorAssignment.upsert({
-    where: { curatorId_studentId: { curatorId, studentId } },
-    update: {},
-    create: { curatorId, studentId },
-  });
 
   console.log("Local staging test users are ready");
 }

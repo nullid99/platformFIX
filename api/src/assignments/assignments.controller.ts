@@ -33,15 +33,20 @@ function stringArray(value: unknown, field: string, optional = false): string[] 
   return value;
 }
 
-function feedbackAttachmentInput(value: unknown): { fileId: string; originalName: string; mimeType: string; byteSize: number } | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "object") throw new BadRequestException("attachment is invalid");
+function feedbackAttachmentItem(value: unknown, index: number): { fileId: string; originalName: string; mimeType: string; byteSize: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new BadRequestException(`attachments[${index}] is invalid`);
   const record = value as JsonBody;
-  const fileId = text(record.fileId, "attachment.fileId");
-  const originalName = text(record.originalName, "attachment.originalName");
-  const mimeType = text(record.mimeType, "attachment.mimeType");
-  if (typeof record.byteSize !== "number") throw new BadRequestException("attachment.byteSize must be a number");
+  const fileId = text(record.fileId, `attachments[${index}].fileId`);
+  const originalName = text(record.originalName, `attachments[${index}].originalName`);
+  const mimeType = text(record.mimeType, `attachments[${index}].mimeType`);
+  if (typeof record.byteSize !== "number") throw new BadRequestException(`attachments[${index}].byteSize must be a number`);
   return { fileId: fileId!, originalName: originalName!, mimeType: mimeType!, byteSize: record.byteSize };
+}
+
+function feedbackAttachmentsInput(value: unknown): Array<{ fileId: string; originalName: string; mimeType: string; byteSize: number }> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) throw new BadRequestException("attachments must be an array");
+  return value.map((item, index) => feedbackAttachmentItem(item, index));
 }
 
 function assignmentInput(body: JsonBody, partial = false) {
@@ -165,9 +170,9 @@ export class ReviewController {
     const session = await this.requireSession(request);
     if (body.decision !== "accepted" && body.decision !== "revision") throw new BadRequestException("decision is invalid");
     const checkedRequirements = stringArray(body.checkedRequirements, "checkedRequirements", true);
-    const attachment = feedbackAttachmentInput(body.attachment);
+    const attachments = feedbackAttachmentsInput(body.attachments);
     try {
-      return { data: await assignmentService.decide(session.userId, submissionId, body.decision, text(body.feedback, "feedback", true), checkedRequirements, attachment) };
+      return { data: await assignmentService.decide(session.userId, submissionId, body.decision, text(body.feedback, "feedback", true), checkedRequirements, attachments) };
     } catch (error) {
       mapError(error);
     }

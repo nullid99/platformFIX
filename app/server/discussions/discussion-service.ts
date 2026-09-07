@@ -84,7 +84,7 @@ function threadInclude() {
 
 type DiscussionThreadWithRelations = Prisma.DiscussionThreadGetPayload<{ include: ReturnType<typeof threadInclude> }>;
 
-function personName(person: DiscussionThreadWithRelations["student"] | DiscussionThreadWithRelations["curator"]): string | null {
+function personName(person: { email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null | undefined): string | null {
   if (!person) return null;
   return person.externalIdentities[0]?.displayName ?? person.externalIdentities[0]?.username ?? person.email;
 }
@@ -124,18 +124,16 @@ export class DiscussionService {
       });
       return tx.discussionThread.findUniqueOrThrow({ where: { id: created.id }, include: threadInclude() });
     });
-    const curatorEmails = thread.curator?.email ? [thread.curator.email] : [];
-    void Promise.all(curatorEmails.map((to) => sendDiscussionNotification({
-      to,
+    const staff = await this.staffRecipients(thread.curatorId ?? undefined);
+    void Promise.all(staff.flatMap((recipient) => recipient.email ? [sendDiscussionNotification({
+      to: recipient.email,
       threadTitle: thread.title,
       senderName: personName(thread.student) ?? "Ученик",
       body,
       threadId: thread.id,
-    }))).catch((error: unknown) => console.error("Discussion recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-    if (thread.curatorId) {
-      void notificationService.create(thread.curatorId, "DISCUSSION_REPLY", `Новый вопрос: ${thread.title}`, body, thread.id)
-        .catch((error: unknown) => console.error("Discussion notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
-    }
+    })] : [])).catch((error: unknown) => console.error("Discussion recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
+    void Promise.all(staff.map((recipient) => notificationService.create(recipient.id, "DISCUSSION_REPLY", `Новый вопрос: ${thread.title}`, body, thread.id)))
+      .catch((error: unknown) => console.error("Discussion notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     return this.toDto(thread);
   }
 
@@ -190,22 +188,24 @@ export class DiscussionService {
       await tx.discussionThread.update({ where: { id: threadId }, data: { status, lastMessageAt: new Date() } });
       return tx.discussionThread.findUniqueOrThrow({ where: { id: threadId }, include: threadInclude() });
     });
+    // The actual person who just wrote this reply — not thread.curator, which is only the
+    // thread's default addressee and can be a completely different curator (any active curator
+    // can reply to any thread, see assertParticipant). Using thread.curator here previously
+    // attributed the email to whoever the thread happened to be addressed to instead of whoever
+    // actually replied.
+    const senderName = personName(actor) ?? (actor.role === UserRole.STUDENT ? "Ученик" : "Куратор");
     const recipients = actor.role === UserRole.STUDENT
-      ? (thread.curator?.email ? [thread.curator.email] : [])
-      : (thread.student.email ? [thread.student.email] : []);
-    void Promise.all(recipients.map((to) => sendDiscussionNotification({
-      to,
+      ? await this.staffRecipients(thread.curatorId ?? undefined)
+      : (thread.student.email ? [{ id: thread.studentId, email: thread.student.email }] : []);
+    void Promise.all(recipients.flatMap((recipient) => recipient.email ? [sendDiscussionNotification({
+      to: recipient.email,
       threadTitle: thread.title,
-      senderName: actor.role === UserRole.STUDENT ? personName(thread.student) ?? "Ученик" : personName(thread.curator) ?? "Куратор",
+      senderName,
       body,
       threadId: thread.id,
-    }))).catch((error: unknown) => console.error("Discussion reply recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-    const recipientId = actor.role === UserRole.STUDENT ? thread.curatorId : thread.studentId;
-    if (recipientId) {
-      const senderName = actor.role === UserRole.STUDENT ? personName(thread.student) ?? "Ученик" : personName(thread.curator) ?? "Куратор";
-      void notificationService.create(recipientId, "DISCUSSION_REPLY", `${senderName}: ${thread.title}`, body, thread.id)
-        .catch((error: unknown) => console.error("Discussion reply notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
-    }
+    })] : [])).catch((error: unknown) => console.error("Discussion reply recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
+    void Promise.all(recipients.map((recipient) => notificationService.create(recipient.id, "DISCUSSION_REPLY", `${senderName}: ${thread.title}`, body, thread.id)))
+      .catch((error: unknown) => console.error("Discussion reply notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     return this.toDto(thread);
   }
 
@@ -251,12 +251,23 @@ export class DiscussionService {
 
   private async resolveCurator(studentId: string, curatorId?: string): Promise<string | undefined> {
     if (curatorId) return this.validateCurator(studentId, curatorId);
-    const assignment = await prisma.curatorAssignment.findFirst({
-      where: { studentId },
-      orderBy: { createdAt: "asc" },
-      select: { curatorId: true },
+    return undefined;
+  }
+
+  // Students never pick a specific curatorId today (no picker in the UI), so this is who
+  // actually hears about a new question/reply: the one explicitly-addressed curator if the
+  // thread has one, otherwise every active curator/owner — matches assertParticipant's "any
+  // active curator can view/reply to any thread", so nobody is silently left unnotified just
+  // because a thread was never addressed to a specific person.
+  private async staffRecipients(explicitCuratorId?: string): Promise<Array<{ id: string; email: string | null }>> {
+    if (explicitCuratorId) {
+      const curator = await prisma.user.findUnique({ where: { id: explicitCuratorId }, select: { id: true, email: true } });
+      return curator ? [curator] : [];
+    }
+    return prisma.user.findMany({
+      where: { role: { in: [UserRole.CURATOR, UserRole.OWNER] }, status: UserStatus.ACTIVE },
+      select: { id: true, email: true },
     });
-    return assignment?.curatorId;
   }
 
   private async assertFilesOwned(ownerId: string, attachments: DiscussionAttachmentInput[]) {
@@ -267,7 +278,10 @@ export class DiscussionService {
   }
 
   private async assertParticipant(actorId: string, threadId: string) {
-    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { id: true, role: true, status: true } });
+    const actor = await prisma.user.findUnique({
+      where: { id: actorId },
+      select: { id: true, role: true, status: true, email: true, externalIdentities: { select: { displayName: true, username: true }, orderBy: { createdAt: "asc" }, take: 1 } },
+    });
     const thread = await prisma.discussionThread.findUnique({ where: { id: threadId }, select: { studentId: true, curatorId: true, status: true } });
     if (!actor || actor.status !== UserStatus.ACTIVE || !thread) throw new AuthServiceError("FORBIDDEN", "Discussion access is not allowed");
     // Any active curator can view/reply to any thread — curators are no longer restricted
