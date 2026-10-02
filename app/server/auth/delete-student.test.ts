@@ -57,7 +57,7 @@ describe("authService#deleteStudent", () => {
     moduleId = module_.id;
 
     const assignment = await prisma.assignment.create({
-      data: { moduleId, title: "Vitest assignment", description: "fixture", status: AssignmentStatus.PUBLISHED },
+      data: { moduleId, practicumId, title: "Vitest assignment", description: "fixture", status: AssignmentStatus.PUBLISHED },
       select: { id: true },
     });
     assignmentId = assignment.id;

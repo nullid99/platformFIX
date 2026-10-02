@@ -80,16 +80,44 @@ export async function sendEmail(message: EmailMessage): Promise<boolean> {
     ? logoSafeHtml.replace("style=\"background:#080d14;padding:28px 12px\"", `style=\"background:#080d14 url('${escapeHtml(backgroundUrl)}') center / cover no-repeat;padding:28px 12px\"`)
     : logoSafeHtml;
 
-  const response = await fetch(RESEND_ENDPOINT, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from, to: [message.to], subject: message.subject, html, text: message.text }),
+  const body = JSON.stringify({ from, to: [message.to], subject: message.subject, html, text: message.text });
+  return enqueueResendRequest(async () => {
+    for (let attempt = 1; ; attempt += 1) {
+      const response = await fetch(RESEND_ENDPOINT, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body,
+      });
+      if (response.ok) return true;
+      if (response.status === 429 && attempt < RESEND_MAX_ATTEMPTS) {
+        await sleep(RESEND_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+      const errorBody = await response.json().catch(() => null) as { message?: string } | null;
+      throw new Error(errorBody?.message ?? `Resend request failed with status ${response.status}`);
+    }
   });
-  if (!response.ok) {
-    const errorBody = await response.json().catch(() => null) as { message?: string } | null;
-    throw new Error(errorBody?.message ?? `Resend request failed with status ${response.status}`);
-  }
-  return true;
+}
+
+// Every bulk notification (new media/module/assignment, "stream is live") fans out with
+// Promise.all over ~90 students, and Resend rejects anything over its per-second request limit
+// with 429 — on 2026-10-01 that silently dropped 78 of 89 "new recording" emails. All sends now
+// go through one process-wide queue spaced well under that limit, and a 429 that still slips
+// through (another process, a burst from Resend's side) is retried with backoff instead of lost.
+const RESEND_MIN_INTERVAL_MS = 250; // ≤ 4 requests/second, Resend allows 10 by default
+const RESEND_MAX_ATTEMPTS = 4;
+const RESEND_RETRY_DELAY_MS = 1_500;
+let resendQueue: Promise<unknown> = Promise.resolve();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function enqueueResendRequest<T>(task: () => Promise<T>): Promise<T> {
+  const run = resendQueue.then(task);
+  // The queue itself must never reject, or one failed email would wedge every send after it.
+  resendQueue = run.catch(() => undefined).then(() => sleep(RESEND_MIN_INTERVAL_MS));
+  return run;
 }
 
 /**
@@ -172,6 +200,59 @@ export async function sendNewModuleNotification(input: { to: string; moduleTitle
     await sendMutableEmail({ to: input.to, subject: `Новый урок · ${input.moduleTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
     console.error("Module email delivery failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
+// Unlike sendNewModuleNotification above (bell-only — see the "deliberately no email"
+// comment in assignment-service.ts#create), a practice assignment isn't hidden behind a
+// module lock, so there's no "notification arrived but the item isn't in my list" risk here.
+export async function sendNewAssignmentNotification(input: { to: string; assignmentTitle: string; assignmentId: string }): Promise<void> {
+  try {
+    const content: ContentNotificationInput = {
+      eyebrow: "ПРАКТИЧЕСКОЕ ЗАДАНИЕ",
+      title: input.assignmentTitle,
+      body: "Куратор опубликовал новое практическое задание. Оно уже доступно в разделе «Задания».",
+      ctaLabel: "Открыть задание",
+      ctaPath: `/?assignmentId=${encodeURIComponent(input.assignmentId)}`,
+      accent: "#78adff",
+    };
+    await sendMutableEmail({ to: input.to, subject: `Практическое задание · ${input.assignmentTitle}`, html: notificationHtml(content), text: notificationText(content) });
+  } catch (error) {
+    console.error("Assignment email delivery failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
+/** Gated per-recipient by their own notifyNewSubmission preference — see assignment-service.ts#submit and notification-service.ts#getEmailPreferences. */
+export async function sendNewSubmissionNotification(input: { to: string; assignmentTitle: string; studentName: string; assignmentId: string }): Promise<void> {
+  try {
+    const content: ContentNotificationInput = {
+      eyebrow: "НОВАЯ РАБОТА НА ПРОВЕРКУ",
+      title: input.assignmentTitle,
+      body: `${input.studentName} отправил(а) домашнее задание «${input.assignmentTitle}» на проверку.`,
+      ctaLabel: "Открыть очередь проверки",
+      ctaPath: "/?tab=review",
+      accent: "#78adff",
+    };
+    await sendMutableEmail({ to: input.to, subject: `Новая работа на проверку · ${input.assignmentTitle}`, html: notificationHtml(content), text: notificationText(content) });
+  } catch (error) {
+    console.error("New submission email delivery failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
+/** Curator-triggered — the "Напомнить" button on the "Прогресс" page (student-progress-service.ts#sendStudentReminder). */
+export async function sendCuratorReminderNotification(input: { to: string; body: string }): Promise<void> {
+  try {
+    const content: ContentNotificationInput = {
+      eyebrow: "НАПОМИНАНИЕ ОТ КУРАТОРА",
+      title: "Куратор напоминает о практикуме",
+      body: input.body,
+      ctaLabel: "Открыть практикум",
+      ctaPath: "/",
+      accent: "#f2b75e",
+    };
+    await sendMutableEmail({ to: input.to, subject: "Напоминание от куратора", html: notificationHtml(content), text: notificationText(content) });
+  } catch (error) {
+    console.error("Curator reminder email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
 }
 

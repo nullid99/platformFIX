@@ -33,6 +33,12 @@ function stringArray(value: unknown, field: string, optional = false): string[] 
   return value;
 }
 
+function optionalBool(value: unknown, field: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new BadRequestException(`${field} must be a boolean`);
+  return value;
+}
+
 function feedbackAttachmentItem(value: unknown, index: number): { fileId: string; originalName: string; mimeType: string; byteSize: number } {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new BadRequestException(`attachments[${index}] is invalid`);
   const record = value as JsonBody;
@@ -51,13 +57,17 @@ function feedbackAttachmentsInput(value: unknown): Array<{ fileId: string; origi
 
 function assignmentInput(body: JsonBody, partial = false) {
   return {
-    moduleId: text(body.moduleId, "moduleId", partial),
+    // Optional here regardless of partial/create — a practice assignment has no module, and
+    // the service is what actually enforces "required unless isPractice" (see
+    // assignment-service.ts#normalizeAssignmentInput).
+    moduleId: text(body.moduleId, "moduleId", true),
     title: text(body.title, "title", partial),
     description: text(body.description, "description", partial),
     deadline: text(body.deadline, "deadline", true),
     requirements: stringArray(body.requirements, "requirements", partial),
     allowedFormats: stringArray(body.allowedFormats, "allowedFormats", partial),
     materials: parseAssignmentMaterials(body.materials, true),
+    reviewRequired: optionalBool(body.reviewRequired, "reviewRequired"),
   };
 }
 
@@ -101,7 +111,8 @@ export class AssignmentsController {
   public async create(@Req() request: RequestWithCookies, @Body() body: JsonBody) {
     const session = await this.requireSession(request);
     try {
-      return { data: await assignmentService.create(session.userId, assignmentInput(body) as Parameters<typeof assignmentService.create>[1]) };
+      const input = { ...assignmentInput(body), isPractice: body.isPractice === true };
+      return { data: await assignmentService.create(session.userId, input as Parameters<typeof assignmentService.create>[1]) };
     } catch (error) {
       mapError(error);
     }
@@ -137,6 +148,16 @@ export class AssignmentsController {
     if (fileIds !== undefined && (!Array.isArray(fileIds) || fileIds.some((item) => typeof item !== "string"))) throw new BadRequestException("fileIds must be an array of strings");
     try {
       return { data: await assignmentService.submit(session.userId, assignmentId, { answerText: text(body.answerText, "answerText", true), attachments: attachments as Array<{ name: string; type: string; size: number }> | undefined, fileIds: fileIds as string[] | undefined }) };
+    } catch (error) {
+      mapError(error);
+    }
+  }
+
+  @Post(":assignmentId/complete")
+  public async completeWithoutReview(@Req() request: RequestWithCookies, @Param("assignmentId") assignmentId: string) {
+    const session = await this.requireSession(request);
+    try {
+      return { data: await assignmentService.completeWithoutReview(session.userId, assignmentId) };
     } catch (error) {
       mapError(error);
     }

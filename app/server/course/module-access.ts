@@ -1,5 +1,5 @@
 import { Prisma } from "@/app/generated/prisma/client";
-import { ModuleAccessStatus } from "@/app/generated/prisma/enums";
+import { AssignmentStatus, ModuleAccessStatus } from "@/app/generated/prisma/enums";
 
 /**
  * A module access row isn't created until a curator's per-module toggle (or an individual
@@ -24,15 +24,24 @@ export async function seedOpenModuleAccess(tx: Prisma.TransactionClient, enrollm
 
 /**
  * The prerequisite gate for submitting an assignment in a module at `modulePosition`: null
- * if there's no module before it (nothing to require), otherwise the title of the module
- * that must be marked completed first (see CourseService.markModuleCompletedForStudent) —
- * still null once that's done. Used both server-side in assignment-service.ts#submit (the
- * actual enforcement) and in #listForStudent (so the student sees why a card is locked
- * before they try).
+ * if there's no module before it, or if that module has no assignment of its own to ever
+ * complete it with (nothing to require either way), otherwise the title of the module that
+ * must be marked completed first (see CourseService.markModuleCompletedForStudent) — still
+ * null once that's done. Used both server-side in assignment-service.ts#submit/
+ * #completeWithoutReview (the actual enforcement) and in #listForStudent (so the student sees
+ * why a card is locked before they try).
  */
 export async function assignmentPrerequisiteGate(client: Prisma.TransactionClient, studentId: string, practicumId: string, modulePosition: number): Promise<string | null> {
   const previousModule = await client.module.findFirst({ where: { practicumId, position: { lt: modulePosition } }, orderBy: { position: "desc" }, select: { id: true, title: true } });
   if (!previousModule) return null;
+  // A module with no assignment at all (regular or "без проверки") has nothing that could ever
+  // mark it COMPLETED — see markModuleCompletedForStudent's auto-trigger, which only fires once
+  // every assignment IN that module is accepted. Requiring a curator to remember a placeholder
+  // "без проверки" assignment on every such lesson (typically Practice/Advanced, which by design
+  // have no formal ДЗ) doesn't scale, so an assignment-free module simply never blocks the one
+  // after it — no curator action needed.
+  const assignmentCount = await client.assignment.count({ where: { moduleId: previousModule.id, status: AssignmentStatus.PUBLISHED } });
+  if (assignmentCount === 0) return null;
   const enrollment = await client.enrollment.findFirst({ where: { studentId, practicumId, status: "ACTIVE" }, select: { id: true } });
   if (!enrollment) return previousModule.title;
   const access = await client.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId: previousModule.id } }, select: { status: true } });

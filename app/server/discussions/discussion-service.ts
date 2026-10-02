@@ -2,6 +2,7 @@ import { Prisma } from "@/app/generated/prisma/client";
 import { DiscussionStatus, DiscussionVisibility, StoredFileStatus, UserRole, UserStatus } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
 import { AuthServiceError } from "@/app/server/auth";
+import { getStudentActivePracticum } from "@/app/server/course/practicum-service";
 import { sendDiscussionNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 
@@ -68,7 +69,7 @@ function normalizeAttachments(values: DiscussionAttachmentInput[] | undefined): 
 
 function threadInclude() {
   return {
-    student: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true, avatarUrl: true, provider: true }, orderBy: { createdAt: "asc" as const } } } },
+    student: { select: { id: true, email: true, isAdvanced: true, externalIdentities: { select: { displayName: true, username: true, avatarUrl: true, provider: true }, orderBy: { createdAt: "asc" as const } } } },
     curator: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true }, orderBy: { createdAt: "asc" as const }, take: 1 } } },
     module: { select: { id: true, title: true, position: true, coverPath: true } },
     assignment: { select: { id: true, title: true } },
@@ -100,6 +101,7 @@ function personAvatarUrl(person: DiscussionThreadWithRelations["student"]): stri
 export class DiscussionService {
   public async create(studentId: string, input: CreateDiscussionInput) {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
+    if ((await getStudentActivePracticum(studentId))?.completedAt) throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — новые вопросы уже не задать.");
     const title = requiredText(input.title, "title", MAX_TITLE_LENGTH);
     const body = requiredText(input.body, "body", MAX_BODY_LENGTH);
     const attachments = normalizeAttachments(input.attachments);
@@ -125,7 +127,10 @@ export class DiscussionService {
       return tx.discussionThread.findUniqueOrThrow({ where: { id: created.id }, include: threadInclude() });
     });
     const staff = await this.staffRecipients(thread.curatorId ?? undefined);
-    void Promise.all(staff.flatMap((recipient) => recipient.email ? [sendDiscussionNotification({
+    // "Новый вопрос" — a curator's own email opt-out (see notification-service.ts#updateEmailPreferences)
+    // only applies to a brand-new thread, not the reply path below, which stays on the recipient's
+    // provider/email presence alone — a curator already following an existing conversation.
+    void Promise.all(staff.flatMap((recipient) => recipient.email && recipient.notifyNewQuestion ? [sendDiscussionNotification({
       to: recipient.email,
       threadTitle: thread.title,
       senderName: personName(thread.student) ?? "Ученик",
@@ -139,8 +144,12 @@ export class DiscussionService {
 
   public async listForStudent(studentId: string) {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
-    const threads = await prisma.discussionThread.findMany({ where: { studentId }, orderBy: { lastMessageAt: "desc" }, include: threadInclude() });
-    return threads.map((thread) => this.toDto(thread));
+    const [threads, activePracticum] = await Promise.all([
+      prisma.discussionThread.findMany({ where: { studentId }, orderBy: { lastMessageAt: "desc" }, include: threadInclude() }),
+      getStudentActivePracticum(studentId),
+    ]);
+    const practicumCompleted = Boolean(activePracticum?.completedAt);
+    return threads.map((thread) => this.toDto(thread, { practicumCompleted }));
   }
 
   public async listForCurator(curatorId: string) {
@@ -178,6 +187,11 @@ export class DiscussionService {
 
   public async reply(actorId: string, threadId: string, input: CreateDiscussionMessageInput) {
     const actor = await this.assertParticipant(actorId, threadId);
+    // Only the student side goes read-only — any active curator can still reply/close out a
+    // thread in a completed practicum (see practicum-service.ts#isPracticumCompleted).
+    if (actor.role === UserRole.STUDENT && (await getStudentActivePracticum(actorId))?.completedAt) {
+      throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — писать в обсуждении уже нельзя.");
+    }
     const body = requiredText(input.body, "body", MAX_BODY_LENGTH);
     const attachments = normalizeAttachments(input.attachments);
     const sourceUrl = optionalUrl(input.sourceUrl);
@@ -206,7 +220,10 @@ export class DiscussionService {
     })] : [])).catch((error: unknown) => console.error("Discussion reply recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
     void Promise.all(recipients.map((recipient) => notificationService.create(recipient.id, "DISCUSSION_REPLY", `${senderName}: ${thread.title}`, body, thread.id)))
       .catch((error: unknown) => console.error("Discussion reply notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
-    return this.toDto(thread);
+    // Known false when the replier is the student (the check above already threw otherwise);
+    // resolved properly for a curator reply, whose own practicum status wasn't checked.
+    const practicumCompleted = actor.role === UserRole.STUDENT ? false : Boolean((await getStudentActivePracticum(thread.studentId))?.completedAt);
+    return this.toDto(thread, { practicumCompleted });
   }
 
   public async close(studentId: string, threadId: string) {
@@ -228,10 +245,10 @@ export class DiscussionService {
   private async validateContext(studentId: string, moduleId?: string, assignmentId?: string) {
     const assignment = assignmentId ? await prisma.assignment.findUnique({
       where: { id: assignmentId },
-      select: { id: true, moduleId: true, module: { select: { practicumId: true } } },
+      select: { id: true, moduleId: true, practicumId: true },
     }) : null;
     const courseModule = moduleId ? await prisma.module.findUnique({ where: { id: moduleId }, select: { id: true, practicumId: true } }) : null;
-    const practicumId = assignment?.module.practicumId ?? courseModule?.practicumId;
+    const practicumId = assignment?.practicumId ?? courseModule?.practicumId;
     if (assignmentId && !assignment) throw new AuthServiceError("INVALID_INPUT", "assignmentId is invalid");
     if (moduleId && !courseModule) throw new AuthServiceError("INVALID_INPUT", "moduleId is invalid");
     if (assignment && moduleId && assignment.moduleId !== moduleId) throw new AuthServiceError("INVALID_INPUT", "Discussion context is inconsistent");
@@ -259,14 +276,14 @@ export class DiscussionService {
   // thread has one, otherwise every active curator/owner — matches assertParticipant's "any
   // active curator can view/reply to any thread", so nobody is silently left unnotified just
   // because a thread was never addressed to a specific person.
-  private async staffRecipients(explicitCuratorId?: string): Promise<Array<{ id: string; email: string | null }>> {
+  private async staffRecipients(explicitCuratorId?: string): Promise<Array<{ id: string; email: string | null; notifyNewQuestion: boolean }>> {
     if (explicitCuratorId) {
-      const curator = await prisma.user.findUnique({ where: { id: explicitCuratorId }, select: { id: true, email: true } });
+      const curator = await prisma.user.findUnique({ where: { id: explicitCuratorId }, select: { id: true, email: true, notifyNewQuestion: true } });
       return curator ? [curator] : [];
     }
     return prisma.user.findMany({
       where: { role: { in: [UserRole.CURATOR, UserRole.OWNER] }, status: UserStatus.ACTIVE },
-      select: { id: true, email: true },
+      select: { id: true, email: true, notifyNewQuestion: true },
     });
   }
 
@@ -306,12 +323,15 @@ export class DiscussionService {
     if (!user || user.status !== UserStatus.ACTIVE || user.role !== role) throw new AuthServiceError("FORBIDDEN", "Student access required");
   }
 
-  private toDto(thread: DiscussionThreadWithRelations, options: { anonymizeStudent?: boolean } = {}) {
+  private toDto(thread: DiscussionThreadWithRelations, options: { anonymizeStudent?: boolean; practicumCompleted?: boolean } = {}) {
     const anonymizeStudent = options.anonymizeStudent ?? false;
     return {
       id: thread.id,
       title: thread.title,
       status: thread.status,
+      // "Завершить поток" — read access to the thread's history is untouched; the reply/ask-a-
+      // question box just hides behind this. See practicum-service.ts#isPracticumCompleted.
+      practicumCompleted: options.practicumCompleted ?? false,
       visibility: thread.visibility,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
@@ -319,8 +339,8 @@ export class DiscussionService {
       module: thread.module ? { id: thread.module.id, title: thread.module.title, position: thread.module.position, coverPath: thread.module.coverPath } : null,
       assignment: thread.assignment ? { id: thread.assignment.id, title: thread.assignment.title } : null,
       student: anonymizeStudent
-        ? { id: null, name: "Ученик потока", email: null, avatarUrl: null }
-        : { id: thread.student.id, name: personName(thread.student), email: thread.student.email, avatarUrl: personAvatarUrl(thread.student) },
+        ? { id: null, name: "Ученик потока", email: null, avatarUrl: null, isAdvanced: false }
+        : { id: thread.student.id, name: personName(thread.student), email: thread.student.email, avatarUrl: personAvatarUrl(thread.student), isAdvanced: thread.student.isAdvanced },
       curator: thread.curator ? { id: thread.curator.id, name: personName(thread.curator), email: thread.curator.email } : null,
       messages: thread.messages.map((message) => {
         const isStudentAuthor = message.author.role === UserRole.STUDENT;

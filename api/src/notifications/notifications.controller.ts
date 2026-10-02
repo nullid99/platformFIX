@@ -49,4 +49,19 @@ export class NotificationsController {
     if (typeof body?.notificationsEnabled !== "boolean") throw new BadRequestException("notificationsEnabled must be a boolean");
     try { return { data: await notificationService.updateGlobalSettings(await sessionUser(request), body.notificationsEnabled) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
+
+  /** Curator/owner only, personal — which categories additionally email this specific curator (see getEmailPreferences on the service). */
+  @Get("email-preferences")
+  public async getEmailPreferences(@Req() request: RequestWithCookies) {
+    try { return { data: await notificationService.getEmailPreferences(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  @Put("email-preferences")
+  public async updateEmailPreferences(@Req() request: RequestWithCookies, @Body() body: { notifyNewSubmission?: unknown; notifyNewQuestion?: unknown }) {
+    if (body?.notifyNewSubmission !== undefined && typeof body.notifyNewSubmission !== "boolean") throw new BadRequestException("notifyNewSubmission must be a boolean");
+    if (body?.notifyNewQuestion !== undefined && typeof body.notifyNewQuestion !== "boolean") throw new BadRequestException("notifyNewQuestion must be a boolean");
+    try {
+      return { data: await notificationService.updateEmailPreferences(await sessionUser(request), { notifyNewSubmission: body.notifyNewSubmission, notifyNewQuestion: body.notifyNewQuestion }) };
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
 }

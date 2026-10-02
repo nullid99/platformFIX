@@ -50,7 +50,7 @@ export class FilesController {
           originalName: requiredString(body.originalName, "originalName"),
           mimeType: requiredString(body.mimeType, "mimeType"),
           byteSize: requiredInteger(body.byteSize, "byteSize"),
-        }, body.purpose === "MODULE_COVER" ? "module-cover" : body.purpose === "CHAT" ? "chat" : "submission"),
+        }, body.purpose === "MODULE_COVER" ? "module-cover" : body.purpose === "CHAT" ? "chat" : body.purpose === "SCHEDULE_COVER" ? "schedule-cover" : body.purpose === "SCHEDULE_COVER_TEMPLATE" ? "schedule-cover-template" : "submission"),
       };
     } catch (error) {
       mapError(error);

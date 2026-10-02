@@ -340,9 +340,17 @@ export class AuthService {
           // see practicum-service.ts#getActivePracticumId.
           const targetPracticumId = invitation.practicumId ?? (await getActivePracticumId(tx));
           if (userRole === UserRole.STUDENT && targetPracticumId) {
+            // A returning student accepting a fresh invite into a different cohort is moving
+            // forward, not joining both at once — close out any other still-active enrollment(s)
+            // first, so they don't end up double-counted (and double-visible in the curator's
+            // per-поток views) across two cohorts simultaneously.
+            await tx.enrollment.updateMany({
+              where: { studentId: userId, practicumId: { not: targetPracticumId }, status: EnrollmentStatus.ACTIVE },
+              data: { status: EnrollmentStatus.COMPLETED },
+            });
             const studentEnrollment = await tx.enrollment.upsert({
               where: { studentId_practicumId: { studentId: userId, practicumId: targetPracticumId } },
-              update: {},
+              update: { status: EnrollmentStatus.ACTIVE },
               create: { studentId: userId, practicumId: targetPracticumId },
               select: { id: true },
             });
@@ -696,19 +704,22 @@ export class AuthService {
     };
   }
 
-  /** Roster of curator accounts and their device/session signal, visible to any active curator
-    * or owner — the staff-side counterpart to getStudentDirectory, needed once a tester (or
-    * anyone) is promoted to curator and stops appearing under "Ученики". */
+  /** Roster of curator and owner accounts and their device/session signal, visible to any active
+    * curator or owner — the staff-side counterpart to getStudentDirectory, needed once a tester
+    * (or anyone) is promoted to curator/owner and stops appearing under "Ученики". Includes OWNER
+    * alongside CURATOR — getTeamMemberSecurityOverview/assertCanManageDeviceSecurity already
+    * accept an owner as a target here, this list just has to actually surface them. */
   public async getTeamDirectory(actorId: string): Promise<TeamMemberDirectoryRecord[]> {
     await this.assertOwnerOrCurator(actorId);
 
     const now = new Date();
     const members = await prisma.user.findMany({
-      where: { role: UserRole.CURATOR, status: { not: UserStatus.DELETED } },
+      where: { role: { in: [UserRole.CURATOR, UserRole.OWNER] }, status: { not: UserStatus.DELETED } },
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
         role: true,
+        isProtectedOwner: true,
         email: true,
         status: true,
         createdAt: true,
@@ -733,6 +744,7 @@ export class AuthService {
     return members.map((member) => ({
       id: member.id,
       role: member.role,
+      isProtectedOwner: member.isProtectedOwner,
       email: member.email,
       status: member.status,
       createdAt: member.createdAt,
@@ -798,6 +810,56 @@ export class AuthService {
     });
   }
 
+  /**
+   * Owner-only. Promotes an existing curator to a full, undifferentiated OWNER — no separate
+   * tier, same powers as any other owner. Only CURATOR → OWNER (not STUDENT directly), same
+   * reasoning as setUserRole above: a curator already has no enrollment/module-access rows to
+   * clean up or seed either way.
+   */
+  public async grantOwnerRole(actorId: string, targetId: string): Promise<{ id: string; role: UserRole }> {
+    await this.assertOwner(actorId);
+    const target = await prisma.user.findUnique({ where: { id: targetId }, select: { id: true, role: true, status: true } });
+    if (!target || target.status === UserStatus.DELETED) throw new AuthServiceError("INVALID_INPUT", "Аккаунт не найден");
+    if (target.role !== UserRole.CURATOR) throw new AuthServiceError("INVALID_INPUT", "Овнером можно сделать только куратора");
+
+    return prisma.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: targetId }, data: { role: UserRole.OWNER } });
+      await tx.auditLog.create({
+        data: { actorId, action: "security.owner_granted", objectType: "User", objectId: targetId },
+      });
+      return { id: targetId, role: UserRole.OWNER };
+    });
+  }
+
+  /**
+   * Owner-only. Demotes another owner back to curator — three guards, all deliberate:
+   *  - never the actor's own role (ask a different owner instead, so nobody locks themselves
+   *    out of "Команда" by mistake);
+   *  - never an account with isProtectedOwner set (reserved for the platform's actual owner —
+   *    see schema.prisma; that one can only be changed by hand in the database, by design, not
+   *    through this feature, no matter who's asking);
+   *  - never the last remaining owner, protected or not — the app would otherwise have no way
+   *    to grant OWNER back to anyone.
+   */
+  public async revokeOwnerRole(actorId: string, targetId: string): Promise<{ id: string; role: UserRole }> {
+    await this.assertOwner(actorId);
+    if (actorId === targetId) throw new AuthServiceError("INVALID_INPUT", "Нельзя снять роль Овнера с самого себя — попросите другого Овнера");
+    const target = await prisma.user.findUnique({ where: { id: targetId }, select: { id: true, role: true, status: true, isProtectedOwner: true } });
+    if (!target || target.status === UserStatus.DELETED) throw new AuthServiceError("INVALID_INPUT", "Аккаунт не найден");
+    if (target.role !== UserRole.OWNER) throw new AuthServiceError("INVALID_INPUT", "Этот аккаунт не Овнер");
+    if (target.isProtectedOwner) throw new AuthServiceError("FORBIDDEN", "Этот Овнер защищён — роль нельзя снять через интерфейс");
+    const ownerCount = await prisma.user.count({ where: { role: UserRole.OWNER, status: { not: UserStatus.DELETED } } });
+    if (ownerCount <= 1) throw new AuthServiceError("INVALID_INPUT", "Должен остаться хотя бы один Овнер");
+
+    return prisma.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: targetId }, data: { role: UserRole.CURATOR } });
+      await tx.auditLog.create({
+        data: { actorId, action: "security.owner_revoked", objectType: "User", objectId: targetId },
+      });
+      return { id: targetId, role: UserRole.CURATOR };
+    });
+  }
+
   public async getStudentDirectory(actorId: string, options?: { practicumId?: string }): Promise<StudentDirectoryRecord[]> {
     const actor = await prisma.user.findUnique({
       where: { id: actorId },
@@ -830,11 +892,16 @@ export class AuthService {
         email: true,
         status: true,
         createdAt: true,
+        isAdvanced: true,
         externalIdentities: {
           select: { provider: true, username: true, displayName: true, avatarUrl: true },
         },
         enrollments: {
-          where: activeEnrollmentFilter,
+          // When filtering by a specific "Поток", show that practicum's enrollment on the card —
+          // a student can hold more than one active enrollment at once (e.g. re-enrolled into a
+          // newer cohort), and picking the oldest one regardless of the filter made the badge
+          // contradict the selected "Поток" (looked like the filter wasn't working).
+          where: options?.practicumId ? { practicumId: options.practicumId, ...activeEnrollmentFilter } : activeEnrollmentFilter,
           orderBy: { createdAt: "asc" },
           take: 1,
           select: { practicum: { select: { id: true, title: true } } },
@@ -869,8 +936,25 @@ export class AuthService {
       submissionCount: student._count.submissions,
       practicum: student.enrollments[0]?.practicum ?? null,
       canViewDetails: true,
+      isAdvanced: student.isAdvanced,
       lastSession: student.sessions[0] ?? null,
     }));
+  }
+
+  /**
+   * Curator-granted, per-person (not per-enrollment — see the schema comment on User.isAdvanced)
+   * — flips the third "Advanced" Module.section track and MediaAudience.ADVANCED recordings on
+   * or off for this student. Toggled from the student's own card in "Ученики".
+   */
+  public async setStudentAdvanced(actorId: string, studentId: string, isAdvanced: boolean): Promise<boolean> {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, status: true } });
+    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) {
+      throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can edit students");
+    }
+    const student = await prisma.user.update({ where: { id: studentId }, data: { isAdvanced }, select: { isAdvanced: true, role: true } }).catch(() => null);
+    if (!student) throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
+    if (student.role !== UserRole.STUDENT) throw new AuthServiceError("INVALID_INPUT", "User is not a student");
+    return student.isAdvanced;
   }
 
   public async updateStudentEmail(actorId: string, studentId: string, rawEmail: string): Promise<string | null> {

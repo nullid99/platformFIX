@@ -15,9 +15,9 @@ import {
 } from "@nestjs/common";
 import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
-import { courseService, createNewPracticum, listPracticums, setActivePracticum, setWorkingPracticum } from "@/app/server/course";
+import { courseService, createNewPracticum, deletePracticum, getPracticumDeletionImpact, getStudentProgress, listPracticums, sendStudentReminder, setActivePracticum, setPracticumCompleted, setPracticumStreamsPrivate, setWorkingPracticum } from "@/app/server/course";
 import { getRequestContext } from "../common/request-context";
-import { parseCreateModuleBody, parseCreateVimeoMediaBody, parseRenameMediaBody, parseUpdateMediaKindBody } from "./course-input";
+import { parseCreateMediaGroupBody, parseCreateModuleBody, parseCreateVimeoMediaBody, parseRenameMediaBody, parseUpdateMediaKindBody } from "./course-input";
 
 type RequestWithCookies = Request & { cookies?: Record<string, string | undefined> };
 
@@ -90,14 +90,35 @@ export class CourseController {
     }
   }
 
+  @Put("media/reorder")
+  public async reorderMediaLibrary(@Req() request: RequestWithCookies, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    if (!body || typeof body !== "object" || !Array.isArray((body as { mediaIds?: unknown }).mediaIds) || !(body as { mediaIds: unknown[] }).mediaIds.every((id) => typeof id === "string")) {
+      throw new BadRequestException("mediaIds is required");
+    }
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await courseService.reorderMediaLibrary(session.userId, (body as { mediaIds: string[] }).mediaIds) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Media library reorder failed");
+    }
+  }
+
   @Put("modules/:moduleId")
   public async updateModule(@Req() request: RequestWithCookies, @Param("moduleId") moduleId: string, @Body() body: unknown) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
     if (!token) throw new UnauthorizedException("Session is required");
     if (!body || typeof body !== "object" || typeof (body as { title?: unknown }).title !== "string") throw new BadRequestException("title is required");
+    const rawQaQuestions = (body as { qaQuestions?: unknown }).qaQuestions;
+    if (rawQaQuestions !== undefined && (!Array.isArray(rawQaQuestions) || rawQaQuestions.some((item) => typeof item !== "string"))) {
+      throw new BadRequestException("qaQuestions must be an array of strings");
+    }
     try {
       const session = await authService.validateSession(token);
-      const input = body as { title: string; description?: string };
+      const input = body as { title: string; description?: string; qaQuestions?: string[] };
       return { data: await courseService.updateModule(session.userId, moduleId, input) };
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
@@ -116,6 +137,33 @@ export class CourseController {
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       throw new InternalServerErrorException("Module deletion failed");
+    }
+  }
+
+  @Post("modules/:moduleId/media-groups")
+  public async createMediaGroup(@Req() request: RequestWithCookies, @Param("moduleId") moduleId: string, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await courseService.createMediaGroup(session.userId, moduleId, parseCreateMediaGroupBody(body).title) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Block creation failed");
+    }
+  }
+
+  @Delete("media-groups/:groupId")
+  public async deleteMediaGroup(@Req() request: RequestWithCookies, @Param("groupId") groupId: string) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await courseService.deleteMediaGroup(session.userId, groupId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      throw new InternalServerErrorException("Block deletion failed");
     }
   }
 
@@ -304,6 +352,37 @@ export class CourseController {
   }
 
   /** Owner or curator — every past and present practicum (owners switch the active one; curators use it to target an invitation). */
+  /** Owner or curator — the "Прогресс" page's cohort-wide student roster, aggregated server-side. */
+  @Get("students/progress")
+  public async getStudentsProgress(@Req() request: RequestWithCookies, @Query("practicumId") practicumId?: string) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    if (!practicumId) throw new BadRequestException("practicumId is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await getStudentProgress(session.userId, practicumId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      throw new InternalServerErrorException("Student progress lookup failed");
+    }
+  }
+
+  /** Owner or curator — the "Прогресс" page's "Напомнить" button. */
+  @Post("students/:studentId/remind")
+  public async remindStudent(@Req() request: RequestWithCookies, @Param("studentId") studentId: string, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    const practicumId = body && typeof body === "object" && "practicumId" in body ? (body as { practicumId: unknown }).practicumId : undefined;
+    if (typeof practicumId !== "string" || !practicumId) throw new BadRequestException("practicumId must be a string");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await sendStudentReminder(session.userId, studentId, practicumId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      throw new InternalServerErrorException("Sending the reminder failed");
+    }
+  }
+
   @Get("practicums")
   public async getPracticums(@Req() request: RequestWithCookies) {
     const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
@@ -351,6 +430,69 @@ export class CourseController {
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       throw new InternalServerErrorException("Switching practicum failed");
+    }
+  }
+
+  /** Owner or curator — per-practicum "private stream" switch, from the "Потоки" list. */
+  @Put("practicums/:practicumId/streams-private")
+  public async setPracticumVisibility(@Req() request: RequestWithCookies, @Param("practicumId") practicumId: string, @Body() body: { streamsPrivate?: unknown }) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    if (typeof body?.streamsPrivate !== "boolean") throw new BadRequestException("streamsPrivate must be a boolean");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await setPracticumStreamsPrivate(session.userId, practicumId, body.streamsPrivate) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Setting practicum stream visibility failed");
+    }
+  }
+
+  /** Owner or curator, reversible — "Завершить поток" on the "Потоки" list. */
+  @Put("practicums/:practicumId/completed")
+  public async setPracticumCompleted(@Req() request: RequestWithCookies, @Param("practicumId") practicumId: string, @Body() body: { completed?: unknown }) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    if (typeof body?.completed !== "boolean") throw new BadRequestException("completed must be a boolean");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await setPracticumCompleted(session.userId, practicumId, body.completed) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Setting practicum completion failed");
+    }
+  }
+
+  /** Owner-only — counts behind the confirmation screen before deletePracticum below. */
+  @Get("practicums/:practicumId/deletion-impact")
+  public async getPracticumDeletionImpact(@Req() request: RequestWithCookies, @Param("practicumId") practicumId: string) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await getPracticumDeletionImpact(session.userId, practicumId) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      throw new InternalServerErrorException("Loading practicum deletion impact failed");
+    }
+  }
+
+  /** Owner-only, permanent — see practicum-admin-service.ts#deletePracticum for the cascade and the two server-side guards. */
+  @Delete("practicums/:practicumId")
+  public async deletePracticum(@Req() request: RequestWithCookies, @Param("practicumId") practicumId: string, @Body() body: { confirmTitle?: unknown }) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    if (typeof body?.confirmTitle !== "string") throw new BadRequestException("confirmTitle must be a string");
+    try {
+      const session = await authService.validateSession(token);
+      await deletePracticum(session.userId, practicumId, body.confirmTitle);
+      return { data: { deleted: true } };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Deleting practicum failed");
     }
   }
 

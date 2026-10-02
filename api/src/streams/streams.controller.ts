@@ -50,6 +50,21 @@ export class StreamsController {
     } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
+  /** "Завершить эфир" for a schedule event — see StreamService#finishStream. */
+  @Post("target/finish")
+  public async finishTarget(@Req() request: RequestWithCookies, @Body() body: { scheduleEventId?: unknown }) {
+    try {
+      if (typeof body?.scheduleEventId !== "string" || !body.scheduleEventId) throw new AuthServiceError("INVALID_INPUT", "scheduleEventId is required");
+      return { data: await streamService.finishStream(await sessionUser(request), body.scheduleEventId) };
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  /** Whichever practicum the caller resolves to — see getVisibilitySettings. Setting it is per-practicum-row, from course.controller.ts's "Потоки" list instead. */
+  @Get("visibility")
+  public async getVisibility(@Req() request: RequestWithCookies) {
+    try { return { data: await streamService.getVisibilitySettings(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
   @Get("recording-storage")
   public async getRecordingStorage(@Req() request: RequestWithCookies) {
     try { return { data: await streamService.getRecordingStorageStatus(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }

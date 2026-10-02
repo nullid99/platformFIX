@@ -16,3 +16,6 @@ dist/
 
 # local release/deploy archives
 *.tar.gz
+
+# local-only docs with real infra access details (host/keys) — see docs/deploy.md
+docs/*.local.md

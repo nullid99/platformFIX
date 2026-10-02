@@ -53,6 +53,15 @@ enum EnrollmentStatus {
   COMPLETED
 }
 
+// Independent of MediaAssetKind (that's WHAT the recording is; this is WHO can see it) — a
+// curator can mark any recording, attached to a module or not, as Advanced-only. Kept as its
+// own dimension rather than folded into kind so a video stays taggable by both at once (e.g.
+// still a QA recording, just restricted) instead of losing its kind to express audience.
+enum MediaAudience {
+  ALL
+  ADVANCED
+}
+
 enum MediaAssetKind {
   LESSON_VIDEO
   STREAM
@@ -127,6 +136,7 @@ enum DiscussionVisibility {
 
 enum NotificationType {
   NEW_ASSIGNMENT
+  NEW_SUBMISSION
   NEW_MEDIA
   NEW_EVENT
   NEW_MODULE
@@ -136,13 +146,24 @@ enum NotificationType {
   STREAM_LIVE
   SCHEDULE_REMINDER
   SECURITY_ALERT
+  CURATOR_REMINDER
 }
 
 model User {
   id                        String                   @id @default(cuid())
   email                     String?                  @unique
   passwordHash              String?
+  // Curator-granted, per-person (not per-enrollment) — a student's Advanced tier follows them
+  // across cohorts rather than resetting on re-enrollment. Meaningless for CURATOR/OWNER rows.
+  // Gates the "Advanced" Module.section track and MediaAudience.ADVANCED recordings — see
+  // course-service.ts#getForUser.
+  isAdvanced                Boolean                  @default(false)
   role                      UserRole
+  // Reserved for the platform's actual owner, set once that person is finally promoted (see
+  // auth-service.ts#revokeOwnerRole) — nobody has this yet. An owner with this flag can't have
+  // OWNER revoked by anyone through the app, including by another owner; everything else about
+  // two owners' powers stays identical. Meaningless for STUDENT/CURATOR rows.
+  isProtectedOwner          Boolean                  @default(false)
   status                    UserStatus               @default(INVITED)
   emailVerifiedAt           DateTime?
   twoFactorEnabled          Boolean                  @default(false)
@@ -170,6 +191,11 @@ model User {
   backtestBookings          ScheduleEvent[]          @relation("ScheduleEventBooking")
   scheduleBookingsAsStudent ScheduleBooking[]        @relation("ScheduleBookingStudent")
   scheduleBookingsAsActor   ScheduleBooking[]        @relation("ScheduleBookingActor")
+  // Per-curator email preference — the in-app bell always fires regardless (see
+  // notification-service.ts), this only gates whether that event also sends an email to this
+  // specific curator/owner. Meaningless for STUDENT rows.
+  notifyNewSubmission       Boolean                  @default(true)
+  notifyNewQuestion         Boolean                  @default(true)
   // A curator/owner's personal "which practicum am I creating content in right now" pointer —
   // independent from Practicum.isActive (which only targets live streaming, unchanged). Null
   // means "no personal pick yet", so every resolver falls back to the active practicum — see
@@ -177,6 +203,7 @@ model User {
   // practicums at the same time without affecting each other or the live-stream target.
   workingPracticumId        String?
   workingPracticum          Practicum?               @relation("UserWorkingPracticum", fields: [workingPracticumId], references: [id], onDelete: SetNull)
+  startedStreamsFor         Practicum[]              @relation("PracticumStreamStartedBy")
 
   @@index([role, status])
 }
@@ -301,6 +328,12 @@ model Practicum {
   title                         String
   description                   String?
   accessUntil                   DateTime?
+  // Curator/owner-set, reversible — "Завершить поток" on the Потоки screen. Deliberately NOT a
+  // hard access cutoff like accessUntil above (which nothing currently reads): a completed
+  // practicum's students keep full read access (modules, ДЗ history, recordings, Practice/
+  // Advanced) — only the write actions (submit/resubmit ДЗ, ask/reply in discussions) check this
+  // and refuse once it's set. See practicum-service.ts#isPracticumCompleted.
+  completedAt                   DateTime?
   // The practicum live streaming targets (LiveKit ingress, "Стримы") and the fallback every
   // resolver uses when a curator/owner has no personal workingPracticumId set yet — see
   // app/server/course/practicum-service.ts#getActivePracticumId. Content creation itself (module,
@@ -313,6 +346,11 @@ model Practicum {
   liveKitIngressId              String?
   isCurrentlyLive               Boolean           @default(false)
   currentStreamSessionStartedAt DateTime?
+  // Per-cohort "private stream" switch (a personal 1:1 session, or recording something to
+  // publish later) — see practicum-admin-service.ts#setPracticumStreamsPrivate and
+  // stream-visibility.ts. Deliberately per-practicum rather than global: flipping it on for
+  // this cohort must not carry over to whichever practicum becomes active next.
+  streamsPrivate                Boolean           @default(false)
   backtestSlotLimit             Int               @default(1)
   preSessionSlotLimit           Int               @default(1)
   // What the curator picked as the target for the NEXT/current broadcast on the "Стримы"
@@ -325,6 +363,12 @@ model Practicum {
   // the "Тематические записи" (STREAM) and "Q&A с куратором" (QA) blocks, so the curator picks
   // which one this broadcast is for. Null/unset defaults to STREAM in createMediaAssetFromRecording.
   pendingStreamMediaKind        MediaAssetKind?
+  // Who pressed "Начать стрим" (or picked the target on "Стримы") for the current/next broadcast
+  // and when — shown to every curator as "Эфир ведёт: Имя", since all curators share one OBS key
+  // and LiveKit itself can't tell who is behind it. Cleared by "Завершить эфир".
+  streamStartedById             String?
+  streamStartedAt               DateTime?
+  streamStartedBy               User?             @relation("PracticumStreamStartedBy", fields: [streamStartedById], references: [id], onDelete: SetNull)
   createdAt                     DateTime          @default(now())
   updatedAt                     DateTime          @updatedAt
   enrollments                   Enrollment[]
@@ -335,6 +379,7 @@ model Practicum {
   streamMessages                StreamMessage[]
   scheduleBookings              ScheduleBooking[]
   workingForUsers               User[]            @relation("UserWorkingPracticum")
+  assignments                   Assignment[]
 }
 
 model StreamMessage {
@@ -406,16 +451,42 @@ model Module {
   // admin screen reports (previously that screen just guessed from one arbitrary student's
   // row, which is what caused open-looking-but-actually-locked modules).
   defaultAccess     ModuleAccessStatus       @default(LOCKED)
+  // Curator-written Q&A discussion prompts for this lesson — a plain string array, shown above
+  // "Открыть обсуждение" (see ModuleOverviewPage). Previously this was the same hardcoded demo
+  // text for every lesson (modulePageContentFor's baseContent.questions); this is the real,
+  // per-lesson replacement.
+  qaQuestions       Json?
   createdAt         DateTime                 @default(now())
   updatedAt         DateTime                 @updatedAt
   practicum         Practicum                @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   mediaAssets       MediaAsset[]
+  mediaGroups       MediaGroup[]
   assignments       Assignment[]
   accessRecords     EnrollmentModuleAccess[]
   discussionThreads DiscussionThread[]
 
   @@unique([practicumId, position])
   @@index([practicumId])
+}
+
+/**
+ * Curator-defined named section inside one lesson — "Бектест", "Пресессия", or whatever else a
+ * curator comes up with — each holding its own set of MediaAsset recordings. Built for Практика
+ * lessons (whose template drops the fixed "Тематические записи"/ДЗ/Q&A blocks in favour of
+ * however many of these the curator wants), but not restricted to that section — nothing here
+ * assumes Module.section === "Practice".
+ */
+model MediaGroup {
+  id          String       @id @default(cuid())
+  moduleId    String
+  title       String
+  position    Int
+  createdAt   DateTime     @default(now())
+  module      Module       @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  mediaAssets MediaAsset[]
+
+  @@unique([moduleId, position])
+  @@index([moduleId])
 }
 
 model EnrollmentModuleAccess {
@@ -444,9 +515,17 @@ model MediaAsset {
   practicumId          String
   moduleId             String?
   scheduleEventId      String?
+  // Which curator-named MediaGroup ("Бектест", "Пресессия"...) this belongs to inside its
+  // module — null for anything not sorted into one yet (including every Теория lesson, which
+  // doesn't use groups at all).
+  groupId              String?
   provider             String
   providerKey          String
   kind                 MediaAssetKind       @default(STREAM)
+  // Set by the curator at publish time, independent of moduleId/kind — ADVANCED hides this
+  // recording from every student except User.isAdvanced ones, whether it's attached to a
+  // Theory/Practice lesson or sitting unattached in the general "Записи" library.
+  audience             MediaAudience        @default(ALL)
   status               MediaAssetStatus     @default(DRAFT)
   title                String?
   description          String?
@@ -457,6 +536,12 @@ model MediaAsset {
   // own FileInfo instead of asking S3/MinIO for it separately.
   byteSize             BigInt?
   position             Int                  @default(0)
+  // Curator's manual order for the practicum-wide "Медиатека" overview (CuratorMediaLibraryView),
+  // which mixes items from three different scopes (module-attached, schedule-event-attached, and
+  // unattached/global) that each already use `position` for their OWN, unrelated ordering
+  // (per-module lesson order, etc). Kept as a separate field so dragging one list never disturbs
+  // the other. Untouched assets share the default 0 and fall back to newest-first ordering.
+  libraryPosition      Int                  @default(0)
   publishedAt          DateTime?
   // Snapshot of the live-chat time window at the moment this asset was auto-created from a
   // stream recording — lets StreamChatService.getArchivedMessages find "the chat that
@@ -469,12 +554,14 @@ model MediaAsset {
   practicum            Practicum            @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   module               Module?              @relation(fields: [moduleId], references: [id], onDelete: SetNull)
   scheduleEvent        ScheduleEvent?       @relation(fields: [scheduleEventId], references: [id], onDelete: SetNull)
+  group                MediaGroup?          @relation(fields: [groupId], references: [id], onDelete: SetNull)
   feedback             Feedback[]
   playbackEvents       MediaPlaybackEvent[]
 
   @@unique([provider, providerKey, moduleId])
   @@index([moduleId, status, position])
   @@index([scheduleEventId, status, position])
+  @@index([groupId, status, position])
   @@index([practicumId, status, position])
 }
 
@@ -541,6 +628,10 @@ model ScheduleEvent {
   description       String
   live              Boolean           @default(false)
   coverPath         String?
+  /// Set by "Завершить эфир" (StreamService#finishStream) — students' schedule then shows the
+  /// event as "Эфир завершён" (+ "Открыть запись" once the curator publishes the recording
+  /// draft). Cleared again if the curator restarts a stream from the same event.
+  streamEndedAt     DateTime?
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
   practicum         Practicum         @relation(fields: [practicumId], references: [id], onDelete: Cascade)
@@ -556,6 +647,23 @@ model ScheduleEvent {
   @@index([practicumId, date])
   @@index([practicumId, type, date])
   @@index([bookedByStudentId])
+}
+
+/**
+ * Curator-managed, platform-wide reusable cover images for the schedule-event creation form's
+ * picker grid (see ScheduleEventForm) — deliberately not scoped to a practicum. `coverPath` is a
+ * plain string like `Module.coverPath`/`ScheduleEvent.coverPath` (either a static `/event-covers/…`
+ * asset for the built-in seeded set, or `/api/files/:id/content` for a curator-uploaded one) —
+ * no FK to StoredFile, so deleting a template never touches events that already copied its path.
+ */
+model ScheduleCoverTemplate {
+  id        String   @id @default(cuid())
+  label     String
+  coverPath String
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([position])
 }
 
 /**
@@ -586,7 +694,26 @@ model ScheduleBooking {
 
 model Assignment {
   id                String               @id @default(cuid())
-  moduleId          String
+  // Nullable only for isPractice — a normal assignment is always inside a lesson. Practice
+  // assignments aren't attached to any lesson (that's the whole point — no deadline, no
+  // requirements, no module-completion gate), so this stays null for those and practicumId
+  // below carries the targeting instead.
+  moduleId          String?
+  // Always set. For a regular assignment this mirrors module.practicumId (kept as its own
+  // column rather than derived, so discussion-service.ts and the practice listing don't need to
+  // traverse a possibly-null module relation just to find out which cohort to check).
+  practicumId       String
+  // Практическое задание — see course this session's per-track Практика work. No deadline, no
+  // requirements checklist, not gated behind a module. Interaction happens as a DiscussionThread
+  // (assignmentId-linked) instead of the formal Submission/decide() review flow — a curator just
+  // replies in plain text, no accept/needs-revision buttons.
+  isPractice        Boolean              @default(false)
+  // "ДЗ без проверки" — the student's own "Выполнено" click creates an already-ACCEPTED
+  // Submission directly (see AssignmentService#completeWithoutReview), skipping the curator
+  // review queue entirely. Exists for lessons with no real homework, where the normal
+  // "every assignment ACCEPTED → unlock next module" gate would otherwise never fire because
+  // nothing was ever there for a curator to accept.
+  reviewRequired    Boolean              @default(true)
   title             String
   description       String
   requirements      Json?
@@ -595,12 +722,14 @@ model Assignment {
   deadline          DateTime?
   createdAt         DateTime             @default(now())
   updatedAt         DateTime             @updatedAt
-  module            Module               @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  module            Module?              @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  practicum         Practicum            @relation(fields: [practicumId], references: [id], onDelete: Cascade)
   submissions       Submission[]
   materials         AssignmentMaterial[]
   discussionThreads DiscussionThread[]
 
   @@index([moduleId, status])
+  @@index([practicumId, isPractice, status])
 }
 
 model Submission {

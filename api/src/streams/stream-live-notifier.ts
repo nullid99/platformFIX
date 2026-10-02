@@ -1,5 +1,6 @@
 import { Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { streamService } from "@/app/server/streams";
+import { isStreamPrivate } from "@/app/server/streams/stream-visibility";
 import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { sendStreamLiveNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
@@ -55,6 +56,9 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
   private async tick(): Promise<void> {
     this.tickCount += 1;
     if (this.tickCount % RECONCILE_INTERVAL_TICKS === 0) await streamService.reconcileLiveStatus();
+    // Recording watchdog — see StreamService#superviseRecording. Independent of the DB live flag
+    // below on purpose: it asks LiveKit directly, so a missed webhook can't blind it either.
+    await streamService.superviseRecording();
 
     const results = await streamService.checkLiveForNotifications().catch((error: unknown) => {
       console.error("Stream live notifier poll failed", error instanceof Error ? error.message : "unknown error");
@@ -81,7 +85,12 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
         const gapSinceLastLive = current.lastLiveAt !== null ? now - current.lastLiveAt : Infinity;
         this.state.set(practicumId, { ...current, notified: true, lastLiveAt: now });
         void this.handleConfirmedLive(practicumId, gapSinceLastLive >= NEW_SESSION_GAP_MS);
-      } else {
+      } else if (current.notified) {
+        // Only a *confirmed* broadcast refreshes lastLiveAt. Refreshing it while still inside the
+        // sustain window (as this used to, unconditionally) meant the confirming tick always saw
+        // a ~20s "gap since last live" — i.e. every broadcast looked like a reconnect of itself,
+        // so isNewSession was never true and neither the "Стрим начался" email/bell nor the chat
+        // reset ever fired (0 STREAM_LIVE notifications in production as of 2026-10-01).
         this.state.set(practicumId, { ...current, lastLiveAt: now });
       }
     }
@@ -94,6 +103,10 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
       console.error("Stream chat session reset failed", error instanceof Error ? error.message : "unknown error");
     });
     this.gateway.broadcastChatReset();
+    // Private stream (1:1, or recording something to publish later) — students already can't
+    // get into it (see getPlaybackStatus), and shouldn't get an email/bell telling them it's
+    // live either.
+    if (await isStreamPrivate(practicumId)) return;
     try {
       const topic = await streamService.getPendingStreamTopic(practicumId).catch(() => null);
       const emails = await activeStudentEmails(practicumId);

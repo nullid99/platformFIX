@@ -110,6 +110,8 @@ function isTestHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname.startsWith("staging.");
 }
 
+const COMMUNITY_MANAGER_TELEGRAM_URL = "https://t.me/ProjectFIX_Manager";
+
 export default function AuthPage() {
   const [authState, setAuthState] = useState("");
   const [devLoginError, setDevLoginError] = useState("");
@@ -128,6 +130,10 @@ export default function AuthPage() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, []);
+
+  const handleConsultationClick = () => {
+    window.open(COMMUNITY_MANAGER_TELEGRAM_URL, "_blank", "noopener,noreferrer");
+  };
 
   const handleDiscordLogin = () => {
     const startUrl = new URL("/api/auth/discord/start", window.location.origin);
@@ -170,7 +176,7 @@ export default function AuthPage() {
             <button type="button" className={lang === "ua" ? "is-active" : ""} onClick={() => setLang("ua")}>UA</button>
             <button type="button" className={lang === "en" ? "is-active" : ""} onClick={() => setLang("en")}>EN</button>
           </div>
-          <button className="auth-consultation-button" type="button">{t.consultation}</button>
+          <button className="auth-consultation-button" type="button" onClick={handleConsultationClick}>{t.consultation}</button>
         </div>
       </header>
 

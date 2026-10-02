@@ -1,11 +1,11 @@
 import { randomUUID } from "crypto";
 import { AccessToken, EgressClient, IngressClient, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
-import { EgressStatus, EncodedFileOutput, EncodedFileType, EncodingOptions, ImageCodec, ImageFileSuffix, ImageOutput, IngressInput, IngressVideoEncodingOptions, IngressVideoOptions, S3Upload, TrackType, VideoLayer, VideoQuality } from "@livekit/protocol";
+import { EgressStatus, EncodedFileOutput, EncodedFileType, EncodingOptions, ImageCodec, ImageFileSuffix, ImageOutput, IngressInput, IngressState_Status, IngressVideoEncodingOptions, IngressVideoOptions, S3Upload, TrackType, VideoLayer, VideoQuality } from "@livekit/protocol";
 import { DeleteObjectCommand, GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { AuthServiceError } from "@/app/server/auth";
 
-export { EgressStatus, IngressInput, TrackType };
+export { EgressStatus, IngressInput, IngressState_Status, TrackType };
 
 /** Single practicum per install (see StreamService.assertCuratorPracticum) — one fixed room for the whole app. */
 export const LIVEKIT_ROOM_NAME = process.env.LIVEKIT_ROOM_NAME?.trim() || "practicum-live";

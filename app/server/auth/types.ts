@@ -128,6 +128,7 @@ export type StudentDirectoryRecord = {
     * (e.g. access expired). Lets the roster show/filter which stream a student is actually in. */
   practicum: { id: string; title: string } | null;
   canViewDetails: boolean;
+  isAdvanced: boolean;
   lastSession: {
     lastActiveAt: Date;
     deviceName: string | null;
@@ -141,6 +142,7 @@ export type StudentDirectoryRecord = {
 export type TeamMemberDirectoryRecord = {
   id: string;
   role: UserRole;
+  isProtectedOwner: boolean;
   email: string | null;
   status: UserStatus;
   createdAt: Date;

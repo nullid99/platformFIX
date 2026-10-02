@@ -1,12 +1,13 @@
 import type { AssignmentFeedback, AssignmentStatus, AssignmentTone } from "./student-dashboard";
 
-export type CuratorNav = "Кабинет куратора" | "Очередь проверки" | "Создать задание" | "Ученики" | "Программа" | "Приглашения" | "Расписание" | "Стримы" | "Медиатека" | "Обсуждения" | "Команда";
+export type CuratorNav = "Кабинет куратора" | "Очередь проверки" | "Создать задание" | "Ученики" | "Прогресс" | "Программа" | "Приглашения" | "Расписание" | "Стримы" | "Медиатека" | "Обсуждения" | "Команда";
 
 export type ReviewQueueItem = {
   id: string;
   studentName: string;
   studentInitials: string;
   studentAvatarUrl?: string | null;
+  studentIsAdvanced?: boolean;
   assignmentTitle: string;
   module: string;
   coverPath?: string | null;
@@ -34,6 +35,10 @@ export type ReviewQueueItem = {
   reviewerName?: string | null;
   /** False when reviewerId belongs to a different curator — disables deciding on this submission. */
   isReviewerSelf?: boolean;
+  /** Accepted by this curator personally — what "Проверено вами" counts. */
+  reviewedByMe?: boolean;
+  /** A "ДЗ без проверки" the student marked done themselves — no curator involved. */
+  selfCompleted?: boolean;
   claimedAt?: string | null;
   /** Requirement texts the curator had checked at decision time. Advisory only — not all need be checked to accept. */
   checkedRequirements?: readonly string[] | null;

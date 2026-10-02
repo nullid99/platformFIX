@@ -14,6 +14,7 @@ const MAX_FILE_NAME_LENGTH = 180;
 const ALLOWED_TYPES = new Set([
   "image/png",
   "image/jpeg",
+  "image/webp",
   "application/pdf",
   "video/mp4",
   "video/webm",
@@ -25,7 +26,7 @@ type UploadInput = {
   byteSize: number;
 };
 
-export type UploadPurpose = "submission" | "module-cover" | "chat";
+export type UploadPurpose = "submission" | "module-cover" | "chat" | "schedule-cover" | "schedule-cover-template";
 
 type FileAccessRecord = {
   id: string;
@@ -72,18 +73,26 @@ function storagePath(storageKey: string): string {
 export class FileService {
   public async createUpload(ownerId: string, input: UploadInput, purpose: UploadPurpose = "submission") {
     await this.assertActiveUser(ownerId);
-    if (purpose === "module-cover") {
+    const isCuratorCover = purpose === "module-cover" || purpose === "schedule-cover" || purpose === "schedule-cover-template";
+    if (isCuratorCover) {
       const curator = await prisma.user.findUnique({ where: { id: ownerId }, select: { role: true } });
-      if (!curator || (curator.role !== UserRole.CURATOR && curator.role !== UserRole.OWNER)) throw new AuthServiceError("FORBIDDEN", "Only a curator can upload a module cover");
+      if (!curator || (curator.role !== UserRole.CURATOR && curator.role !== UserRole.OWNER)) throw new AuthServiceError("FORBIDDEN", "Only a curator can upload this cover");
     }
     if (purpose === "chat") await assertPracticumViewer(ownerId);
     const originalName = normalizeName(input.originalName);
     const mimeType = normalizeType(input.mimeType);
     const byteSize = assertSize(input.byteSize);
-    if (purpose === "module-cover" && (!mimeType.startsWith("image/") || byteSize > 5 * 1024 * 1024)) throw new AuthServiceError("INVALID_INPUT", "Module cover must be an image up to 5 MB");
+    if (isCuratorCover && (!mimeType.startsWith("image/") || byteSize > 5 * 1024 * 1024)) throw new AuthServiceError("INVALID_INPUT", "Cover image must be up to 5 MB");
     if (purpose === "chat" && (!mimeType.startsWith("image/") || byteSize > 8 * 1024 * 1024)) throw new AuthServiceError("INVALID_INPUT", "Chat images must be up to 8 MB");
     const id = randomUUID();
-    const storageKey = `${purpose === "module-cover" ? "module-covers/pending" : purpose === "chat" ? "chat" : "submissions"}/${ownerId}/${id}`;
+    const storagePrefixByPurpose: Record<UploadPurpose, string> = {
+      submission: "submissions",
+      "module-cover": "module-covers/pending",
+      chat: "chat",
+      "schedule-cover": "schedule-covers/pending",
+      "schedule-cover-template": "schedule-cover-templates/pending",
+    };
+    const storageKey = `${storagePrefixByPurpose[purpose]}/${ownerId}/${id}`;
     const file = await prisma.storedFile.create({
       data: { id, ownerId, storageKey, originalName, mimeType, byteSize, status: StoredFileStatus.PENDING },
       select: { id: true },
@@ -119,6 +128,77 @@ export class FileService {
       throw new AuthServiceError("INVALID_INPUT", "Module cover file is unavailable");
     }
     return { moduleId, coverPath };
+  }
+
+  /** One-off cover for a single schedule event — see ScheduleService#create/#update. Unlike a
+    * template, this never gets its own ScheduleCoverTemplate row. */
+  public async attachToScheduleEventCover(actorId: string, eventId: string, fileId: string): Promise<string> {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, status: true } });
+    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) throw new AuthServiceError("FORBIDDEN", "Only a curator can change event covers");
+    const file = await prisma.storedFile.findUnique({ where: { id: fileId }, select: { id: true, ownerId: true, status: true, storageKey: true } });
+    if (!file || file.ownerId !== actorId || file.status !== StoredFileStatus.UPLOADED || !file.storageKey.startsWith("schedule-covers/pending/")) throw new AuthServiceError("FORBIDDEN", "This file cannot be used as an event cover");
+    const storageKey = `schedule-covers/${eventId}/${file.id}`;
+    const coverPath = `/api/files/${file.id}/content`;
+    const source = storagePath(file.storageKey);
+    const target = storagePath(storageKey);
+    await mkdir(resolve(target, ".."), { recursive: true });
+    try {
+      await rename(source, target);
+      try {
+        await prisma.storedFile.update({ where: { id: file.id }, data: { storageKey } });
+      } catch (error) {
+        await rename(target, source).catch(() => undefined);
+        throw error;
+      }
+    } catch (error) {
+      if (error instanceof AuthServiceError) throw error;
+      throw new AuthServiceError("INVALID_INPUT", "Event cover file is unavailable");
+    }
+    return coverPath;
+  }
+
+  /** A reusable, platform-wide cover — see ScheduleCoverTemplate in schema.prisma. Deleting one
+    * later (deleteScheduleCoverTemplate) only removes this row, never the file itself, so an
+    * event that already copied its coverPath keeps working. */
+  public async createScheduleCoverTemplate(actorId: string, fileId: string, label: string): Promise<{ id: string; label: string; coverPath: string }> {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, status: true } });
+    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) throw new AuthServiceError("FORBIDDEN", "Only a curator can manage cover templates");
+    const normalizedLabel = label.trim().slice(0, 60);
+    if (!normalizedLabel) throw new AuthServiceError("INVALID_INPUT", "label is required");
+    const file = await prisma.storedFile.findUnique({ where: { id: fileId }, select: { id: true, ownerId: true, status: true, storageKey: true } });
+    if (!file || file.ownerId !== actorId || file.status !== StoredFileStatus.UPLOADED || !file.storageKey.startsWith("schedule-cover-templates/pending/")) throw new AuthServiceError("FORBIDDEN", "This file cannot be used as a cover template");
+    const created = await prisma.scheduleCoverTemplate.create({ data: { label: normalizedLabel, coverPath: "" }, select: { id: true } });
+    const storageKey = `schedule-cover-templates/${created.id}/${file.id}`;
+    const coverPath = `/api/files/${file.id}/content`;
+    const source = storagePath(file.storageKey);
+    const target = storagePath(storageKey);
+    await mkdir(resolve(target, ".."), { recursive: true });
+    try {
+      await rename(source, target);
+      await prisma.$transaction([
+        prisma.storedFile.update({ where: { id: file.id }, data: { storageKey } }),
+        prisma.scheduleCoverTemplate.update({ where: { id: created.id }, data: { coverPath } }),
+      ]);
+    } catch (error) {
+      await prisma.scheduleCoverTemplate.delete({ where: { id: created.id } }).catch(() => undefined);
+      await rename(target, source).catch(() => undefined);
+      throw new AuthServiceError("INVALID_INPUT", "Cover template file is unavailable");
+    }
+    return { id: created.id, label: normalizedLabel, coverPath };
+  }
+
+  public async listScheduleCoverTemplates(): Promise<Array<{ id: string; label: string; coverPath: string }>> {
+    return prisma.scheduleCoverTemplate.findMany({ orderBy: [{ position: "asc" }, { createdAt: "asc" }], select: { id: true, label: true, coverPath: true } });
+  }
+
+  /** Only removes the template row — the underlying file (if any) is left in place so an event
+    * that already copied this template's coverPath keeps showing it. */
+  public async deleteScheduleCoverTemplate(actorId: string, templateId: string): Promise<void> {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, status: true } });
+    if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) throw new AuthServiceError("FORBIDDEN", "Only a curator can manage cover templates");
+    await prisma.scheduleCoverTemplate.delete({ where: { id: templateId } }).catch(() => {
+      throw new AuthServiceError("INVALID_INPUT", "Cover template does not exist");
+    });
   }
 
   public async uploadContent(actorId: string, fileId: string, body: NodeJS.ReadableStream): Promise<void> {
@@ -200,6 +280,11 @@ export class FileService {
       ? await prisma.enrollmentModuleAccess.count({ where: { moduleId: moduleCoverModuleId, status: ModuleAccessStatus.UNLOCKED, enrollment: { studentId: actorId, status: EnrollmentStatus.ACTIVE, OR: [{ accessUntil: null }, { accessUntil: { gt: new Date() } }] } } })
       : 0;
     const curatorModuleAccess = moduleCoverModuleId && (actor.role === UserRole.CURATOR || actor.role === UserRole.OWNER) ? 1 : 0;
+    // A schedule-event cover (one-off or a reusable template) is decorative, shown on the
+    // schedule page to whichever cohort can already see the event — already less exposed than
+    // the fully-public static /event-covers/*.png files this replaces, so any active session
+    // (any role, any practicum) is enough rather than re-deriving per-event enrollment here.
+    const scheduleCoverAccess = /^schedule-covers\/|^schedule-cover-templates\//.test(file.storageKey) ? 1 : 0;
     if (file.ownerId !== actorId) {
       const studentIds = file.submissions.map((item) => item.submission.studentId);
       // Any active curator can open a submission's attachments, same as the review queue
@@ -210,7 +295,11 @@ export class FileService {
           where: {
             id: { in: file.assignmentMaterials.map((material) => material.assignmentId) },
             status: AssignmentStatus.PUBLISHED,
-            module: { practicum: { enrollments: { some: { studentId: actorId, status: EnrollmentStatus.ACTIVE } } } },
+            // practicumId is always set (see the schema comment on Assignment.practicumId) —
+            // going through `module.practicum` instead always missed a practice assignment,
+            // whose moduleId is null by design, so this check silently denied every material
+            // attached to one (broken-image icon for the student, not a thrown/visible error).
+            practicum: { enrollments: { some: { studentId: actorId, status: EnrollmentStatus.ACTIVE } } },
           },
         })
         : 0;
@@ -235,7 +324,7 @@ export class FileService {
       const feedbackStudentIds = file.feedbackAttachments.map((attachment) => attachment.feedback.submission.studentId);
       const curatorFeedbackAccess = actor.role === UserRole.CURATOR && feedbackStudentIds.length > 0 ? 1 : 0;
       const studentFeedbackAccess = actor.role === UserRole.STUDENT && feedbackStudentIds.includes(actorId) ? 1 : 0;
-      if (actor.role !== UserRole.OWNER && !isLocalTestCurator && assigned === 0 && studentMaterialAccess === 0 && moduleCoverAccess === 0 && curatorModuleAccess === 0 && curatorStreamChatAccess === 0 && studentStreamChatAccess === 0 && curatorDiscussionAccess === 0 && studentDiscussionAccess === 0 && curatorFeedbackAccess === 0 && studentFeedbackAccess === 0) throw new AuthServiceError("FORBIDDEN", "File access is not allowed");
+      if (actor.role !== UserRole.OWNER && !isLocalTestCurator && assigned === 0 && studentMaterialAccess === 0 && moduleCoverAccess === 0 && curatorModuleAccess === 0 && curatorStreamChatAccess === 0 && studentStreamChatAccess === 0 && curatorDiscussionAccess === 0 && studentDiscussionAccess === 0 && curatorFeedbackAccess === 0 && studentFeedbackAccess === 0 && scheduleCoverAccess === 0) throw new AuthServiceError("FORBIDDEN", "File access is not allowed");
     }
     return { id: file.id, storageKey: file.storageKey, originalName: file.originalName, mimeType: file.mimeType, byteSize: file.byteSize };
   }

@@ -5,6 +5,7 @@ import "dotenv/config";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { WebhookEvent } from "livekit-server-sdk";
 import type { EgressInfo } from "@livekit/protocol";
+import { IdentityProvider, MediaAssetKind, MediaAssetStatus, ScheduleEventType, UserRole, UserStatus } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
 import { streamService } from "./stream-service";
 import { EgressStatus, LIVEKIT_ROOM_NAME } from "./livekit-client";
@@ -100,5 +101,118 @@ describe("stream-service: recording -> MediaAsset (regression: pg_advisory_xact_
 
     const rows = await prisma.mediaAsset.findMany({ where: { providerKey } });
     expect(rows).toHaveLength(1);
+  });
+});
+
+/**
+ * "Начать стрим" / "Завершить эфир" from a schedule event (2026-10-02). In this same file, not a
+ * separate one, on purpose: both suites drive the active practicum's stream target, and vitest
+ * runs files in parallel but tests within a file in order.
+ */
+describe("stream-service: broadcast started from a schedule event", () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const keys = [1, 2, 3].map((part) => `recordings/vitest-event-${suffix}-${part}.mp4`);
+  let practicumId: string;
+  let createdPracticumId: string | null = null;
+  let curatorId: string;
+  let eventId: string;
+  let originalTarget: { pendingStreamModuleId: string | null; pendingStreamScheduleEventId: string | null; pendingStreamMediaKind: MediaAssetKind | null; streamStartedById: string | null; streamStartedAt: Date | null };
+  let otherCuratorId: string;
+
+  beforeAll(async () => {
+    process.env.LIVEKIT_HOST ??= "http://127.0.0.1:1";
+    process.env.LIVEKIT_API_KEY ??= "vitest-placeholder";
+    process.env.LIVEKIT_API_SECRET ??= "vitest-placeholder";
+    const existing = await prisma.practicum.findFirst({ where: { isActive: true }, select: { id: true, pendingStreamModuleId: true, pendingStreamScheduleEventId: true, pendingStreamMediaKind: true, streamStartedById: true, streamStartedAt: true } });
+    if (existing) {
+      practicumId = existing.id;
+      originalTarget = { pendingStreamModuleId: existing.pendingStreamModuleId, pendingStreamScheduleEventId: existing.pendingStreamScheduleEventId, pendingStreamMediaKind: existing.pendingStreamMediaKind, streamStartedById: existing.streamStartedById, streamStartedAt: existing.streamStartedAt };
+    } else {
+      const created = await prisma.practicum.create({ data: { title: `Vitest event-stream fixture ${suffix}`, isActive: true } });
+      practicumId = created.id;
+      createdPracticumId = created.id;
+      originalTarget = { pendingStreamModuleId: null, pendingStreamScheduleEventId: null, pendingStreamMediaKind: null, streamStartedById: null, streamStartedAt: null };
+    }
+    curatorId = (await prisma.user.create({
+      data: { role: UserRole.CURATOR, status: UserStatus.ACTIVE, email: `vitest-stream-curator-${suffix}@example.com`, externalIdentities: { create: { provider: IdentityProvider.LOCAL, providerSubject: `vitest-stream-curator-${suffix}`, username: "vitest-stream-curator" } } },
+      select: { id: true },
+    })).id;
+    otherCuratorId = (await prisma.user.create({
+      data: { role: UserRole.CURATOR, status: UserStatus.ACTIVE, email: `vitest-stream-other-${suffix}@example.com`, externalIdentities: { create: { provider: IdentityProvider.LOCAL, providerSubject: `vitest-stream-other-${suffix}`, username: "vitest-other", displayName: "Другой куратор" } } },
+      select: { id: true },
+    })).id;
+    eventId = (await prisma.scheduleEvent.create({ data: { practicumId, type: ScheduleEventType.LECTURE, title: `Vitest лекция ${suffix}`, date: new Date(), time: "13:00 — 14:00", description: "fixture" }, select: { id: true } })).id;
+  });
+
+  afterAll(async () => {
+    await prisma.mediaAsset.deleteMany({ where: { providerKey: { in: keys } } });
+    await prisma.scheduleEvent.deleteMany({ where: { id: eventId } });
+    if (createdPracticumId) await prisma.practicum.delete({ where: { id: createdPracticumId } });
+    else await prisma.practicum.update({ where: { id: practicumId }, data: originalTarget });
+    await prisma.user.deleteMany({ where: { id: { in: [curatorId, otherCuratorId] } } });
+  });
+
+  function recording(key: string, startedSecondsAgo: number, endedSecondsAgo: number): WebhookEvent {
+    const nowNs = BigInt(Date.now()) * BigInt(1_000_000);
+    const info = {
+      egressId: `EG_vitest_${key}`,
+      roomName: LIVEKIT_ROOM_NAME,
+      status: EgressStatus.EGRESS_COMPLETE,
+      startedAt: nowNs - BigInt(startedSecondsAgo) * BigInt(1_000_000_000),
+      endedAt: nowNs - BigInt(endedSecondsAgo) * BigInt(1_000_000_000),
+      fileResults: [{ filename: key, size: BigInt(1_000) }],
+    } as unknown as EgressInfo;
+    return { event: "egress_ended", egressInfo: info } as unknown as WebhookEvent;
+  }
+
+  async function waitFor(key: string, timeoutMs = 3_000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const found = await prisma.mediaAsset.findFirst({ where: { providerKey: key }, select: { status: true, scheduleEventId: true, moduleId: true, title: true } });
+      if (found || Date.now() > deadline) return found;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  it("files the recording as a draft under the event and keeps the target for the rest of the broadcast", async () => {
+    await streamService.setStreamTarget(curatorId, { scheduleEventId: eventId });
+    await streamService.handleLiveKitWebhookEvent(recording(keys[0], 600, 300));
+    const first = await waitFor(keys[0]);
+    expect(first).toMatchObject({ status: MediaAssetStatus.DRAFT, scheduleEventId: eventId, moduleId: null });
+
+    // An OBS reconnect splits the recording — the second half must land on the same event.
+    const practicum = await prisma.practicum.findUnique({ where: { id: practicumId }, select: { pendingStreamScheduleEventId: true } });
+    expect(practicum?.pendingStreamScheduleEventId).toBe(eventId);
+    await streamService.handleLiveKitWebhookEvent(recording(keys[1], 290, 60));
+    expect(await waitFor(keys[1])).toMatchObject({ status: MediaAssetStatus.DRAFT, scheduleEventId: eventId });
+  });
+
+  it("'Завершить эфир' marks the event finished and detaches it; a recording finishing right after still lands on it", async () => {
+    await streamService.finishStream(curatorId, eventId);
+    const event = await prisma.scheduleEvent.findUnique({ where: { id: eventId }, select: { streamEndedAt: true } });
+    expect(event?.streamEndedAt).toBeInstanceOf(Date);
+    const practicum = await prisma.practicum.findUnique({ where: { id: practicumId }, select: { pendingStreamScheduleEventId: true } });
+    expect(practicum?.pendingStreamScheduleEventId).toBeNull();
+
+    // The streamer pressed "Завершить" before stopping OBS: this recording ends after the target is gone.
+    await streamService.handleLiveKitWebhookEvent(recording(keys[2], 50, 0));
+    expect(await waitFor(keys[2])).toMatchObject({ status: MediaAssetStatus.DRAFT, scheduleEventId: eventId });
+  });
+
+  it("starting the stream again from the same event clears its 'finished' mark", async () => {
+    await streamService.setStreamTarget(curatorId, { scheduleEventId: eventId });
+    const event = await prisma.scheduleEvent.findUnique({ where: { id: eventId }, select: { streamEndedAt: true } });
+    expect(event?.streamEndedAt).toBeNull();
+  });
+
+  it("remembers who pressed 'Начать стрим' — every other curator sees it, and 'Завершить эфир' clears it", async () => {
+    await streamService.setStreamTarget(otherCuratorId, { scheduleEventId: eventId });
+    const seenByOther = await streamService.getStreamTarget(otherCuratorId);
+    expect(seenByOther.host).toMatchObject({ name: "Другой куратор", isMe: true });
+    const seenByMe = await streamService.getStreamTarget(curatorId);
+    expect(seenByMe.host).toMatchObject({ name: "Другой куратор", isMe: false });
+
+    const afterFinish = await streamService.finishStream(curatorId, eventId);
+    expect(afterFinish.host).toBeNull();
   });
 });

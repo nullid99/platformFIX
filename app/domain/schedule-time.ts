@@ -34,6 +34,16 @@ export function zonedTimeToUtc(dateKey: string, hhmm: string, timeZone: string =
   return new Date(utcGuess - (asZoned - utcGuess));
 }
 
+/** "YYYY-MM-DD" calendar-date key for `date` as seen in `timeZone` — lets a booking date compare against "today" without off-by-one drift from the server's own UTC clock. */
+export function dateKeyInZone(date: Date, timeZone: string = EVENT_TIMEZONE): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
+/** Today's calendar-date key in `timeZone` — see dateKeyInZone. */
+export function todayDateKey(timeZone: string = EVENT_TIMEZONE): string {
+  return dateKeyInZone(new Date(), timeZone);
+}
+
 /** Formats a UTC instant as "DD.MM.YYYY HH:MM" wall-clock time in `timeZone` — e.g. auto-naming an unattached stream recording that has no lesson/event title to borrow. */
 export function formatZonedDateTime(date: Date, timeZone: string = EVENT_TIMEZONE): string {
   const formatter = new Intl.DateTimeFormat("en-GB", {

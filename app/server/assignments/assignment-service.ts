@@ -1,6 +1,9 @@
 import { Prisma } from "@/app/generated/prisma/client";
 import {
   AssignmentStatus,
+  DiscussionStatus,
+  EnrollmentStatus,
+  ModuleAccessStatus,
   StoredFileStatus,
   SubmissionStatus,
   UserRole,
@@ -10,8 +13,9 @@ import { prisma } from "@/app/server/db";
 import { AuthServiceError } from "@/app/server/auth";
 import { assignmentPrerequisiteGate, isModuleOpenForStudent, seedOpenModuleAccess } from "@/app/server/course/module-access";
 import { courseService } from "@/app/server/course/course-service";
-import { sendReviewNotification } from "@/app/server/notifications/email-service";
-import { activeStudentIds } from "@/app/server/notifications/recipient-service";
+import { getWorkingPracticumId, isPracticumCompleted } from "@/app/server/course/practicum-service";
+import { sendNewAssignmentNotification, sendNewSubmissionNotification, sendReviewNotification } from "@/app/server/notifications/email-service";
+import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { nextSubmissionStatus } from "./assignment-transition";
 
@@ -20,13 +24,19 @@ type AssignmentMaterialInput =
   | { kind: "FILE"; title: string; fileId: string };
 
 type AssignmentInput = {
-  moduleId: string;
+  moduleId?: string;
+  // Практическое задание: no lesson, no deadline, no requirements — see the type comment on
+  // Assignment.isPractice in schema.prisma for the full picture.
+  isPractice?: boolean;
   title: string;
   description: string;
   deadline?: string;
   requirements: string[];
   allowedFormats: string[];
   materials?: AssignmentMaterialInput[];
+  // "ДЗ без проверки" — see Assignment.reviewRequired in schema.prisma. Ignored for a practice
+  // assignment (never goes through this Submission-based flow either way).
+  reviewRequired?: boolean;
 };
 
 type SubmissionInput = {
@@ -214,6 +224,19 @@ function assignmentStatusFromSubmission(status: SubmissionStatus | undefined): "
   return "Не начато";
 }
 
+// No thread yet → nothing sent. NEW/WAITING → it's with the curator (student is waiting on a
+// reply, same as "На проверке" for a regular ДЗ). ANSWERED → the curator just replied, so it's
+// the student's turn again — shown as "Принято" (student replies → "На проверке", curator
+// replies → "Принято"; practice work deliberately has no "нужна доработка"/revision cycle, see
+// the feature's design, so that status never applies here). CLOSED only ever happens by the
+// student's own hand (see DiscussionService#close — a curator can't close a thread), so it lands
+// on the same "Принято" state rather than a distinct one nothing in the UI can trigger anyway.
+function practiceStatusFromDiscussion(status: DiscussionStatus | undefined): ReturnType<typeof assignmentStatusFromSubmission> {
+  if (status === DiscussionStatus.CLOSED || status === DiscussionStatus.ANSWERED) return "Принято";
+  if (status === DiscussionStatus.NEW || status === DiscussionStatus.WAITING) return "На проверке";
+  return "Не начато";
+}
+
 function toneFromStatus(status: ReturnType<typeof assignmentStatusFromSubmission>): "blue" | "amber" | "gray" {
   if (status === "Нужна доработка") return "amber";
   if (status === "Не начато") return "gray";
@@ -239,8 +262,27 @@ function latestSubmission<T extends { attempt: number }>(submissions: readonly T
 export class AssignmentService {
   public async listForStudent(studentId: string) {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
+    const enrollments = await prisma.enrollment.findMany({
+      where: { studentId, status: EnrollmentStatus.ACTIVE, OR: [{ accessUntil: null }, { accessUntil: { gt: new Date() } }] },
+      select: { practicumId: true },
+    });
+    const enrolledPracticumIds = enrollments.map((enrollment) => enrollment.practicumId);
+    // "Завершить поток" — completed practicums still fully populate this list (read access is
+    // untouched); toStudentDto just stamps practicumCompleted on each row so the submission
+    // form/"Выполнено" button can hide themselves. A student is normally enrolled in exactly one
+    // active practicum, but this stays a map rather than a single lookup for the (rare,
+    // historically buggy — see the double-enrollment fix) case where they're in more than one.
+    const practicumCompletionById = new Map(
+      (await prisma.practicum.findMany({ where: { id: { in: enrolledPracticumIds } }, select: { id: true, completedAt: true } }))
+        .map((practicum) => [practicum.id, Boolean(practicum.completedAt)] as const),
+    );
     const assignments = await prisma.assignment.findMany({
-      where: { status: AssignmentStatus.PUBLISHED },
+      where: {
+        status: AssignmentStatus.PUBLISHED,
+        // A regular assignment is still module-gated below; a practice assignment has no module
+        // to gate on, so eligibility is just "enrolled and active in the targeted practicum."
+        OR: [{ isPractice: false }, { isPractice: true, practicumId: { in: enrolledPracticumIds } }],
+      },
       orderBy: { createdAt: "desc" },
       include: {
         module: { select: { title: true, position: true, coverPath: true, practicumId: true } },
@@ -255,29 +297,69 @@ export class AssignmentService {
         materials: { orderBy: { position: "asc" } },
       },
     });
+    const regularAssignments = assignments.filter((assignment) => !assignment.isPractice);
+    const practiceAssignments = assignments.filter((assignment) => assignment.isPractice);
+
     // A module can hold several assignments (or a stream, or nothing) — completion is a
     // curator's explicit call (markModuleCompletedForStudent), so each assignment still
     // needs its own gate check against the module before it, not just "is the module open."
     const gateCache = new Map<string, string | null>();
     const openCache = new Map<string, boolean>();
-    const orderedAssignments = [...assignments].sort((left, right) => {
+    const orderedAssignments = [...regularAssignments].sort((left, right) => {
       const leftStatus = assignmentStatusFromSubmission(latestSubmission(left.submissions)?.status);
       const rightStatus = assignmentStatusFromSubmission(latestSubmission(right.submissions)?.status);
       const priorityDiff = ASSIGNMENT_STATUS_PRIORITY[leftStatus] - ASSIGNMENT_STATUS_PRIORITY[rightStatus];
-      return priorityDiff !== 0 ? priorityDiff : left.module.position - right.module.position;
+      return priorityDiff !== 0 ? priorityDiff : left.module!.position - right.module!.position;
     });
-    const results = await Promise.all(orderedAssignments.map(async (assignment) => {
-      if (!openCache.has(assignment.moduleId)) {
-        openCache.set(assignment.moduleId, await isModuleOpenForStudent(prisma, studentId, assignment.module.practicumId, assignment.moduleId));
+    const regularResults = await Promise.all(orderedAssignments.map(async (assignment) => {
+      if (!openCache.has(assignment.moduleId!)) {
+        openCache.set(assignment.moduleId!, await isModuleOpenForStudent(prisma, studentId, assignment.module!.practicumId, assignment.moduleId!));
       }
-      if (!openCache.get(assignment.moduleId)) return null;
-      const cacheKey = `${assignment.module.practicumId}:${assignment.module.position}`;
+      if (!openCache.get(assignment.moduleId!)) return null;
+      const cacheKey = `${assignment.module!.practicumId}:${assignment.module!.position}`;
       if (!gateCache.has(cacheKey)) {
-        gateCache.set(cacheKey, await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position));
+        gateCache.set(cacheKey, await assignmentPrerequisiteGate(prisma, studentId, assignment.module!.practicumId, assignment.module!.position));
       }
-      return this.toStudentDto(assignment, gateCache.get(cacheKey) ?? null);
+      return this.toStudentDto(assignment, gateCache.get(cacheKey) ?? null, undefined, undefined, practicumCompletionById.get(assignment.module!.practicumId) ?? false);
     }));
-    return results.filter((item): item is NonNullable<typeof item> => item !== null);
+
+    const practiceResults = await this.attachDiscussionStatus(studentId, practiceAssignments, practicumCompletionById);
+    // Theory (already ordered by priority/module position) then practice (recency order,
+    // see attachDiscussionStatus) is the right relative order for everything still active —
+    // but "Принято" (done, either kind) still needs to sink below all of that, not just below
+    // the theory ones. A stable sort on "is this Принято" alone moves only the accepted items
+    // down, without disturbing the two groups' own already-correct internal order.
+    const combined = [...regularResults.filter((item): item is NonNullable<typeof item> => item !== null), ...practiceResults];
+    return combined.sort((left, right) => Number(left.status === "Принято") - Number(right.status === "Принято"));
+  }
+
+  // Most-recently-created first (already the query's orderBy) — there's no module position or
+  // Submission-derived status to sort by, unlike the regular-assignment gate loop above.
+  private async attachDiscussionStatus(studentId: string, assignments: readonly AssignmentWithRelations[], practicumCompletionById: ReadonlyMap<string, boolean>) {
+    if (assignments.length === 0) return [];
+    const threads = await prisma.discussionThread.findMany({
+      where: { studentId, assignmentId: { in: assignments.map((assignment) => assignment.id) } },
+      orderBy: { lastMessageAt: "desc" },
+      select: {
+        assignmentId: true,
+        status: true,
+        // Surfaced on the assignment card itself so a status change (e.g. "Принято" after the
+        // curator replies) doesn't leave the student wondering what was actually said without
+        // clicking through into the discussion thread separately.
+        messages: { orderBy: { createdAt: "desc" }, take: 1, select: { body: true, authorId: true, createdAt: true } },
+      },
+    });
+    const statusByAssignment = new Map<string, DiscussionStatus>();
+    const lastMessageByAssignment = new Map<string, { text: string; fromCurator: boolean; createdAt: Date }>();
+    for (const thread of threads) {
+      if (!thread.assignmentId) continue;
+      if (!statusByAssignment.has(thread.assignmentId)) statusByAssignment.set(thread.assignmentId, thread.status);
+      const latestMessage = thread.messages[0];
+      if (latestMessage && !lastMessageByAssignment.has(thread.assignmentId)) {
+        lastMessageByAssignment.set(thread.assignmentId, { text: latestMessage.body, fromCurator: latestMessage.authorId !== studentId, createdAt: latestMessage.createdAt });
+      }
+    }
+    return assignments.map((assignment) => this.toStudentDto(assignment, null, statusByAssignment.get(assignment.id), lastMessageByAssignment.get(assignment.id) ?? null, practicumCompletionById.get(assignment.practicumId) ?? false));
   }
 
   public async listForCurator(actorId: string) {
@@ -307,19 +389,31 @@ export class AssignmentService {
     const normalized = this.normalizeAssignmentInput(input);
 
     const assignment = await prisma.$transaction(async (tx) => {
-      const courseModule = await tx.module.findUnique({ where: { id: normalized.moduleId }, select: { id: true, practicumId: true } });
-      if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
-      const practicum = await tx.practicum.findUnique({ where: { id: courseModule.practicumId } });
+      let practicumId: string;
+      let moduleId: string | null = null;
+      if (normalized.isPractice) {
+        practicumId = (await getWorkingPracticumId(actorId)) ?? "";
+        if (!practicumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
+      } else {
+        const courseModule = await tx.module.findUnique({ where: { id: normalized.moduleId }, select: { id: true, practicumId: true } });
+        if (!courseModule) throw new AuthServiceError("INVALID_INPUT", "Module does not exist");
+        practicumId = courseModule.practicumId;
+        moduleId = courseModule.id;
+      }
+      const practicum = await tx.practicum.findUnique({ where: { id: practicumId } });
       if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
       const created = await tx.assignment.create({
         data: {
-          moduleId: courseModule.id,
+          moduleId,
+          practicumId: practicum.id,
+          isPractice: normalized.isPractice,
           title: normalized.title,
           description: normalized.description,
           requirements: normalized.requirements as Prisma.InputJsonValue,
           allowedFormats: normalized.allowedFormats as Prisma.InputJsonValue,
           deadline: normalized.deadline,
           status: AssignmentStatus.PUBLISHED,
+          reviewRequired: normalized.reviewRequired,
         },
       });
 
@@ -338,15 +432,20 @@ export class AssignmentService {
         }) });
       }
 
-      const students = await tx.user.findMany({ where: { role: UserRole.STUDENT, status: UserStatus.ACTIVE }, select: { id: true } });
-      for (const student of students) {
-        const studentEnrollment = await tx.enrollment.upsert({
-          where: { studentId_practicumId: { studentId: student.id, practicumId: practicum.id } },
-          update: {},
-          create: { studentId: student.id, practicumId: practicum.id },
+      // Practice assignments aren't gated behind a module, so there's no per-module access to
+      // seed for them — every active student in the practicum already sees it via listForStudent.
+      // Only students already in *this* поток: the old version upserted an Enrollment for every
+      // active student on the platform, so creating one ДЗ on 2026-10-01 silently pulled two
+      // students from a finished test cohort into the current one (with no real course access).
+      // Joining a поток happens only through an invitation or the owner's role switch.
+      if (!normalized.isPractice) {
+        const enrollments = await tx.enrollment.findMany({
+          where: { practicumId: practicum.id, status: EnrollmentStatus.ACTIVE, student: { role: UserRole.STUDENT, status: UserStatus.ACTIVE } },
           select: { id: true },
         });
-        await seedOpenModuleAccess(tx, studentEnrollment.id, practicum.id);
+        for (const enrollment of enrollments) {
+          await seedOpenModuleAccess(tx, enrollment.id, practicum.id);
+        }
       }
       return created.id;
     });
@@ -364,21 +463,33 @@ export class AssignmentService {
         materials: { orderBy: { position: "asc" } },
       },
     });
-    // Bell only, deliberately no email — see email-service.ts's curated list. Notifying a
-    // student about an assignment sitting behind a module they haven't unlocked yet produces
-    // exactly "the notification arrived but the item isn't in my list" — listForStudent hides
-    // the same assignment under this same isModuleOpenForStudent check, so this makes the two
-    // agree on who's actually told about it.
-    void (async () => {
-      const candidateIds = await activeStudentIds(created.module.practicumId);
-      const openChecks = await Promise.all(candidateIds.map(async (studentId) => ({
-        studentId,
-        open: await isModuleOpenForStudent(prisma, studentId, created.module.practicumId, created.moduleId),
-      })));
-      const notifiableIds = openChecks.filter((entry) => entry.open).map((entry) => entry.studentId);
-      if (notifiableIds.length === 0) return;
-      await notificationService.createMany(notifiableIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.module.title, created.id);
-    })().catch((error: unknown) => console.error("Assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    if (created.isPractice) {
+      // Bell + EMAIL, unlike a regular assignment below — a practice assignment is never hidden
+      // behind a module lock, so there's no "notification arrived but the item isn't in my list"
+      // risk, and email is exactly right for a heads-up about backtest/pre-session work to do
+      // while waiting on the group (see the explicit ask that started this feature).
+      void (async () => {
+        const [studentIds, emails] = await Promise.all([activeStudentIds(created.practicumId), activeStudentEmails(created.practicumId)]);
+        if (studentIds.length > 0) await notificationService.createMany(studentIds, "NEW_ASSIGNMENT", `Практическое задание: ${created.title}`, undefined, created.id);
+        await Promise.all(emails.map((email) => sendNewAssignmentNotification({ to: email, assignmentTitle: created.title, assignmentId: created.id })));
+      })().catch((error: unknown) => console.error("Practice assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    } else {
+      // Bell only, deliberately no email — see email-service.ts's curated list. Notifying a
+      // student about an assignment sitting behind a module they haven't unlocked yet produces
+      // exactly "the notification arrived but the item isn't in my list" — listForStudent hides
+      // the same assignment under this same isModuleOpenForStudent check, so this makes the two
+      // agree on who's actually told about it.
+      void (async () => {
+        const candidateIds = await activeStudentIds(created.module!.practicumId);
+        const openChecks = await Promise.all(candidateIds.map(async (studentId) => ({
+          studentId,
+          open: await isModuleOpenForStudent(prisma, studentId, created.module!.practicumId, created.moduleId!),
+        })));
+        const notifiableIds = openChecks.filter((entry) => entry.open).map((entry) => entry.studentId);
+        if (notifiableIds.length === 0) return;
+        await notificationService.createMany(notifiableIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.module!.title, created.id);
+      })().catch((error: unknown) => console.error("Assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    }
     return this.toStudentDto(created);
   }
 
@@ -392,6 +503,7 @@ export class AssignmentService {
     if (input.deadline !== undefined) data.deadline = parseDate(input.deadline);
     if (input.requirements !== undefined) data.requirements = normalizeRequirements(input.requirements) as Prisma.InputJsonValue;
     if (input.allowedFormats !== undefined) data.allowedFormats = normalizeFormats(input.allowedFormats) as Prisma.InputJsonValue;
+    if (input.reviewRequired !== undefined) data.reviewRequired = input.reviewRequired;
     const normalizedMaterials = input.materials === undefined ? undefined : normalizeMaterials(input.materials);
     const updated = await prisma.$transaction(async (tx) => {
       if (normalizedMaterials !== undefined) {
@@ -417,15 +529,51 @@ export class AssignmentService {
     await this.assertCurator(actorId);
     const result = await prisma.assignment.updateMany({ where: { id: assignmentId, status: { not: AssignmentStatus.ARCHIVED } }, data: { status: AssignmentStatus.ARCHIVED } });
     if (result.count !== 1) throw new AuthServiceError("INVALID_INPUT", "Assignment does not exist");
+
+    // decide() below only re-checks "is every assignment in this module now accepted" at the
+    // moment a submission gets accepted — it never re-fires on its own afterwards. A student
+    // blocked solely by THIS assignment (already-accepted everywhere else in the module) would
+    // otherwise stay stuck behind the "Сначала сдайте ДЗ модуля X" gate forever, even though the
+    // assignment that was supposedly missing no longer exists.
+    void this.recheckModuleCompletionAfterArchive(actorId, assignmentId)
+      .catch((error: unknown) => console.error("Module completion recheck after archive failed", error instanceof Error ? error.message : "unknown error"));
+  }
+
+  private async recheckModuleCompletionAfterArchive(actorId: string, assignmentId: string): Promise<void> {
+    const assignment = await prisma.assignment.findUnique({
+      where: { id: assignmentId },
+      select: { moduleId: true, module: { select: { practicumId: true } } },
+    });
+    if (!assignment || !assignment.module || !assignment.moduleId) return;
+    const { moduleId } = assignment;
+    const { practicumId } = assignment.module;
+
+    const moduleAssignments = await prisma.assignment.findMany({ where: { moduleId, status: AssignmentStatus.PUBLISHED }, select: { id: true } });
+    if (moduleAssignments.length === 0) return;
+
+    const enrollments = await prisma.enrollment.findMany({ where: { practicumId, status: EnrollmentStatus.ACTIVE }, select: { id: true, studentId: true } });
+    for (const enrollment of enrollments) {
+      const access = await prisma.enrollmentModuleAccess.findUnique({ where: { enrollmentId_moduleId: { enrollmentId: enrollment.id, moduleId } }, select: { status: true } });
+      if (access?.status === ModuleAccessStatus.COMPLETED) continue;
+      const latestStatuses = await Promise.all(moduleAssignments.map((moduleAssignment) => prisma.submission.findFirst({ where: { assignmentId: moduleAssignment.id, studentId: enrollment.studentId }, orderBy: { attempt: "desc" }, select: { status: true } })));
+      if (!latestStatuses.every((submission) => submission?.status === SubmissionStatus.ACCEPTED)) continue;
+      await courseService.markModuleCompletedForStudent(actorId, enrollment.studentId, moduleId);
+    }
   }
 
   public async submit(studentId: string, assignmentId: string, input: SubmissionInput) {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
     const assignment = await prisma.assignment.findFirst({
       where: { id: assignmentId, status: AssignmentStatus.PUBLISHED },
-      select: { id: true, moduleId: true, module: { select: { position: true, practicumId: true } } },
+      select: { id: true, title: true, moduleId: true, reviewRequired: true, module: { select: { position: true, practicumId: true } } },
     });
-    if (!assignment) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
+    // A practice assignment has no module — it's answered through its linked DiscussionThread
+    // (see DiscussionService#create) instead of this formal submission flow.
+    if (!assignment || !assignment.module || !assignment.moduleId) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
+    if (await isPracticumCompleted(assignment.module.practicumId)) throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — отправка домашних заданий больше не доступна.");
+    // A "ДЗ без проверки" assignment only ever goes through completeWithoutReview below —
+    // this path is for the normal curator-reviewed form the student no longer sees for it.
+    if (!assignment.reviewRequired) throw new AuthServiceError("INVALID_INPUT", "Assignment does not require a submission");
     if (!(await isModuleOpenForStudent(prisma, studentId, assignment.module.practicumId, assignment.moduleId))) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
     const blockedByModuleTitle = await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position);
     if (blockedByModuleTitle) throw new AuthServiceError("INVALID_INPUT", `Сначала нужно сдать ДЗ модуля «${blockedByModuleTitle}»`);
@@ -451,8 +599,8 @@ export class AssignmentService {
     // again. A first-time submission (no previous reviewer) still starts unclaimed.
     const carriedReviewerId = previous?.status === SubmissionStatus.NEEDS_REVISION ? previous.reviewerId : null;
 
-    return prisma.$transaction(async (tx) => {
-      const submission = await tx.submission.create({
+    const submission = await prisma.$transaction(async (tx) => {
+      const created = await tx.submission.create({
         data: {
           assignmentId,
           studentId,
@@ -466,9 +614,73 @@ export class AssignmentService {
         },
         select: { id: true, attempt: true, status: true, submittedAt: true },
       });
-      if (fileIds.length > 0) await tx.submissionAttachment.createMany({ data: fileIds.map((fileId, position) => ({ submissionId: submission.id, fileId, position })) });
-      return submission;
+      if (fileIds.length > 0) await tx.submissionAttachment.createMany({ data: fileIds.map((fileId, position) => ({ submissionId: created.id, fileId, position })) });
+      return created;
     });
+    // Only for a genuinely new, unclaimed submission — a revision resubmission goes straight back
+    // to the same reviewer (carriedReviewerId above) who already knows about it from having sent
+    // it back, so broadcasting to every curator here would just be noise.
+    if (!carriedReviewerId) {
+      void this.notifyStaffOfNewSubmission(studentId, assignmentId, assignment.title)
+        .catch((error: unknown) => console.error("New submission notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    }
+    return submission;
+  }
+
+  /**
+   * The "Выполнено" button on a "ДЗ без проверки" assignment — creates an already-ACCEPTED
+   * Submission directly, with no curator involved, then runs the same "did every assignment in
+   * this module just get accepted" check decide() runs after a curator's accept, so a
+   * homework-less lesson can still unlock the next one. See Assignment.reviewRequired.
+   */
+  public async completeWithoutReview(studentId: string, assignmentId: string) {
+    await this.assertActiveUser(studentId, UserRole.STUDENT);
+    const assignment = await prisma.assignment.findFirst({
+      where: { id: assignmentId, status: AssignmentStatus.PUBLISHED, isPractice: false },
+      select: { id: true, moduleId: true, reviewRequired: true, module: { select: { position: true, practicumId: true } } },
+    });
+    if (!assignment || !assignment.module || !assignment.moduleId) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
+    if (await isPracticumCompleted(assignment.module.practicumId)) throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — отправка домашних заданий больше не доступна.");
+    if (assignment.reviewRequired) throw new AuthServiceError("INVALID_INPUT", "Assignment requires review");
+    if (!(await isModuleOpenForStudent(prisma, studentId, assignment.module.practicumId, assignment.moduleId))) throw new AuthServiceError("INVALID_INPUT", "Assignment is not available");
+    const blockedByModuleTitle = await assignmentPrerequisiteGate(prisma, studentId, assignment.module.practicumId, assignment.module.position);
+    if (blockedByModuleTitle) throw new AuthServiceError("INVALID_INPUT", `Сначала нужно сдать ДЗ модуля «${blockedByModuleTitle}»`);
+
+    const moduleId = assignment.moduleId;
+    const previous = await prisma.submission.findFirst({ where: { assignmentId, studentId }, orderBy: { attempt: "desc" }, select: { id: true, attempt: true, status: true, submittedAt: true } });
+    // Idempotent replay (double-click, stale tab retry) — nothing new to do, just hand back what's there.
+    if (previous?.status === SubmissionStatus.ACCEPTED) return previous;
+    const attempt = (previous?.attempt ?? 0) + 1;
+    const submission = await prisma.submission.create({
+      data: { assignmentId, studentId, attempt, status: SubmissionStatus.ACCEPTED, submittedAt: new Date() },
+      select: { id: true, attempt: true, status: true, submittedAt: true },
+    });
+
+    // Mirrors decide()'s post-accept auto-completion below — this assignment just became
+    // ACCEPTED without a curator ever deciding it, so the same "is every assignment in the
+    // module now accepted" check needs to run here too.
+    void (async () => {
+      const moduleAssignments = await prisma.assignment.findMany({ where: { moduleId, status: AssignmentStatus.PUBLISHED }, select: { id: true } });
+      if (moduleAssignments.length === 0) return;
+      const latestStatuses = await Promise.all(moduleAssignments.map((moduleAssignment) => prisma.submission.findFirst({ where: { assignmentId: moduleAssignment.id, studentId }, orderBy: { attempt: "desc" }, select: { status: true } })));
+      if (!latestStatuses.every((entry) => entry?.status === SubmissionStatus.ACCEPTED)) return;
+      await courseService.completeModuleForStudent(studentId, moduleId);
+    })().catch((error: unknown) => console.error("Auto module completion (no-review) failed", error instanceof Error ? error.message : "unknown error"));
+
+    return submission;
+  }
+
+  private async notifyStaffOfNewSubmission(studentId: string, assignmentId: string, assignmentTitle: string): Promise<void> {
+    const [student, staff] = await Promise.all([
+      prisma.user.findUnique({ where: { id: studentId }, select: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1, select: { displayName: true, username: true } } } }),
+      prisma.user.findMany({ where: { role: { in: [UserRole.CURATOR, UserRole.OWNER] }, status: UserStatus.ACTIVE }, select: { id: true, email: true, notifyNewSubmission: true } }),
+    ]);
+    if (staff.length === 0) return;
+    const studentName = student?.externalIdentities[0]?.displayName ?? student?.externalIdentities[0]?.username ?? "Ученик";
+    await Promise.all(staff.map((recipient) => notificationService.create(recipient.id, "NEW_SUBMISSION", `Новая работа на проверку: ${assignmentTitle}`, studentName, assignmentId)));
+    await Promise.all(staff.flatMap((recipient) => recipient.email && recipient.notifyNewSubmission
+      ? [sendNewSubmissionNotification({ to: recipient.email, assignmentTitle, studentName, assignmentId })]
+      : []));
   }
 
   public async listQueue(actorId: string) {
@@ -582,7 +794,9 @@ export class AssignmentService {
           ...attempt,
           assignmentId: submission.assignmentId,
           title: submission.assignment.title,
-          module: `${String(submission.assignment.module.position).padStart(2, "0")} · ${submission.assignment.module.title}`,
+          // Same invariant as toQueueDto above — a Submission only ever belongs to a
+          // regular assignment, which always has a module.
+          module: `${String(submission.assignment.module!.position).padStart(2, "0")} · ${submission.assignment.module!.title}`,
           attempts: [attempt],
         });
         continue;
@@ -658,13 +872,14 @@ export class AssignmentService {
       // module counts as done and the next module unlocks for them, same as a curator
       // clicking "Урок пройден" by hand. Matches what the "Сначала сдайте ДЗ урока X" gate
       // message on the locked next assignment actually promises.
-      if (decision === "accepted") {
+      if (decision === "accepted" && result.moduleId) {
+        const moduleId = result.moduleId;
         void (async () => {
-          const moduleAssignments = await prisma.assignment.findMany({ where: { moduleId: result.moduleId, status: AssignmentStatus.PUBLISHED }, select: { id: true } });
+          const moduleAssignments = await prisma.assignment.findMany({ where: { moduleId, status: AssignmentStatus.PUBLISHED }, select: { id: true } });
           if (moduleAssignments.length === 0) return;
           const latestStatuses = await Promise.all(moduleAssignments.map((moduleAssignment) => prisma.submission.findFirst({ where: { assignmentId: moduleAssignment.id, studentId: result.studentId }, orderBy: { attempt: "desc" }, select: { status: true } })));
           if (!latestStatuses.every((submission) => submission?.status === SubmissionStatus.ACCEPTED)) return;
-          await courseService.markModuleCompletedForStudent(actorId, result.studentId, result.moduleId);
+          await courseService.markModuleCompletedForStudent(actorId, result.studentId, moduleId);
         })().catch((error: unknown) => console.error("Auto module completion failed", error instanceof Error ? error.message : "unknown error"));
       }
       return { id: result.id, status: result.status };
@@ -675,14 +890,17 @@ export class AssignmentService {
   }
 
   private normalizeAssignmentInput(input: AssignmentInput) {
+    const isPractice = input.isPractice === true;
     return {
-      moduleId: requiredText(input.moduleId, "moduleId", 100),
+      isPractice,
+      moduleId: isPractice ? undefined : requiredText(input.moduleId ?? "", "moduleId", 100),
       title: requiredText(input.title, "title"),
       description: requiredText(input.description, "description", MAX_TEXT_LENGTH),
-      deadline: parseDate(input.deadline),
-      requirements: normalizeRequirements(input.requirements),
-      allowedFormats: normalizeFormats(input.allowedFormats),
+      deadline: isPractice ? undefined : parseDate(input.deadline),
+      requirements: isPractice ? [] : normalizeRequirements(input.requirements),
+      allowedFormats: isPractice ? [] : normalizeFormats(input.allowedFormats),
       materials: normalizeMaterials(input.materials),
+      reviewRequired: input.reviewRequired !== false,
     };
   }
 
@@ -697,14 +915,26 @@ export class AssignmentService {
     if (!user || user.status !== UserStatus.ACTIVE || user.role !== role) throw new AuthServiceError("FORBIDDEN", "Student access required");
   }
 
-  private toStudentDto(assignment: AssignmentWithRelations, blockedByModuleTitle: string | null = null) {
+  private toStudentDto(assignment: AssignmentWithRelations, blockedByModuleTitle: string | null = null, discussionStatus?: DiscussionStatus, lastMessage?: { text: string; fromCurator: boolean; createdAt: Date } | null, practicumCompleted = false) {
     const latest = latestSubmission(assignment.submissions ?? []);
-    const status = assignmentStatusFromSubmission(latest?.status);
+    // A practice assignment never gets a Submission row (see submit()) — its "status" instead
+    // tracks whose turn it is in the linked DiscussionThread (see DiscussionService#reply).
+    const status = assignment.isPractice ? practiceStatusFromDiscussion(discussionStatus) : assignmentStatusFromSubmission(latest?.status);
     return {
       id: assignment.id,
       title: assignment.title,
-      module: `${String(assignment.module.position).padStart(2, "0")} · ${assignment.module.title}`,
-      coverPath: assignment.module.coverPath,
+      isPractice: assignment.isPractice,
+      // "Завершить поток" — read access to everything below stays; the submit form/"Выполнено"
+      // button just hide behind this. See practicum-service.ts#isPracticumCompleted.
+      practicumCompleted,
+      // "Выполнено" button vs. the normal submission form — see AssignmentService#completeWithoutReview.
+      // Always true for a practice assignment (irrelevant there; it never uses this DTO's submission flow).
+      reviewRequired: assignment.reviewRequired,
+      // Practice-only — the latest message in the linked DiscussionThread, so the card can show
+      // what was actually said without a click-through. Always null for a regular assignment.
+      lastMessage: lastMessage ? { text: lastMessage.text, fromCurator: lastMessage.fromCurator, createdAt: lastMessage.createdAt } : null,
+      module: assignment.module ? `${String(assignment.module.position).padStart(2, "0")} · ${assignment.module.title}` : "Практическое задание",
+      coverPath: assignment.module?.coverPath ?? null,
       status,
       blockedByModuleTitle,
       tone: toneFromStatus(status),
@@ -743,7 +973,10 @@ export class AssignmentService {
     };
   }
 
-  private toQueueDto(submission: Awaited<ReturnType<typeof prisma.submission.findFirst>> & { assignment: { title: string; requirements: unknown; module: { title: string; position: number; coverPath: string | null } }; student: { externalIdentities: Array<{ displayName: string | null; username: string | null; avatarUrl: string | null; provider: string }> }; reviewer: { id: string; email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null; fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>; checkedRequirements?: Prisma.JsonValue }, attemptHistory: readonly QueueAttempt[], actorId: string) {
+  // Submissions only ever exist for regular (non-practice) assignments — see submit()'s explicit
+  // rejection of practice ones — so assignment.module is null here only in the type system, never
+  // in practice; the "!" below reflects that invariant rather than asserting past a real gap.
+  private toQueueDto(submission: Awaited<ReturnType<typeof prisma.submission.findFirst>> & { assignment: { title: string; requirements: unknown; reviewRequired: boolean; module: { title: string; position: number; coverPath: string | null } | null }; student: { isAdvanced: boolean; externalIdentities: Array<{ displayName: string | null; username: string | null; avatarUrl: string | null; provider: string }> }; reviewer: { id: string; email: string | null; externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null; fileAttachments: Array<{ file: { id: string; originalName: string; mimeType: string; byteSize: number } }>; checkedRequirements?: Prisma.JsonValue }, attemptHistory: readonly QueueAttempt[], actorId: string) {
     const identity = submission.student.externalIdentities[0];
     const studentName = identity?.displayName ?? identity?.username ?? "Ученик";
     // Curators recognize students by face faster than by initials once a cohort grows past a
@@ -761,10 +994,11 @@ export class AssignmentService {
       studentName,
       studentInitials: studentName.slice(0, 2).toUpperCase(),
       studentAvatarUrl,
+      studentIsAdvanced: submission.student.isAdvanced,
       assignmentTitle: submission.assignment.title,
       requirements: getRequirements(submission.assignment.requirements as Prisma.JsonValue),
-      module: `${String(submission.assignment.module.position).padStart(2, "0")} · ${submission.assignment.module.title}`,
-      coverPath: submission.assignment.module.coverPath,
+      module: `${String(submission.assignment.module!.position).padStart(2, "0")} · ${submission.assignment.module!.title}`,
+      coverPath: submission.assignment.module!.coverPath,
       status,
       tone: toneFromStatus(status),
       submittedAt: submission.submittedAt ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(submission.submittedAt) : "Без даты",
@@ -787,6 +1021,12 @@ export class AssignmentService {
       // has this claimed — the server already rejects the decide()/claim() call in that
       // case, but the button used to stay clickable and just fail after a round trip.
       isReviewerSelf: reviewerId === null || reviewerId === actorId,
+      // "Проверено вами" counts only work this curator actually accepted. A "ДЗ без проверки"
+      // the student completed themselves is ACCEPTED with no reviewer at all, and the
+      // isReviewerSelf above (null counts as "self" so an unclaimed item stays actionable) used
+      // to credit every one of those to whoever was looking at the dashboard (2026-10-01).
+      reviewedByMe: reviewerId === actorId,
+      selfCompleted: submission.status === SubmissionStatus.ACCEPTED && reviewerId === null && !submission.assignment.reviewRequired,
       claimedAt: submission.claimedAt,
       checkedRequirements: Array.isArray(submission.checkedRequirements) ? (submission.checkedRequirements as string[]) : null,
       progress: "—",

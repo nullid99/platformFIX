@@ -80,6 +80,21 @@ export class SecurityController {
     }
   }
 
+  @Patch(":studentId/advanced")
+  public async updateStudentAdvanced(
+    @Req() request: RequestWithCookies,
+    @Param("studentId") studentId: string,
+    @Body() body: { isAdvanced?: unknown },
+  ) {
+    const session = await this.requireSession(request);
+    const isAdvanced = body.isAdvanced === true;
+    try {
+      return { data: { isAdvanced: await authService.setStudentAdvanced(session.userId, studentId, isAdvanced) } };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
   @Get(":studentId/assignments")
   public async getStudentAssignments(@Req() request: RequestWithCookies, @Param("studentId") studentId: string) {
     const session = await this.requireSession(request);
@@ -250,6 +265,30 @@ export class TeamSecurityController {
     const session = await this.requireSession(request);
     try {
       return { data: await authService.getTeamMemberSecurityOverview(session.userId, memberId) };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  /** Owner-only — promotes a curator to a full, undifferentiated owner. See auth-service.ts#grantOwnerRole. */
+  @Post(":memberId/grant-owner")
+  public async grantOwner(@Req() request: RequestWithCookies, @Param("memberId") memberId: string) {
+    const session = await this.requireSession(request);
+    if (session.role !== UserRole.OWNER) throw new ForbiddenException("Owner access required");
+    try {
+      return { data: await authService.grantOwnerRole(session.userId, memberId) };
+    } catch (error) {
+      mapSecurityError(error);
+    }
+  }
+
+  /** Owner-only — demotes another owner back to curator. See auth-service.ts#revokeOwnerRole for the three guards (self, protected owner, last remaining owner). */
+  @Post(":memberId/revoke-owner")
+  public async revokeOwner(@Req() request: RequestWithCookies, @Param("memberId") memberId: string) {
+    const session = await this.requireSession(request);
+    if (session.role !== UserRole.OWNER) throw new ForbiddenException("Owner access required");
+    try {
+      return { data: await authService.revokeOwnerRole(session.userId, memberId) };
     } catch (error) {
       mapSecurityError(error);
     }

@@ -5,7 +5,9 @@ import { prisma } from "@/app/server/db";
 import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { sendNewEventNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
-import { getWorkingPracticumId } from "@/app/server/course/practicum-service";
+import { getWorkingPracticumId, isPracticumCompleted } from "@/app/server/course/practicum-service";
+import { dateKeyInZone, todayDateKey } from "@/app/domain/schedule-time";
+import { fileService } from "@/app/server/files";
 
 export type ScheduleEventInput = {
   type: ScheduleEventType;
@@ -15,6 +17,9 @@ export type ScheduleEventInput = {
   description: string;
   live?: boolean;
   coverPath?: string;
+  // A freshly-uploaded one-off cover (see ScheduleEventForm's file picker) — set once the event
+  // row itself exists (create()/update() both handle that ordering), overriding `coverPath`.
+  coverFileId?: string;
 };
 
 const eventTypeLabels: Record<ScheduleEventType, string> = {
@@ -103,7 +108,7 @@ export class ScheduleService {
     const [events, limits] = await Promise.all([
       prisma.scheduleEvent.findMany({
         where: { practicumId },
-        orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+        orderBy: [{ date: "asc" }, { time: "asc" }],
         include: {
           mediaAssets: { where: user.role === UserRole.STUDENT ? { status: MediaAssetStatus.PUBLISHED } : undefined, orderBy: [{ position: "asc" }, { createdAt: "asc" }] },
           bookedBy: { include: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1 } } },
@@ -118,10 +123,16 @@ export class ScheduleService {
     await this.assertActiveUser(actorId, UserRole.STUDENT);
     try {
       const { event, limits } = await prisma.$transaction(async (tx) => {
-        const current = await tx.scheduleEvent.findUnique({ where: { id: eventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true } });
+        const current = await tx.scheduleEvent.findUnique({ where: { id: eventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true, date: true } });
         if (!current) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+        if (await isPracticumCompleted(current.practicumId, tx)) throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — новые записи уже не забронировать.");
         if (!BOOKABLE_TYPES.has(current.type)) throw new AuthServiceError("INVALID_INPUT", "This event type cannot be booked");
         if (current.bookedByStudentId) throw new AuthServiceError("AUTH_CONFLICT", "This slot is already booked");
+        // A student can only self-serve today's or future slots — a past date is locked and can
+        // only be released by a curator (from the student's card), same reasoning as cancelBooking
+        // below: otherwise a finished slot could be un-booked after the fact to reclaim it against
+        // the per-type limit.
+        if (dateKeyInZone(current.date) < todayDateKey()) throw new AuthServiceError("INVALID_INPUT", "This slot is in the past and can no longer be booked");
         const practicum = await tx.practicum.findUnique({ where: { id: current.practicumId }, select: { backtestSlotLimit: true, preSessionSlotLimit: true } });
         const limits: BookingLimits = { backtestSlotLimit: practicum?.backtestSlotLimit ?? 1, preSessionSlotLimit: practicum?.preSessionSlotLimit ?? 1 };
         const limit = slotLimitForType(current.type, limits) ?? 0;
@@ -153,12 +164,18 @@ export class ScheduleService {
   public async cancelBooking(actorId: string, eventId: string) {
     const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, status: true } });
     if (!actor || actor.status !== UserStatus.ACTIVE) throw new AuthServiceError("SESSION_INVALID", "User is not active");
-    const current = await prisma.scheduleEvent.findUnique({ where: { id: eventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true } });
+    const current = await prisma.scheduleEvent.findUnique({ where: { id: eventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true, date: true } });
     if (!current) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
     if (!current.bookedByStudentId) throw new AuthServiceError("INVALID_INPUT", "This slot is not booked");
     const isSelf = current.bookedByStudentId === actorId;
     const isCuratorOverride = actor.role === UserRole.CURATOR || actor.role === UserRole.OWNER;
     if (!isSelf && !isCuratorOverride) throw new AuthServiceError("FORBIDDEN", "Only the student who booked this slot or a curator can cancel it");
+    // Self-service only reaches today/future slots — a past one (missed, or already attended)
+    // can't be un-booked to free the slot back up against the per-type limit. A curator can still
+    // release it manually (e.g. the student's card, after a genuine no-show) regardless of date.
+    if (isSelf && !isCuratorOverride && dateKeyInZone(current.date) < todayDateKey()) {
+      throw new AuthServiceError("INVALID_INPUT", "This slot is in the past — ask a curator to release it");
+    }
     const bookedStudentId = current.bookedByStudentId;
     const { event, limits } = await prisma.$transaction(async (tx) => {
       const updated = await tx.scheduleEvent.update({
@@ -182,7 +199,11 @@ export class ScheduleService {
     if (!workingPracticumId) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
     const practicum = await prisma.practicum.findUnique({ where: { id: workingPracticumId }, select: { id: true, backtestSlotLimit: true, preSessionSlotLimit: true } });
     if (!practicum) throw new AuthServiceError("INVALID_INPUT", "Practicum is not configured");
-    const event = await prisma.scheduleEvent.create({ data: { ...this.eventFields(input), practicumId: practicum.id } });
+    let event = await prisma.scheduleEvent.create({ data: { ...this.eventFields(input), practicumId: practicum.id } });
+    if (input.coverFileId) {
+      const coverPath = await fileService.attachToScheduleEventCover(actorId, event.id, input.coverFileId);
+      event = await prisma.scheduleEvent.update({ where: { id: event.id }, data: { coverPath } });
+    }
     const eventDate = new Intl.DateTimeFormat("ru-RU").format(event.date);
     void activeStudentEmails(practicum.id)
       .then((emails) => Promise.all(emails.map((to) => sendNewEventNotification({ to, eventTitle: event.title, eventDate, eventId: event.id }))))
@@ -198,10 +219,26 @@ export class ScheduleService {
     await this.assertCurator(actorId);
     const existing = await prisma.scheduleEvent.findUnique({ where: { id: requiredText(eventId, "eventId", 100) }, select: { practicumId: true } });
     if (!existing) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
-    const event = await prisma.scheduleEvent.update({ where: { id: eventId }, data: this.eventFields(input) }).catch(() => null);
+    let event = await prisma.scheduleEvent.update({ where: { id: eventId }, data: this.eventFields(input) }).catch(() => null);
     if (!event) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+    if (input.coverFileId) {
+      const coverPath = await fileService.attachToScheduleEventCover(actorId, event.id, input.coverFileId);
+      event = await prisma.scheduleEvent.update({ where: { id: event.id }, data: { coverPath } });
+    }
     const limits = await this.practicumBookingLimits(existing.practicumId);
     return this.toDto(event, actorId, limits);
+  }
+
+  public async listCoverTemplates() {
+    return fileService.listScheduleCoverTemplates();
+  }
+
+  public async createCoverTemplate(actorId: string, fileId: string, label: string) {
+    return fileService.createScheduleCoverTemplate(actorId, fileId, label);
+  }
+
+  public async deleteCoverTemplate(actorId: string, templateId: string): Promise<void> {
+    return fileService.deleteScheduleCoverTemplate(actorId, templateId);
   }
 
   /** No practicum-equality gate — a curator can delete an event from any practicum, finished cohorts included. */
@@ -230,7 +267,7 @@ export class ScheduleService {
   }
 
   private toDto(event: {
-    id: string; type: ScheduleEventType; title: string; date: Date; time: string; description: string; live: boolean; coverPath: string | null;
+    id: string; type: ScheduleEventType; title: string; date: Date; time: string; description: string; live: boolean; coverPath: string | null; streamEndedAt?: Date | null;
     mediaAssets?: Array<{ id: string; title: string | null; provider: string; providerKey: string; status: MediaAssetStatus }>;
     bookedByStudentId?: string | null;
     bookedBy?: { externalIdentities: Array<{ displayName: string | null; username: string | null }> } | null;
@@ -247,6 +284,7 @@ export class ScheduleService {
       description: event.description,
       live: event.live,
       coverPath: event.coverPath,
+      streamEndedAt: event.streamEndedAt ? event.streamEndedAt.toISOString() : null,
       recordingAvailable: media.some((item) => item.status === MediaAssetStatus.PUBLISHED),
       recordings: media,
       bookedByStudentId: event.bookedByStudentId ?? null,

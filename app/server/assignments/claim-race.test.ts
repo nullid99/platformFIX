@@ -42,7 +42,7 @@ describe("assignmentService#claim — owner vs curator race", () => {
 
     const module_ = await prisma.module.create({ data: { practicumId, title: `Vitest claim-race module ${suffix}`, position: 999_100 }, select: { id: true } });
     moduleId = module_.id;
-    const assignment = await prisma.assignment.create({ data: { moduleId, title: "Vitest claim-race assignment", description: "fixture", status: AssignmentStatus.PUBLISHED }, select: { id: true } });
+    const assignment = await prisma.assignment.create({ data: { moduleId, practicumId, title: "Vitest claim-race assignment", description: "fixture", status: AssignmentStatus.PUBLISHED }, select: { id: true } });
     assignmentId = assignment.id;
 
     const student = await prisma.user.create({

@@ -17,9 +17,17 @@ export const metadata: Metadata = {
   description: "Учебный кабинет трейдера",
 };
 
+// Runs before React hydrates (blocking, inline) so the light theme doesn't flash dark-then-light
+// on load — a `useEffect` doing this same read would paint the wrong theme first. Kept a plain
+// string of JS (not a shared .ts file) since it must inline into the HTML, not load as a module.
+const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem("fix-theme");if(t==="light")document.documentElement.setAttribute("data-theme","light");}catch(e){}})();`;
+
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="ru" className={`${inter.variable} ${robotoMono.variable} ${dmMono.variable}`}>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body>{children}</body>
     </html>
   );

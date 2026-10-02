@@ -5,8 +5,12 @@ import { assertPracticumViewer } from "./access";
 import { fetchTradingViewPreview, findTradingViewUrl, type LinkPreview } from "./link-preview";
 
 const MESSAGE_MAX_LENGTH = 2_000;
-const HISTORY_LIMIT = 50;
-const ARCHIVE_LIMIT = 500;
+// Whole-broadcast history, not a "last N" window: with 50, anyone who opened the chat mid-stream
+// or scrolled up after it couldn't see earlier messages (a 1-hour stream on 2026-10-01 had 341).
+// listRecent is already scoped to the current broadcast's chat session, so this only caps an
+// unusually long one.
+const HISTORY_LIMIT = 1_000;
+const ARCHIVE_LIMIT = 2_000;
 
 // Fixed set so the picker is small and every reaction renders consistently — matches the
 // quick-react row Discord shows, not a full emoji keyboard.
@@ -21,15 +25,17 @@ export type StreamChatMessageDto = {
   authorName: string;
   authorAvatarUrl: string | null;
   authorRole: UserRole;
+  authorIsAdvanced: boolean;
   attachment: { fileId: string; url: string } | null;
   linkPreview: LinkPreview | null;
-  replyTo: { id: string; authorName: string; authorRole: UserRole; body: string } | null;
+  replyTo: { id: string; authorId: string; authorName: string; authorRole: UserRole; authorIsAdvanced: boolean; body: string } | null;
   reactions: Array<{ emoji: string; userIds: string[] }>;
 };
 
 type AuthorForDto = {
   id: string;
   role: UserRole;
+  isAdvanced: boolean;
   email: string | null;
   externalIdentities: Array<{ displayName: string | null; username: string | null; avatarUrl: string | null }>;
 };
@@ -45,7 +51,7 @@ type MessageForDto = {
   reactions: Array<{ emoji: string; userId: string }>;
 };
 
-const AUTHOR_SELECT = { id: true, role: true, email: true, externalIdentities: { select: { displayName: true, username: true, avatarUrl: true }, orderBy: { createdAt: "asc" as const }, take: 1 } };
+const AUTHOR_SELECT = { id: true, role: true, isAdvanced: true, email: true, externalIdentities: { select: { displayName: true, username: true, avatarUrl: true }, orderBy: { createdAt: "asc" as const }, take: 1 } };
 const REPLY_TO_INCLUDE = { select: { id: true, body: true, author: { select: AUTHOR_SELECT } } };
 const REACTIONS_INCLUDE = { select: { emoji: true, userId: true } };
 
@@ -180,9 +186,10 @@ export class StreamChatService {
       authorName: authorName(message.author),
       authorAvatarUrl: authorAvatarUrl(message.author),
       authorRole: message.author.role,
+      authorIsAdvanced: message.author.isAdvanced,
       attachment: message.fileId ? { fileId: message.fileId, url: `/api/files/${message.fileId}/content` } : null,
       linkPreview: toLinkPreview(message.linkPreview),
-      replyTo: message.replyTo ? { id: message.replyTo.id, authorName: authorName(message.replyTo.author), authorRole: message.replyTo.author.role, body: message.replyTo.body } : null,
+      replyTo: message.replyTo ? { id: message.replyTo.id, authorId: message.replyTo.author.id, authorName: authorName(message.replyTo.author), authorRole: message.replyTo.author.role, authorIsAdvanced: message.replyTo.author.isAdvanced, body: message.replyTo.body } : null,
       reactions: groupReactions(message.reactions),
     };
   }

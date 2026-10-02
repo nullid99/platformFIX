@@ -37,6 +37,24 @@ export class ScheduleController {
     try { return { data: await scheduleService.getBookingSettings(await sessionUser(request)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
+  @Get("cover-templates")
+  public async listCoverTemplates(@Req() request: RequestWithCookies) {
+    try { await sessionUser(request); return { data: await scheduleService.listCoverTemplates() }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  @Post("cover-templates")
+  public async createCoverTemplate(@Req() request: RequestWithCookies, @Body() body: unknown) {
+    const record = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    if (typeof record.fileId !== "string" || !record.fileId.trim()) throw new BadRequestException("fileId is required");
+    if (typeof record.label !== "string" || !record.label.trim()) throw new BadRequestException("label is required");
+    try { return { data: await scheduleService.createCoverTemplate(await sessionUser(request), record.fileId, record.label) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); if (error instanceof BadRequestException) throw error; throw error; }
+  }
+
+  @Delete("cover-templates/:templateId")
+  public async deleteCoverTemplate(@Req() request: RequestWithCookies, @Param("templateId") templateId: string) {
+    try { await scheduleService.deleteCoverTemplate(await sessionUser(request), templateId); return { data: { id: templateId } }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
   @Put("settings")
   public async updateSettings(@Req() request: RequestWithCookies, @Body() body: unknown) {
     try { return { data: await scheduleService.updateBookingSettings(await sessionUser(request), parseBookingSettingsBody(body)) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); if (error instanceof BadRequestException) throw error; throw error; }

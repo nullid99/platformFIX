@@ -12,7 +12,8 @@ export function parseScheduleEventBody(value: unknown): ScheduleEventInput {
   const body = value as Record<string, unknown>;
   if (!Object.values(ScheduleEventType).includes(body.type as ScheduleEventType)) throw new BadRequestException("type is invalid");
   if (body.live !== undefined && typeof body.live !== "boolean") throw new BadRequestException("live must be a boolean");
-  return { type: body.type as ScheduleEventType, title: text(body.title, "title", 180), date: text(body.date, "date", 10), time: text(body.time, "time", 80), description: text(body.description, "description", 5_000), live: body.live as boolean | undefined, coverPath: typeof body.coverPath === "string" ? body.coverPath.trim().slice(0, 500) : undefined };
+  if (body.coverFileId !== undefined && typeof body.coverFileId !== "string") throw new BadRequestException("coverFileId must be a string");
+  return { type: body.type as ScheduleEventType, title: text(body.title, "title", 180), date: text(body.date, "date", 10), time: text(body.time, "time", 80), description: text(body.description, "description", 5_000), live: body.live as boolean | undefined, coverPath: typeof body.coverPath === "string" ? body.coverPath.trim().slice(0, 500) : undefined, coverFileId: body.coverFileId as string | undefined };
 }
 
 export function parseBookingSettingsBody(value: unknown): { backtestSlotLimit: number; preSessionSlotLimit: number } {

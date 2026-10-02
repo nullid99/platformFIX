@@ -6,10 +6,13 @@ import { activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { sendNewMediaNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { isModuleOpenForStudent } from "@/app/server/course/module-access";
+import { getActivePracticumId } from "@/app/server/course/practicum-service";
+import { isStreamPrivate } from "./stream-visibility";
 import { assertPracticumViewer } from "./access";
 import {
   EgressStatus,
   IngressInput,
+  IngressState_Status,
   LIVEKIT_INGRESS_PARTICIPANT_IDENTITY,
   LIVEKIT_INGRESS_VIDEO_OPTIONS,
   LIVEKIT_ROOM_NAME,
@@ -46,11 +49,30 @@ export type PlaybackStatusDto = {
   roomName: string | null;
   /** The schedule event this broadcast is for — the curator's pending target, only surfaced while actually live. */
   liveScheduleEventId: string | null;
+  /** Whether LiveKit is actually writing this broadcast to a file (null = not known yet). */
+  recording: RecordingState | null;
+  /** Staff only (null for students): whether the curator picked a lesson/event for this broadcast. */
+  hasStreamTarget: boolean | null;
+  /** Staff only: who started this broadcast on the platform ("Начать стрим"). */
+  host?: StreamHostDto;
 };
+
+export type RecordingState = "recording" | "starting" | "off";
+
+// The watchdog refreshes the recording state every ~20s; older than this means it isn't running.
+const RECORDING_STATE_MAX_AGE_MS = 45_000;
+
+// A healthy egress goes STARTING → ACTIVE in ~1.5s; see superviseRecording.
+const RECORDING_START_TIMEOUT_MS = 15_000;
 
 export type RecordingStorageStatusDto = { totalBytes: number; usedBytes: number; availableBytes: number; updatedAt: string } | null;
 
+/** "Эфир ведёт: Имя" — who pressed "Начать стрим" for the current/next broadcast. */
+export type StreamHostDto = { name: string; startedAt: string; isMe: boolean } | null;
+
 export type StreamTargetDto = {
+  /** Staff only. */
+  host?: StreamHostDto;
   moduleId: string | null;
   moduleTitle: string | null;
   scheduleEventId: string | null;
@@ -95,6 +117,16 @@ export class StreamService {
     if (practicum.liveKitIngressId) {
       const [existing] = await client.listIngress({ ingressId: practicum.liveKitIngressId }).catch(() => []);
       if (existing) {
+        // Never touch an ingress while OBS is actually streaming into it: LiveKit's UpdateIngress
+        // restarts an active session, OBS reconnects on its own within a second, but the tracks
+        // come back with new ids — which ends the running track-composite recording and starts a
+        // fresh one, so every curator merely opening "Стримы" mid-broadcast (the page POSTs here on
+        // mount) split the recording into another Медиатека entry. The update is only there to
+        // pick up encoding-option changes, which can just as well wait for the next idle visit.
+        const status = existing.state?.status;
+        if (practicum.isCurrentlyLive || status === IngressState_Status.ENDPOINT_BUFFERING || status === IngressState_Status.ENDPOINT_PUBLISHING) {
+          return ingressDto(existing, practicum.isCurrentlyLive);
+        }
         // Keeps an already-issued RTMP URL/key stable while still picking up encoding-option
         // changes (e.g. the video preset) made after the ingress was first created.
         const updated = await client.updateIngress(existing.ingressId, { name: practicum.title, video: LIVEKIT_INGRESS_VIDEO_OPTIONS }).catch(() => existing);
@@ -157,13 +189,41 @@ export class StreamService {
     return asset.providerKey;
   }
 
-  /** Safe for both curator and enrolled students — mints a fresh subscribe-only token per call, never exposes the RTMP key. */
+  /**
+   * Safe for both curator and enrolled students — mints a fresh subscribe-only token per call,
+   * never exposes the RTMP key. While the "private stream" switch is on, a student gets "not
+   * live" back regardless of the real state and never gets a token — this is the actual access
+   * gate (not just a hidden nav button), so a student with the page already open, or hitting
+   * this endpoint directly, still can't get in. A curator/owner is unaffected — they need to
+   * keep watching their own private/test broadcast.
+   */
   public async getPlaybackStatus(actorId: string): Promise<PlaybackStatusDto> {
-    const { practicumId } = await assertPracticumViewer(actorId);
-    const practicum = await prisma.practicum.findUnique({ where: { id: practicumId }, select: { isCurrentlyLive: true, pendingStreamScheduleEventId: true } });
-    if (!practicum?.isCurrentlyLive) return { isLive: false, viewerToken: null, roomName: null, liveScheduleEventId: null };
+    const { practicumId, role } = await assertPracticumViewer(actorId);
+    if (role === UserRole.STUDENT && await isStreamPrivate(practicumId)) {
+      return { isLive: false, viewerToken: null, roomName: null, liveScheduleEventId: null, recording: null, hasStreamTarget: null };
+    }
+    const isStaffViewer = role !== UserRole.STUDENT;
+    const practicum = await prisma.practicum.findUnique({ where: { id: practicumId }, select: { isCurrentlyLive: true, pendingStreamScheduleEventId: true, pendingStreamModuleId: true } });
+    if (!practicum?.isCurrentlyLive) return { isLive: false, viewerToken: null, roomName: null, liveScheduleEventId: null, recording: null, hasStreamTarget: null };
     const viewerToken = await mintViewerToken(actorId);
-    return { isLive: true, viewerToken, roomName: LIVEKIT_ROOM_NAME, liveScheduleEventId: practicum.pendingStreamScheduleEventId };
+    const recording = await this.getRecordingState({ allowFetch: isStaffViewer });
+    const hasStreamTarget = isStaffViewer ? Boolean(practicum.pendingStreamModuleId || practicum.pendingStreamScheduleEventId) : null;
+    const host = isStaffViewer ? await this.resolveStreamHost(practicumId, actorId) : undefined;
+    return { isLive: true, viewerToken, roomName: LIVEKIT_ROOM_NAME, liveScheduleEventId: practicum.pendingStreamScheduleEventId, recording, hasStreamTarget, host };
+  }
+
+  /**
+   * Read-only for both roles, like getPlaybackStatus — resolves to the caller's own practicum
+   * (their enrollment for a student, the active one for staff) and reports its "private stream"
+   * flag. A student's own sidebar needs this to decide whether to hide "Стрим" at all,
+   * independent of whether a stream happens to be live right now. The flag alone reveals nothing
+   * about content. Setting it is per-practicum-row, owner/curator-only — see
+   * practicum-admin-service.ts#setPracticumStreamsPrivate, from the "Потоки" list instead of here,
+   * since a curator/owner may want to set it for a practicum other than their own current one.
+   */
+  public async getVisibilitySettings(actorId: string): Promise<{ streamsPrivate: boolean }> {
+    const { practicumId } = await assertPracticumViewer(actorId);
+    return { streamsPrivate: await isStreamPrivate(practicumId) };
   }
 
   /** Topic of the currently-configured stream target, for the "stream is live" email/notification — null when the curator hasn't picked one. */
@@ -191,9 +251,11 @@ export class StreamService {
    * *ingress participant* joining/leaving, not room_started/room_finished, since a LiveKit room
    * stays open for emptyTimeout (5 min) after OBS disconnects, so room-level events lag well
    * behind "is anyone actually publishing right now." track_published kicks off recording once
-   * both of the ingress participant's tracks are up; egress_ended finalizes it. Single-practicum
-   * install, so the DB update touches every practicum row, same as the rest of the codebase's
-   * "there's only one" convention.
+   * both of the ingress participant's tracks are up; egress_ended finalizes it. There's one
+   * shared room for the whole install (see LIVEKIT_ROOM_NAME), but only the currently *active*
+   * practicum (getActivePracticumId) is the one actually broadcasting into it — writing the flag
+   * onto every practicum row used to leak "live" onto every other cohort (including long-finished
+   * ones a returning student might reopen months later), which is exactly the bug this scopes.
    */
   public async handleLiveKitWebhookEvent(event: WebhookEvent): Promise<void> {
     if (event.event === "egress_ended") {
@@ -203,7 +265,10 @@ export class StreamService {
     if (event.room?.name !== LIVEKIT_ROOM_NAME || event.participant?.identity !== LIVEKIT_INGRESS_PARTICIPANT_IDENTITY) return;
 
     if (event.event === "participant_joined" || event.event === "participant_left") {
-      await prisma.practicum.updateMany({ data: { isCurrentlyLive: event.event === "participant_joined" } });
+      const activePracticumId = await getActivePracticumId();
+      if (activePracticumId) {
+        await prisma.practicum.update({ where: { id: activePracticumId }, data: { isCurrentlyLive: event.event === "participant_joined" } });
+      }
       return;
     }
     if (event.event === "track_published") void this.maybeStartRecording();
@@ -214,12 +279,22 @@ export class StreamService {
    * the DB flag currently says. Called once on API startup (a restart mid-broadcast means no
    * participant_joined re-fires) and periodically by the notifier (see RECONCILE_INTERVAL_TICKS
    * in stream-live-notifier.ts) as a backstop for webhook deliveries LiveKit never guarantees.
+   * Also the self-heal for any practicum stuck with a stale `true` from before this method (or the
+   * webhook handler above) scoped its write to the active practicum only — every non-active row
+   * gets forced back to false here on top of the active one getting the real value.
    */
   public async reconcileLiveStatus(): Promise<void> {
     try {
       const participants = await roomServiceClient().listParticipants(LIVEKIT_ROOM_NAME).catch(() => []);
       const isLive = participants.some((participant) => participant.identity === LIVEKIT_INGRESS_PARTICIPANT_IDENTITY);
-      await prisma.practicum.updateMany({ data: { isCurrentlyLive: isLive } });
+      const activePracticumId = await getActivePracticumId();
+      await prisma.practicum.updateMany({
+        where: activePracticumId ? { id: { not: activePracticumId } } : {},
+        data: { isCurrentlyLive: false },
+      });
+      if (activePracticumId) {
+        await prisma.practicum.update({ where: { id: activePracticumId }, data: { isCurrentlyLive: isLive } });
+      }
     } catch (error) {
       console.error("LiveKit startup reconciliation failed", error instanceof Error ? error.message : "unknown error");
     }
@@ -229,7 +304,23 @@ export class StreamService {
   public async getStreamTarget(actorId: string): Promise<StreamTargetDto> {
     const practicum = await this.assertCuratorPracticum(actorId);
     const current = await prisma.practicum.findUnique({ where: { id: practicum.id }, select: { pendingStreamModuleId: true, pendingStreamScheduleEventId: true, pendingStreamMediaKind: true } });
-    return this.resolveStreamTarget(current?.pendingStreamModuleId ?? null, current?.pendingStreamScheduleEventId ?? null, current?.pendingStreamMediaKind ?? null);
+    const target = await this.resolveStreamTarget(current?.pendingStreamModuleId ?? null, current?.pendingStreamScheduleEventId ?? null, current?.pendingStreamMediaKind ?? null);
+    return { ...target, host: await this.resolveStreamHost(practicum.id, actorId) };
+  }
+
+  /**
+   * All curators share one OBS key, so LiveKit can't tell who is broadcasting — the platform
+   * remembers who pressed "Начать стрим" (or picked the target on "Стримы") instead.
+   */
+  private async resolveStreamHost(practicumId: string, actorId: string): Promise<StreamHostDto> {
+    const practicum = await prisma.practicum.findUnique({
+      where: { id: practicumId },
+      select: { streamStartedAt: true, streamStartedBy: { select: { id: true, email: true, externalIdentities: { select: { displayName: true, username: true }, orderBy: { createdAt: "asc" }, take: 1 } } } },
+    });
+    const user = practicum?.streamStartedBy;
+    if (!user || !practicum?.streamStartedAt) return null;
+    const identity = user.externalIdentities[0];
+    return { name: identity?.displayName ?? identity?.username ?? user.email ?? "Куратор", startedAt: practicum.streamStartedAt.toISOString(), isMe: user.id === actorId };
   }
 
   /** Set (or clear, passing neither) the lesson/schedule-event this stream is for — mutually exclusive. mediaKind only applies with moduleId (which of the module's two stream blocks this is for). */
@@ -245,11 +336,50 @@ export class StreamService {
       mediaKind = input.mediaKind === "QA" ? MediaAssetKind.QA : MediaAssetKind.STREAM;
     } else if (input.scheduleEventId) {
       const scheduleEvent = await prisma.scheduleEvent.findUnique({ where: { id: input.scheduleEventId }, select: { practicumId: true } });
-      if (!scheduleEvent || scheduleEvent.practicumId !== practicum.id) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+      if (!scheduleEvent) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+      // Broadcasts always go to the practicum assigned for streams ("Назначить для эфиров"), while
+      // a curator's "Расписание" shows their own working поток — which can be a different one.
+      if (scheduleEvent.practicumId !== practicum.id) throw new AuthServiceError("INVALID_INPUT", `Это событие из другого потока. Эфиры сейчас идут в поток «${practicum.title}» — переключитесь на него в «Потоках» или выберите событие оттуда.`);
       scheduleEventId = input.scheduleEventId;
     }
-    await prisma.practicum.update({ where: { id: practicum.id }, data: { pendingStreamModuleId: moduleId, pendingStreamScheduleEventId: scheduleEventId, pendingStreamMediaKind: mediaKind } });
-    return this.resolveStreamTarget(moduleId, scheduleEventId, mediaKind);
+    const hasTarget = Boolean(moduleId || scheduleEventId);
+    await prisma.practicum.update({
+      where: { id: practicum.id },
+      data: {
+        pendingStreamModuleId: moduleId,
+        pendingStreamScheduleEventId: scheduleEventId,
+        pendingStreamMediaKind: mediaKind,
+        streamStartedById: hasTarget ? actorId : null,
+        streamStartedAt: hasTarget ? new Date() : null,
+      },
+    });
+    // "Начать стрим" again on an event already marked finished (a second session, or the end was
+    // pressed too early) — it's live again, not "Эфир завершён".
+    if (scheduleEventId) await prisma.scheduleEvent.update({ where: { id: scheduleEventId }, data: { streamEndedAt: null } });
+    return { ...(await this.resolveStreamTarget(moduleId, scheduleEventId, mediaKind)), host: await this.resolveStreamHost(practicum.id, actorId) };
+  }
+
+  /**
+   * "Завершить эфир" — from the schedule event or the "Стримы" page. Marks the event finished
+   * (students' schedule shows "Эфир завершён", then "Открыть запись" once the curator publishes
+   * the draft) and clears the broadcast's target, so the next broadcast can't land on this event
+   * by mistake. Ending the actual video is still OBS's "Остановить трансляцию"; a recording that
+   * finishes after this is still filed under the event — see createMediaAssetFromRecording.
+   */
+  public async finishStream(actorId: string, scheduleEventId: string): Promise<StreamTargetDto> {
+    const practicum = await this.assertCuratorPracticum(actorId);
+    const scheduleEvent = await prisma.scheduleEvent.findUnique({ where: { id: scheduleEventId }, select: { practicumId: true } });
+    if (!scheduleEvent || scheduleEvent.practicumId !== practicum.id) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+    await prisma.$transaction([
+      prisma.scheduleEvent.update({ where: { id: scheduleEventId }, data: { streamEndedAt: new Date() } }),
+      prisma.practicum.updateMany({
+        where: { id: practicum.id, pendingStreamScheduleEventId: scheduleEventId },
+        data: { pendingStreamModuleId: null, pendingStreamScheduleEventId: null, pendingStreamMediaKind: null, streamStartedById: null, streamStartedAt: null },
+      }),
+    ]);
+    const current = await prisma.practicum.findUnique({ where: { id: practicum.id }, select: { pendingStreamModuleId: true, pendingStreamScheduleEventId: true, pendingStreamMediaKind: true } });
+    const target = await this.resolveStreamTarget(current?.pendingStreamModuleId ?? null, current?.pendingStreamScheduleEventId ?? null, current?.pendingStreamMediaKind ?? null);
+    return { ...target, host: await this.resolveStreamHost(practicum.id, actorId) };
   }
 
   private async resolveStreamTarget(moduleId: string | null, scheduleEventId: string | null, mediaKind: MediaAssetKind | null): Promise<StreamTargetDto> {
@@ -268,9 +398,9 @@ export class StreamService {
 
   /**
    * Called when a LiveKit egress (recording) completes: resolves the curator's pre-selected
-   * target (Practicum.pendingStream*, picked on "Стримы" before going live) into an auto-published
-   * MediaAsset, or lands it as an unassigned draft for the curator to place from the Медиатека
-   * when no target was picked, then notifies students. Idempotent on (provider, providerKey) so a
+   * target (Practicum.pendingStream*, picked on "Стримы" or via "Начать стрим" on a schedule
+   * event) — a lesson target auto-publishes and notifies students; an event target becomes a
+   * draft filed under that event; no target becomes an unassigned draft for the Медиатека. Idempotent on (provider, providerKey) so a
    * retried webhook/reconciliation is safe.
    */
   private async createMediaAssetFromRecording(input: { provider: string; providerKey: string; durationSec: number | null; byteSize: bigint | null; preciseStart: Date | null; preciseEnd: Date | null }): Promise<void> {
@@ -310,17 +440,34 @@ export class StreamService {
       } else if (practicum.pendingStreamScheduleEventId) {
         const scheduleEvent = await tx.scheduleEvent.findUnique({ where: { id: practicum.pendingStreamScheduleEventId }, select: { id: true, title: true, practicumId: true } });
         if (scheduleEvent && scheduleEvent.practicumId === practicum.id) targetScheduleEvent = scheduleEvent;
+      } else {
+        // "Завершить эфир" usually gets pressed before OBS is stopped, so the recording can finish
+        // after the target was already cleared — file it under the event that was ended while this
+        // recording ran (or within a few minutes after), instead of as an unassigned draft.
+        const recordingStart = input.preciseStart ?? new Date(Date.now() - 6 * 60 * 60_000);
+        const recordingEnd = input.preciseEnd ?? new Date();
+        targetScheduleEvent = await tx.scheduleEvent.findFirst({
+          where: { practicumId: practicum.id, streamEndedAt: { gte: recordingStart, lte: new Date(recordingEnd.getTime() + 15 * 60_000) } },
+          orderBy: { streamEndedAt: "desc" },
+          select: { id: true, title: true },
+        });
       }
       // A module target additionally picks which of its two stream blocks this recording belongs
       // in — "Тематические записи" (STREAM) vs "Q&A с куратором" (QA). Irrelevant otherwise.
       const mediaKind = targetModule && practicum.pendingStreamMediaKind === MediaAssetKind.QA ? MediaAssetKind.QA : MediaAssetKind.STREAM;
-      // The picked target is one-shot — consumed here regardless of whether it still resolved to
+      // A lesson target is one-shot — consumed here regardless of whether it still resolved to
       // something valid, so a stale/deleted target doesn't keep silently failing every webhook.
-      if (practicum.pendingStreamModuleId || practicum.pendingStreamScheduleEventId) {
+      // A schedule-event target is NOT: it stays for the whole broadcast (an OBS reconnect splits
+      // the recording, and the second half must land on the same event too) and is cleared by
+      // "Завершить эфир" (finishStream) or by starting the next event's stream.
+      if (practicum.pendingStreamModuleId) {
         await tx.practicum.update({ where: { id: practicum.id }, data: { pendingStreamModuleId: null, pendingStreamScheduleEventId: null, pendingStreamMediaKind: null } });
       }
 
-      const isAutoPublished = Boolean(targetModule || targetScheduleEvent);
+      // Event broadcasts become a DRAFT already filed under the event (decided 2026-10-02): the
+      // curator reviews it in Медиатека and publishes with one click; until then students see
+      // "Эфир завершён · запись скоро появится". Lesson targets still auto-publish as before.
+      const isAutoPublished = Boolean(targetModule);
       const lastMedia = await tx.mediaAsset.findFirst({
         where: targetScheduleEvent ? { scheduleEventId: targetScheduleEvent.id } : targetModule ? { moduleId: targetModule.id } : { practicumId: practicum.id, moduleId: null, scheduleEventId: null },
         orderBy: { position: "desc" },
@@ -338,13 +485,17 @@ export class StreamService {
           publishedAt: isAutoPublished ? new Date() : undefined,
           // Unassigned recordings get a "date + time" title instead of a bare null (which the
           // frontend renders as "Без названия") so the curator can tell drafts apart in Медиатека.
+          // Event drafts carry the start time too — a broadcast split by an OBS reconnect yields
+          // two drafts on the same event, and the curator needs to tell them apart.
           title: targetScheduleEvent
-            ? targetScheduleEvent.title
+            ? `${targetScheduleEvent.title} — запись эфира ${formatZonedDateTime(input.preciseStart ?? new Date())}`
             : targetModule
               ? `${targetModule.title} — ${mediaKind === MediaAssetKind.QA ? "Q&A" : "запись эфира"}`
               : `Запись ${formatZonedDateTime(input.preciseStart ?? new Date())}`,
-          chatSessionStartedAt: isAutoPublished ? (input.preciseStart ?? practicum.currentStreamSessionStartedAt) : undefined,
-          chatSessionEndedAt: isAutoPublished ? (input.preciseEnd ?? new Date()) : undefined,
+          // Also for event drafts: the "Чат эфира" archive under the recording is cut from this
+          // window once the curator publishes it.
+          chatSessionStartedAt: isAutoPublished || targetScheduleEvent ? (input.preciseStart ?? practicum.currentStreamSessionStartedAt) : undefined,
+          chatSessionEndedAt: isAutoPublished || targetScheduleEvent ? (input.preciseEnd ?? new Date()) : undefined,
           durationSec: input.durationSec != null ? Math.round(input.durationSec) : undefined,
           byteSize: input.byteSize ?? undefined,
           position: (lastMedia?.position ?? -1) + 1,
@@ -380,6 +531,92 @@ export class StreamService {
    * ordering — so this re-derives ground truth from listParticipants rather than trying to
    * correlate two possibly-out-of-order events (same reasoning as reconcileLiveStatus).
    */
+  /**
+   * Recording watchdog, run by the live notifier every tick (~20s). A real incident on
+   * 2026-10-01: a corrupted H.264 frame arrived in the egress's first second, its GStreamer
+   * pipeline stayed PAUSED forever ("pipeline paused" but never "pipeline playing"), and LiveKit
+   * kept reporting the egress as STARTING for the whole 55-minute broadcast — so
+   * maybeStartRecording's "already recording" check never let a second attempt through and the
+   * broadcast was lost with nobody noticing. A healthy egress reaches ACTIVE in ~1.5s, so one
+   * still STARTING after RECORDING_START_TIMEOUT_MS is stopped and replaced; a fresh egress starts
+   * from a fresh keyframe. Also starts a recording if OBS is live and none is running at all
+   * (e.g. a track_published webhook that never arrived).
+   */
+  private readonly egressFirstSeenAt = new Map<string, number>();
+  /**
+   * What the watchdog last saw (it asks LiveKit every ~20s anyway). getPlaybackStatus serves the
+   * recording indicator from here, so every viewer's 15s status poll — students included, ~90 of
+   * them during a broadcast — costs LiveKit nothing extra.
+   */
+  private lastRecordingState: { state: RecordingState; at: number } | null = null;
+
+  private rememberRecordingState(running: Array<{ status: EgressStatus }>): void {
+    const state: RecordingState = running.some((egress) => egress.status === EgressStatus.EGRESS_ACTIVE) ? "recording"
+      : running.some((egress) => egress.status === EgressStatus.EGRESS_STARTING) ? "starting"
+      : "off";
+    this.lastRecordingState = { state, at: Date.now() };
+  }
+
+  public async superviseRecording(): Promise<void> {
+    try {
+      const participants = await roomServiceClient().listParticipants(LIVEKIT_ROOM_NAME).catch(() => null);
+      if (!participants) return; // LiveKit unreachable — don't act on a guess
+      if (!participants.some((participant) => participant.identity === LIVEKIT_INGRESS_PARTICIPANT_IDENTITY)) {
+        this.egressFirstSeenAt.clear();
+        this.lastRecordingState = null;
+        return;
+      }
+      const running = await egressClient().listEgress({ roomName: LIVEKIT_ROOM_NAME, active: true }).catch(() => null);
+      if (!running) return;
+      this.rememberRecordingState(running);
+
+      const now = Date.now();
+      let recordingInProgress = false;
+      for (const egress of running) {
+        if (egress.status !== EgressStatus.EGRESS_STARTING) {
+          // ACTIVE is healthy; ENDING is on its way out and egress_ended → finishRecording
+          // restarts a fresh segment by itself if OBS is still live.
+          recordingInProgress = true;
+          continue;
+        }
+        const firstSeen = this.egressFirstSeenAt.get(egress.egressId) ?? now;
+        this.egressFirstSeenAt.set(egress.egressId, firstSeen);
+        const startedAt = egress.startedAt ? Number(egress.startedAt) / 1_000_000 : firstSeen;
+        if (now - Math.min(startedAt, firstSeen) < RECORDING_START_TIMEOUT_MS) {
+          recordingInProgress = true;
+          continue;
+        }
+        console.error("LiveKit recording stuck before starting — stopping it to start a fresh one", egress.egressId);
+        this.egressFirstSeenAt.delete(egress.egressId);
+        await egressClient().stopEgress(egress.egressId).catch((error: unknown) => console.error("Stuck recording stop failed", egress.egressId, error instanceof Error ? error.message : "unknown error"));
+      }
+      if (!recordingInProgress) {
+        // Short pause so LiveKit has dropped the stopped egress from its active list before
+        // maybeStartRecording checks it; its own egress_ended webhook may get there first, and
+        // recordingStartInFlight + the active-list check keep the two from doubling up.
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        await this.maybeStartRecording();
+      }
+    } catch (error) {
+      console.error("Recording watchdog failed", error instanceof Error ? error.message : "unknown error");
+    }
+  }
+
+  /**
+   * Recording indicator for everyone watching (staff and, since 2026-10-02, students too — a viewer
+   * who notices "Запись не идёт" can tell the curator). Served from the watchdog's last look; only
+   * a staff request may fall back to asking LiveKit itself, and only if that look is stale (e.g.
+   * the first seconds after an API restart), so viewer count never multiplies LiveKit calls.
+   */
+  public async getRecordingState(options: { allowFetch: boolean }): Promise<RecordingState | null> {
+    if (this.lastRecordingState && Date.now() - this.lastRecordingState.at < RECORDING_STATE_MAX_AGE_MS) return this.lastRecordingState.state;
+    if (!options.allowFetch) return null;
+    const running = await egressClient().listEgress({ roomName: LIVEKIT_ROOM_NAME, active: true }).catch(() => null);
+    if (!running) return null;
+    this.rememberRecordingState(running);
+    return this.lastRecordingState?.state ?? null;
+  }
+
   private async maybeStartRecording(): Promise<void> {
     if (this.recordingStartInFlight) return;
     this.recordingStartInFlight = true;
