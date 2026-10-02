@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { convertEventTime } from "./page";
+import { convertEventTime, convertToKyivTime } from "./page";
 
 // Events are entered in Kyiv time; students see them in their own zone. Converted per event date,
 // so countries with different (or no) DST switches are right on both sides of the switch.
@@ -25,5 +25,19 @@ describe("convertEventTime (Kyiv → viewer zone)", () => {
 
   test("free text that isn't a time is left as typed", () => {
     expect(convertEventTime("2026-10-03", "весь день", "Europe/Berlin")).toBeNull();
+  });
+});
+
+// Curators in other countries type the time in their own zone; storage stays Kyiv.
+describe("convertToKyivTime (curator's zone → Kyiv for storage)", () => {
+  test("a Warsaw curator's 12:00 is stored as 13:00 Kyiv, both before and after the DST switch", () => {
+    expect(convertToKyivTime("2026-10-03", "12:00 — 13:00", "Europe/Warsaw")).toEqual({ date: "2026-10-03", time: "13:00 — 14:00" });
+    expect(convertToKyivTime("2026-11-10", "12:00 — 13:00", "Europe/Warsaw")).toEqual({ date: "2026-11-10", time: "13:00 — 14:00" });
+  });
+
+  test("round-trips: what the curator typed is what they see again", () => {
+    const stored = convertToKyivTime("2026-11-10", "16:00 — 17:00", "Asia/Almaty");
+    expect(stored).toEqual({ date: "2026-11-10", time: "13:00 — 14:00" });
+    expect(convertEventTime(stored!.date, stored!.time, "Asia/Almaty")).toEqual({ date: "2026-11-10", time: "16:00 — 17:00" });
   });
 });
