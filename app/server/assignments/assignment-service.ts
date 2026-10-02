@@ -14,7 +14,7 @@ import { AuthServiceError } from "@/app/server/auth";
 import { assignmentPrerequisiteGate, isModuleOpenForStudent, seedOpenModuleAccess } from "@/app/server/course/module-access";
 import { courseService } from "@/app/server/course/course-service";
 import { getWorkingPracticumId, isPracticumCompleted } from "@/app/server/course/practicum-service";
-import { sendNewAssignmentNotification, sendNewSubmissionNotification, sendReviewNotification } from "@/app/server/notifications/email-service";
+import { sendLessonAssignmentNotification, sendNewAssignmentNotification, sendNewSubmissionNotification, sendReviewNotification } from "@/app/server/notifications/email-service";
 import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { nextSubmissionStatus } from "./assignment-transition";
@@ -453,7 +453,7 @@ export class AssignmentService {
     const created = await prisma.assignment.findUniqueOrThrow({
       where: { id: assignment },
       include: {
-        module: { select: { id: true, practicumId: true, title: true, position: true, coverPath: true } },
+        module: { select: { id: true, practicumId: true, title: true, position: true, coverPath: true, section: true } },
         submissions: {
           include: {
             feedback: { orderBy: { createdAt: "asc" }, select: { id: true, text: true, createdAt: true, attachments: { orderBy: { createdAt: "asc" }, select: { id: true, originalName: true, mimeType: true, byteSize: true, fileId: true, file: { select: { status: true } } } } } },
@@ -474,20 +474,26 @@ export class AssignmentService {
         await Promise.all(emails.map((email) => sendNewAssignmentNotification({ to: email, assignmentTitle: created.title, assignmentId: created.id })));
       })().catch((error: unknown) => console.error("Practice assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     } else {
-      // Bell only, deliberately no email — see email-service.ts's curated list. Notifying a
-      // student about an assignment sitting behind a module they haven't unlocked yet produces
-      // exactly "the notification arrived but the item isn't in my list" — listForStudent hides
-      // the same assignment under this same isModuleOpenForStudent check, so this makes the two
-      // agree on who's actually told about it.
+      // Bell + email (email added 2026-10-02), but only to students this lesson is already open
+      // for: nothing inside a closed lesson is announced — they get one "Урок открыт" email when
+      // the curator opens it (course-service.ts#setModuleAccess). listForStudent hides the same
+      // assignment under this same isModuleOpenForStudent check, so the two always agree.
       void (async () => {
         const candidateIds = await activeStudentIds(created.module!.practicumId);
         const openChecks = await Promise.all(candidateIds.map(async (studentId) => ({
           studentId,
           open: await isModuleOpenForStudent(prisma, studentId, created.module!.practicumId, created.moduleId!),
         })));
-        const notifiableIds = openChecks.filter((entry) => entry.open).map((entry) => entry.studentId);
+        const openIds = openChecks.filter((entry) => entry.open).map((entry) => entry.studentId);
+        // An Advanced lesson's access rows get written for non-Advanced students too (harmless for
+        // visibility — getForUser hides the lesson from them), so "open" alone would leak its ДЗ.
+        const notifiableIds = created.module!.section === "Advanced"
+          ? (await prisma.user.findMany({ where: { id: { in: openIds }, isAdvanced: true }, select: { id: true } })).map((student) => student.id)
+          : openIds;
         if (notifiableIds.length === 0) return;
         await notificationService.createMany(notifiableIds, "NEW_ASSIGNMENT", `Новое задание: ${created.title}`, created.module!.title, created.id);
+        const recipients = await prisma.user.findMany({ where: { id: { in: notifiableIds }, email: { not: null } }, select: { email: true } });
+        await Promise.all(recipients.map((recipient) => recipient.email && sendLessonAssignmentNotification({ to: recipient.email, assignmentTitle: created.title, moduleTitle: created.module!.title, assignmentId: created.id })));
       })().catch((error: unknown) => console.error("Assignment notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     }
     return this.toStudentDto(created);

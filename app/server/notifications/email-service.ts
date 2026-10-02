@@ -187,25 +187,45 @@ export async function sendEmailVerificationNotification(input: EmailVerification
   }
 }
 
-export async function sendNewModuleNotification(input: { to: string; moduleTitle: string; moduleId: string }): Promise<void> {
+/**
+ * "Урок открыт" — sent when a curator opens a lesson (for the поток or one student). Replaced the
+ * old "Новый урок" email on creation (2026-10-02): a just-created lesson is always closed, so that
+ * mail announced something students couldn't open yet.
+ */
+export async function sendModuleOpenedNotification(input: { to: string; moduleTitle: string; moduleId: string }): Promise<void> {
   try {
     const content: ContentNotificationInput = {
-      eyebrow: "НОВЫЙ УРОК",
+      eyebrow: "УРОК ОТКРЫТ",
       title: input.moduleTitle,
-      body: "В программе практикума появился новый урок. Он откроется, когда куратор даст доступ.",
-      ctaLabel: "Открыть программу",
+      body: "Куратор открыл урок — материалы, записи и задания уже доступны в программе практикума.",
+      ctaLabel: "Открыть урок",
       ctaPath: `/?moduleId=${encodeURIComponent(input.moduleId)}`,
-      accent: "#78adff",
+      accent: "#58d3c7",
     };
-    await sendMutableEmail({ to: input.to, subject: `Новый урок · ${input.moduleTitle}`, html: notificationHtml(content), text: notificationText(content) });
+    await sendMutableEmail({ to: input.to, subject: `Урок открыт · ${input.moduleTitle}`, html: notificationHtml(content), text: notificationText(content) });
   } catch (error) {
-    console.error("Module email delivery failed", error instanceof Error ? error.message : "unknown error");
+    console.error("Module-opened email delivery failed", error instanceof Error ? error.message : "unknown error");
   }
 }
 
-// Unlike sendNewModuleNotification above (bell-only — see the "deliberately no email"
-// comment in assignment-service.ts#create), a practice assignment isn't hidden behind a
-// module lock, so there's no "notification arrived but the item isn't in my list" risk here.
+/** New ДЗ in a lesson — only ever sent to students that lesson is already open for (assignment-service.ts#create). */
+export async function sendLessonAssignmentNotification(input: { to: string; assignmentTitle: string; moduleTitle: string; assignmentId: string }): Promise<void> {
+  try {
+    const content: ContentNotificationInput = {
+      eyebrow: "НОВОЕ ДОМАШНЕЕ ЗАДАНИЕ",
+      title: input.assignmentTitle,
+      body: `В уроке «${input.moduleTitle}» появилось новое домашнее задание. Оно уже доступно в разделе «Задания».`,
+      ctaLabel: "Открыть задание",
+      ctaPath: `/?assignmentId=${encodeURIComponent(input.assignmentId)}`,
+      accent: "#78adff",
+    };
+    await sendMutableEmail({ to: input.to, subject: `Новое ДЗ · ${input.assignmentTitle}`, html: notificationHtml(content), text: notificationText(content) });
+  } catch (error) {
+    console.error("Lesson assignment email delivery failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
+// A practice assignment isn't hidden behind a lesson lock, so it goes to every active student.
 export async function sendNewAssignmentNotification(input: { to: string; assignmentTitle: string; assignmentId: string }): Promise<void> {
   try {
     const content: ContentNotificationInput = {

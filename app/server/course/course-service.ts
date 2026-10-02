@@ -12,7 +12,7 @@ import {
 import { AuthServiceError } from "@/app/server/auth";
 import { prisma } from "@/app/server/db";
 import { activeStudentIds } from "@/app/server/notifications/recipient-service";
-import { sendNewModuleNotification, sendNewMediaNotification } from "@/app/server/notifications/email-service";
+import { sendModuleOpenedNotification, sendNewMediaNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { fileService } from "@/app/server/files";
 import { deleteRecordingObjects } from "@/app/server/streams/livekit-client";
@@ -191,24 +191,9 @@ export class CourseService {
       }
       throw error;
     }
-    // Announced to everyone immediately, unlike NEW_ASSIGNMENT/NEW_MEDIA — a fresh module is
-    // always LOCKED by default (nobody has an EnrollmentModuleAccess row for it yet), so gating
-    // this on isModuleOpenForStudent would mean it never fires at all. This is curriculum news
-    // ("a new lesson exists"), not content-visibility news ("you can watch/submit this now").
-    void (async () => {
-      const candidateIds = await activeStudentIds(practicumId);
-      if (candidateIds.length === 0) return;
-      // An Advanced module's very existence is meant to stay invisible to a non-Advanced
-      // student (see course-service.ts#getForUser) — announcing its title here would leak
-      // exactly that, so this is the one module-creation path that needs the isAdvanced gate.
-      const studentIds = section === "Advanced"
-        ? (await prisma.user.findMany({ where: { id: { in: candidateIds }, isAdvanced: true }, select: { id: true } })).map((student) => student.id)
-        : candidateIds;
-      if (studentIds.length === 0) return;
-      const recipients = await prisma.user.findMany({ where: { id: { in: studentIds }, email: { not: null } }, select: { email: true } });
-      await Promise.all(recipients.map((recipient) => recipient.email && sendNewModuleNotification({ to: recipient.email, moduleTitle: created.title, moduleId: created.id })));
-      await notificationService.createMany(studentIds, "NEW_MODULE", `Новый урок: ${created.title}`, undefined, created.id);
-    })().catch((error: unknown) => console.error("Module notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+    // No notification on creation (2026-10-02): a new lesson is always closed, and nothing inside
+    // a closed lesson is announced. Students hear about it once the curator opens it — see
+    // setModuleAccess ("Урок открыт" email + bell).
     return created;
   }
 
@@ -255,8 +240,19 @@ export class CourseService {
     if (newlyOpenedStudentIds.length > 0) {
       void notificationService.createMany(newlyOpenedStudentIds, "MODULE_OPENED", `Открыт урок: ${courseModule.title}`, undefined, moduleId)
         .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+      void this.emailModuleOpened(newlyOpenedStudentIds, courseModule.title, moduleId);
     }
     return result;
+  }
+
+  /** "Урок открыт" email — the one email about a lesson; nothing is mailed while it's closed. */
+  private async emailModuleOpened(studentIds: readonly string[], moduleTitle: string, moduleId: string): Promise<void> {
+    try {
+      const recipients = await prisma.user.findMany({ where: { id: { in: [...studentIds] }, email: { not: null } }, select: { email: true } });
+      await Promise.all(recipients.map((recipient) => recipient.email && sendModuleOpenedNotification({ to: recipient.email, moduleTitle, moduleId })));
+    } catch (error) {
+      console.error("Module-opened email dispatch failed", error instanceof Error ? error.message : "unknown error");
+    }
   }
 
   /**
@@ -285,6 +281,7 @@ export class CourseService {
     if (unlocked && !wasOpen) {
       void notificationService.create(studentId, "MODULE_OPENED", `Открыт урок: ${courseModule.title}`, undefined, moduleId)
         .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
+      void this.emailModuleOpened([studentId], courseModule.title, moduleId);
     }
     return { moduleId, studentId, status: access.status, isOverride: access.isOverride };
   }
@@ -915,7 +912,10 @@ export class CourseService {
         // isModuleOpenForStudent only checks unlock status, not the Advanced gate (that's a
         // separate axis — see MediaAudience) — an Advanced-tagged recording, module-attached or
         // not, must never announce its title to a non-Advanced student.
-        const notifiableIds = media.audience === MediaAudience.ADVANCED
+        // Same for a recording sitting in an Advanced lesson, whatever its own audience tag:
+        // access rows for an Advanced lesson exist for non-Advanced students too.
+        const inAdvancedLesson = moduleId ? (await prisma.module.findUnique({ where: { id: moduleId }, select: { section: true } }))?.section === "Advanced" : false;
+        const notifiableIds = media.audience === MediaAudience.ADVANCED || inAdvancedLesson
           ? (await prisma.user.findMany({ where: { id: { in: openIds }, isAdvanced: true }, select: { id: true } })).map((student) => student.id)
           : openIds;
         if (notifiableIds.length === 0) return;

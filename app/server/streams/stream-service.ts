@@ -512,11 +512,16 @@ export class StreamService {
     // schedule-event target (Q&A recordings, mostly) has no "closed lesson" to gate on.
     void (async () => {
       const candidateIds = await activeStudentIds(practicumId);
-      const notifiableIds = moduleId
+      const openIds = moduleId
         ? (await Promise.all(candidateIds.map(async (studentId) => ({ studentId, open: await isModuleOpenForStudent(prisma, studentId, practicumId, moduleId) }))))
             .filter((entry) => entry.open)
             .map((entry) => entry.studentId)
         : candidateIds;
+      // An Advanced lesson's access rows exist for non-Advanced students too — see course-service.ts#publishMedia.
+      const inAdvancedLesson = moduleId ? (await prisma.module.findUnique({ where: { id: moduleId }, select: { section: true } }))?.section === "Advanced" : false;
+      const notifiableIds = inAdvancedLesson
+        ? (await prisma.user.findMany({ where: { id: { in: openIds }, isAdvanced: true }, select: { id: true } })).map((student) => student.id)
+        : openIds;
       if (notifiableIds.length === 0) return;
       const recipients = await prisma.user.findMany({ where: { id: { in: notifiableIds }, email: { not: null } }, select: { email: true } });
       await Promise.all(recipients.map((recipient) => recipient.email && sendNewMediaNotification({ to: recipient.email, mediaTitle: media.title ?? "Новая запись", kind: media.kind, mediaId: media.id })));
