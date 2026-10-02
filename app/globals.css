@@ -6041,12 +6041,43 @@ div.discussion-selected-preview-list { width: min(100%, 900px); display: grid; g
   border-color: rgba(59, 208, 130, .3);
 }
 
+/* Holds the scrolling list + the "новые сообщения ↓" button pinned over its bottom edge. */
+.live-room-chat-scroll-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .live-room-chat-messages {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+.live-room-chat-new-messages {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  z-index: 3;
+  transform: translateX(-50%);
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: #5865f2;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .45);
+}
+
+.live-room-chat-new-messages:hover {
+  background: #6b77f5;
 }
 
 .live-room-chat-message {

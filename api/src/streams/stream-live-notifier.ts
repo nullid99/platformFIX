@@ -106,7 +106,7 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
     await streamService.startNewChatSession(practicumId).catch((error: unknown) => {
       console.error("Stream chat session reset failed", error instanceof Error ? error.message : "unknown error");
     });
-    try { this.gateway.broadcastChatReset(); } catch (error) { console.error("Stream chat reset broadcast failed", error instanceof Error ? error.message : "unknown error"); }
+    try { this.gateway.broadcastChatReset(practicumId); } catch (error) { console.error("Stream chat reset broadcast failed", error instanceof Error ? error.message : "unknown error"); }
     // Private stream (1:1, or recording something to publish later) — students already can't
     // get into it (see getPlaybackStatus), and shouldn't get an email/bell telling them it's
     // live either.

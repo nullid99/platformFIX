@@ -5020,9 +5020,29 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boole
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const { messages: chatMessages, connected: chatConnected, chatError, currentUserId, sendMessage, react, deleteMessage } = useStreamChat();
 
+  // Discord-style: follow new messages only while the viewer is at the bottom. Someone scrolled up
+  // reading history stays where they are (2026-10-03: every new message used to yank them down)
+  // and gets a "новые сообщения ↓" button instead. Their own message always jumps to the bottom.
+  const [atBottom, setAtBottom] = useState(true);
+  const atBottomRef = useRef(true);
+  const [seenCount, setSeenCount] = useState(0);
+  const unseenCount = atBottom ? 0 : Math.max(0, chatMessages.length - seenCount);
+  const scrollChatToBottom = (smooth = false) => chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+  const handleChatScroll = () => {
+    const element = chatScrollRef.current;
+    if (!element) return;
+    const nowAtBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+    if (nowAtBottom === atBottomRef.current) return;
+    atBottomRef.current = nowAtBottom;
+    setAtBottom(nowAtBottom);
+    // Leaving the bottom: everything up to here counts as seen; arriving: all of it is.
+    setSeenCount(chatMessages.length);
+  };
+  const lastMessage = chatMessages[chatMessages.length - 1];
   useEffect(() => {
-    chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
-  }, [chatMessages]);
+    const ownMessage = Boolean(lastMessage && currentUserId && lastMessage.authorId === currentUserId);
+    if (atBottomRef.current || ownMessage) chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
+  }, [chatMessages, lastMessage, currentUserId]);
 
   const submitChatMessage = (event: FormEvent) => {
     event.preventDefault();
@@ -5054,7 +5074,8 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boole
 
   return <aside className="content-panel live-room-chat">
     <div className="section-heading"><div><span className="section-kicker">ЧАТ</span><h2>Чат эфира</h2></div>{chatConnected ? <span className="live-room-chat-status online">На связи</span> : <span className="live-room-chat-status">Подключение…</span>}</div>
-    <div className="live-room-chat-messages" ref={chatScrollRef}>
+    <div className="live-room-chat-scroll-wrap">
+    <div className="live-room-chat-messages" ref={chatScrollRef} onScroll={handleChatScroll}>
       {chatMessages.length === 0 ? (
         <div className="live-room-chat-placeholder">
           <MessageSquareText size={22} />
@@ -5062,6 +5083,8 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boole
           <span>Здесь будет обсуждение эфира в реальном времени{isFullscreen ? " — чат остаётся справа и на весь экран." : "."}</span>
         </div>
       ) : chatMessages.map((message) => <ChatMessageRow message={message} currentUserId={currentUserId} showAdvanced={canModerate} onReact={react} onContextMenu={(event, targetMessage) => { event.preventDefault(); setContextMenu({ message: targetMessage, x: event.clientX, y: event.clientY }); }} key={message.id} />)}
+    </div>
+    {unseenCount > 0 && <button type="button" className="live-room-chat-new-messages" onClick={() => scrollChatToBottom(true)}>{unseenCount} {unseenCount % 10 === 1 && unseenCount % 100 !== 11 ? "новое сообщение" : [2, 3, 4].includes(unseenCount % 10) && ![12, 13, 14].includes(unseenCount % 100) ? "новых сообщения" : "новых сообщений"} ↓</button>}
     </div>
     {contextMenu && <ChatContextMenu
       state={contextMenu}

@@ -27,14 +27,26 @@ export class StreamsGateway implements OnGatewayConnection {
   @WebSocketServer()
   private server!: Server;
 
+  /**
+   * One socket.io room per поток. Everything used to go out via server.emit — to every connected
+   * socket — so a message posted from another cohort's chat (a test or finished поток) showed up
+   * live in the current cohort's chat, and a new broadcast's chat reset wiped every cohort's open
+   * chat panel (found 2026-10-03).
+   */
+  private static room(practicumId: string): string {
+    return `practicum:${practicumId}`;
+  }
+
   public async handleConnection(client: Socket): Promise<void> {
     try {
       const cookies = parseCookies(client.handshake.headers.cookie);
       const token = cookies[AUTH_COOKIE_NAMES.session];
       if (!token) throw new AuthServiceError("SESSION_INVALID", "Session is required");
       const session = await authService.validateSession(token);
-      await streamChatService.assertAccess(session.userId);
+      const { practicumId } = await streamChatService.assertAccess(session.userId);
       client.data.userId = session.userId;
+      client.data.practicumId = practicumId;
+      await client.join(StreamsGateway.room(practicumId));
       const history = await streamChatService.listRecent(session.userId);
       client.emit("chat:history", history);
     } catch (error) {
@@ -43,9 +55,15 @@ export class StreamsGateway implements OnGatewayConnection {
     }
   }
 
-  /** Called by StreamLiveNotifier when a new broadcast starts — clears already-open chat panels immediately. */
-  public broadcastChatReset(): void {
-    this.server.emit("chat:history", []);
+  /** Called by StreamLiveNotifier when a new broadcast starts — clears that поток's already-open chat panels immediately. */
+  public broadcastChatReset(practicumId: string): void {
+    this.server.to(StreamsGateway.room(practicumId)).emit("chat:history", []);
+  }
+
+  /** The поток this socket's chat belongs to — fixed at connect, re-checked by every service call. */
+  private roomOf(client: Socket): string | null {
+    const practicumId = client.data.practicumId as string | undefined;
+    return practicumId ? StreamsGateway.room(practicumId) : null;
   }
 
   @SubscribeMessage("chat:send")
@@ -57,7 +75,8 @@ export class StreamsGateway implements OnGatewayConnection {
     const replyToId = typeof payload?.replyToId === "string" ? payload.replyToId : undefined;
     try {
       const message = await streamChatService.postMessage(userId, body, fileId, replyToId);
-      this.server.emit("chat:message", message);
+      const room = this.roomOf(client);
+      if (room) this.server.to(room).emit("chat:message", message);
     } catch (error) {
       client.emit("chat:error", error instanceof AuthServiceError ? error.message : "Не удалось отправить сообщение");
     }
@@ -71,7 +90,8 @@ export class StreamsGateway implements OnGatewayConnection {
     if (!messageId) return;
     try {
       const result = await streamChatService.deleteMessage(userId, messageId);
-      this.server.emit("chat:delete", result);
+      const room = this.roomOf(client);
+      if (room) this.server.to(room).emit("chat:delete", result);
     } catch (error) {
       client.emit("chat:error", error instanceof AuthServiceError ? error.message : "Не удалось удалить сообщение");
     }
@@ -86,7 +106,8 @@ export class StreamsGateway implements OnGatewayConnection {
     if (!messageId || !emoji) return;
     try {
       const result = await streamChatService.toggleReaction(userId, messageId, emoji);
-      this.server.emit("chat:reaction", result);
+      const room = this.roomOf(client);
+      if (room) this.server.to(room).emit("chat:reaction", result);
     } catch (error) {
       client.emit("chat:error", error instanceof AuthServiceError ? error.message : "Не удалось поставить реакцию");
     }
