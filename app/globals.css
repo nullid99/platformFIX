@@ -8451,3 +8451,6 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 .stream-practicum-note strong { color: #fff; }
 .stream-practicum-note.is-warning { color: #f3dca6; background: rgba(243, 201, 105, .08); border-color: rgba(243, 201, 105, .45); border-left: 4px solid #f3c969; }
 .stream-practicum-note.is-warning > svg { color: #f3c969; }
+
+/* "по Киеву 13:00" next to a student's converted event time (see scheduleApiToUi). */
+.event-kyiv-time { margin-left: 8px; color: #7f93a8; font-size: 11px; font-weight: 400; white-space: nowrap; }

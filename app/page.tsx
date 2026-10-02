@@ -56,7 +56,7 @@ import { curatorDashboard, type CuratorNav, type ReviewQueueItem } from "./data/
 import { practicumModules, studentDashboard, type Assignment, type AssignmentStatus, type AssignmentTone, type DashboardNav, type PracticumModule, type PracticumSection, type ScheduleEvent, type StreamItem, type StreamKind } from "./data/student-dashboard";
 import { calculatePracticumProgress } from "./domain/progress";
 import { isDiscordUserId } from "./domain/discord";
-import { zonedTimeToUtc } from "./domain/schedule-time";
+import { EVENT_TIMEZONE, zonedTimeToUtc } from "./domain/schedule-time";
 import AuthPage from "./auth/page";
 
 // All browser requests use the same-origin Next.js proxy. This keeps private media
@@ -465,6 +465,7 @@ type SessionProfile = {
   profile: {
     email: string | null;
     emailVerifiedAt: string | null;
+    timeZone?: string | null;
     displayName: string | null;
     username: string | null;
     identities: Array<{
@@ -686,6 +687,9 @@ function HomeContent() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [sessionProfile, setSessionProfile] = useState<SessionProfile | null>(null);
   const [role, setRole] = useState<UserRole>("student");
+  // Students see schedule times in their own zone (Профиль choice, else the browser's); staff keep
+  // Kyiv, the zone events are created in. Set during render, before children fetch the schedule.
+  setViewerTimeZone(role === "student" && sessionProfile ? (sessionProfile.profile.timeZone || browserTimeZone()) : null);
   // Curator-only: which practicum's title to show next to the breadcrumb, so a curator never has
   // to guess or remember where new content is actually landing — see PracticumManagerCard for the
   // same "workingPracticumId set → that one, else the active one" resolution done server-side.
@@ -1179,10 +1183,27 @@ function ProfileView({ profile, name, initials, role, onProfileUpdated, onLogout
   name: string;
   initials: string;
   role: UserRole;
-  onProfileUpdated: (profile: Pick<SessionProfile["profile"], "email" | "emailVerifiedAt">) => void;
+  onProfileUpdated: (profile: Partial<Pick<SessionProfile["profile"], "email" | "emailVerifiedAt" | "timeZone">>) => void;
   onLogout: () => void;
 }) {
   const [email, setEmail] = useState(profile.email ?? "");
+  const [timeZoneSaving, setTimeZoneSaving] = useState(false);
+  const [timeZoneFeedback, setTimeZoneFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const autoZone = browserTimeZone();
+  const saveTimeZone = async (next: string) => {
+    setTimeZoneSaving(true); setTimeZoneFeedback(null);
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/auth/profile/timezone`, { method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ timeZone: next || null }) });
+      const payload = await response.json().catch(() => ({})) as { data?: { timeZone: string | null }; message?: string };
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось сохранить часовой пояс");
+      onProfileUpdated({ timeZone: payload.data.timeZone });
+      setTimeZoneFeedback({ tone: "success", text: "Сохранено — расписание показывается в выбранном поясе." });
+    } catch (error) {
+      setTimeZoneFeedback({ tone: "error", text: error instanceof Error ? error.message : "Не удалось сохранить часовой пояс" });
+    } finally {
+      setTimeZoneSaving(false);
+    }
+  };
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [backtestBooking, setBacktestBooking] = useState<ScheduleEvent | null | undefined>(undefined);
@@ -1276,6 +1297,27 @@ function ProfileView({ profile, name, initials, role, onProfileUpdated, onLogout
           </div>
           <p className="profile-help">Выбор сохраняется в этом браузере и применяется сразу.</p>
         </section>
+
+        {role === "student" && <section className="content-panel profile-card">
+          <div className="section-heading">
+            <div><span className="section-kicker">РАСПИСАНИЕ</span><h2>Часовой пояс</h2></div>
+            <Clock3 size={19} className="profile-card-icon" />
+          </div>
+          <label className="form-field"><span>Показывать время эфиров и событий</span>
+            <select value={profile.timeZone ?? ""} disabled={timeZoneSaving} onChange={(event) => void saveTimeZone(event.target.value)}>
+              <option value="">Автоматически — {timeZoneTitle(autoZone)} ({timeZoneOffsetLabel(autoZone)})</option>
+              <optgroup label="Страна — город">
+                {COMMON_TIME_ZONES.map((zone) => <option value={zone.id} key={zone.id}>{zone.label} ({timeZoneOffsetLabel(zone.id)})</option>)}
+              </optgroup>
+              {profile.timeZone && !COMMON_TIME_ZONES.some((zone) => zone.id === profile.timeZone) && <option value={profile.timeZone}>{profile.timeZone} ({timeZoneOffsetLabel(profile.timeZone)})</option>}
+              <optgroup label="Все часовые пояса">
+                {allTimeZones().filter((zone) => !COMMON_TIME_ZONES.some((common) => common.id === zone)).map((zone) => <option value={zone} key={zone}>{zone.replace(/_/g, " ")} ({timeZoneOffsetLabel(zone)})</option>)}
+              </optgroup>
+            </select>
+          </label>
+          <p className="profile-help">Эфиры создаются по киевскому времени — платформа сама пересчитывает их в ваш пояс, с учётом перехода на зимнее и летнее время в вашей стране. «Автоматически» берёт пояс из настроек вашего устройства.</p>
+          {timeZoneFeedback && <div className={timeZoneFeedback.tone === "error" ? "file-error" : "form-action-feedback"}>{timeZoneFeedback.text}</div>}
+        </section>}
 
         <section className="content-panel profile-card">
           <div className="section-heading">
@@ -4715,14 +4757,14 @@ function CuratorScheduleEventDetails({ event, streamControls, onEdit, onDelete, 
 
 /** Interpreted as Kyiv time regardless of the viewer's own timezone — see schedule-time.ts. */
 function eventStartDate(event: ScheduleEvent): Date {
-  const startTime = event.time.split(/\s*[—–-]\s*/)[0]?.trim() || "00:00";
-  return zonedTimeToUtc(event.date, startTime);
+  const startTime = (event.kyivTime ?? event.time).split(/\s*[—–-]\s*/)[0]?.trim() || "00:00";
+  return zonedTimeToUtc(event.kyivDate ?? event.date, startTime);
 }
 
 /** "13:00 — 14:00" → 14:00 that day (Kyiv); a single time counts as a 2-hour slot. */
 function eventEndDate(event: ScheduleEvent): Date {
-  const endTime = event.time.split(/\s*[—–-]\s*/)[1]?.trim();
-  return endTime && /^\d{1,2}:\d{2}$/.test(endTime) ? zonedTimeToUtc(event.date, endTime) : new Date(eventStartDate(event).getTime() + 2 * 60 * 60_000);
+  const endTime = (event.kyivTime ?? event.time).split(/\s*[—–-]\s*/)[1]?.trim();
+  return endTime && /^\d{1,2}:\d{2}$/.test(endTime) ? zonedTimeToUtc(event.kyivDate ?? event.date, endTime) : new Date(eventStartDate(event).getTime() + 2 * 60 * 60_000);
 }
 
 /**
@@ -5473,7 +5515,7 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
 
     <section className="content-panel live-room-upcoming">
       <div className="section-heading"><div><span className="section-kicker">РАСПИСАНИЕ</span><h2>Ближайшие эфиры</h2></div><CalendarDays size={18} className="heading-icon" /></div>
-      {upcoming.length > 0 ? <div className="live-room-upcoming-list">{upcoming.map((event) => <button className="live-room-upcoming-row" type="button" key={event.id} onClick={() => onNavigate("Расписание")}><div><strong>{event.title}</strong><span>{event.weekday}, {formatEventDate(event.date)} · {event.time}</span></div><ChevronRight size={16} /></button>)}</div> : <div className="empty-state compact"><CalendarDays size={20} /><strong>Эфиров пока не запланировано</strong><span>Добавь событие в «Расписании», чтобы оно появилось здесь.</span></div>}
+      {upcoming.length > 0 ? <div className="live-room-upcoming-list">{upcoming.map((event) => <button className="live-room-upcoming-row" type="button" key={event.id} onClick={() => onNavigate("Расписание")}><div><strong>{event.title}</strong><span>{event.weekday}, {formatEventDate(event.date)} · {event.time}{event.kyivTimeLabel ? ` (по Киеву ${event.kyivTimeLabel})` : ""}</span></div><ChevronRight size={16} /></button>)}</div> : <div className="empty-state compact"><CalendarDays size={20} /><strong>Эфиров пока не запланировано</strong><span>Добавь событие в «Расписании», чтобы оно появилось здесь.</span></div>}
     </section>
   </div>;
 }
@@ -5583,7 +5625,7 @@ function ScheduleEventForm({ initialDate = toDateKey(new Date()), initialEvent, 
     onCreate({ id: initialEvent?.id ?? `event-${Date.now()}`, date, day: date.slice(-2), month: parsedDate.toLocaleDateString("ru-RU", { month: "short" }).replace(".", "").toUpperCase(), weekday, type, title: title.trim(), time: time.trim(), live: type === "Практическая часть" || type === "Лекция", description: description.trim(), recordingAvailable: initialEvent?.recordingAvailable ?? false, coverPath: coverPath.trim() || undefined, coverFileId: coverFileId || undefined });
   };
 
-  return <form className="content-panel schedule-form" onSubmit={submit}><div className="section-heading"><div><span className="section-kicker">НОВОЕ СОБЫТИЕ</span><h2>Добавить встречу в поток</h2></div><button type="button" className="icon-button compact" aria-label="Закрыть форму" onClick={onCancel}><X size={16} /></button></div><div className="form-body"><div className="form-grid"><label className="form-field form-field-wide"><span>Название</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Разбор рынка в прямом эфире" /></label><label className="form-field"><span>Тип события</span><select value={type} onChange={(event) => setType(event.target.value as ScheduleEvent["type"])}><option>Лекция</option><option>Практическая часть</option><option>Q&A</option><option>Разбор ДЗ</option><option>Бэктест</option><option>Пресессия</option></select>{isBookableSlotType(type) && <small className="form-field-hint">Индивидуальный слот: свободен для записи, пока его не займёт ученик — количество слотов на ученика настраивается в блоке «Лимиты записи» на странице «Расписание».</small>}</label><label className="form-field"><span>Дата</span><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label className="form-field"><span>Время</span><input value={time} onChange={(event) => setTime(event.target.value)} placeholder="19:00 — 20:30" /></label><label className="form-field form-field-wide"><span>Описание</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={3} placeholder="Что будет происходить на встрече и что подготовить ученикам?" /></label></div><div className="schedule-cover-picker"><div><span className="form-section-label">Обложка события</span><p>Выберите готовый шаблон, загрузите фото только для этого события или сохраните новый шаблон для будущих событий.</p></div><div className="schedule-cover-grid">{coverTemplates.map((templateOption) => <div className="schedule-cover-option-wrap" key={templateOption.id}><button type="button" className={`schedule-cover-option ${!coverFileId && coverPath === templateOption.coverPath ? "selected" : ""}`} onClick={() => { setCoverPath(templateOption.coverPath); setCoverFileId(""); setCoverFileName(""); }}><span style={{ backgroundImage: `url("${scheduleCoverImageUrl(templateOption.coverPath)}")` }} /><strong>{templateOption.label}</strong></button><button type="button" className="schedule-cover-delete" aria-label={`Удалить шаблон «${templateOption.label}»`} onClick={() => void deleteTemplate(templateOption)}><X size={12} /></button></div>)}</div><label className="schedule-cover-upload"><Plus size={16} /><span>{coverUploading ? "Загружаем…" : coverFileName || "Выбрать изображение с компьютера"}</span><small>PNG, JPG, WEBP · до 5 МБ · только для этого события</small><input type="file" accept="image/png,image/jpeg,image/webp" disabled={coverUploading} onChange={(event) => { void handleCoverFile(event.target.files?.[0]); event.target.value = ""; }} /></label>{coverError && <div className="file-error" role="alert">{coverError}</div>}<div className="schedule-cover-template-create">{showTemplateForm ? <div className="schedule-cover-template-form"><input value={templateLabel} onChange={(event) => setTemplateLabel(event.target.value)} placeholder="Название шаблона" maxLength={60} /><label className="schedule-cover-upload compact"><Plus size={14} /><span>{templateSaving ? "Сохраняем…" : "Выбрать фото и сохранить как шаблон"}</span><input type="file" accept="image/png,image/jpeg,image/webp" disabled={templateSaving} onChange={(event) => { void handleCreateTemplate(event.target.files?.[0]); event.target.value = ""; }} /></label><button type="button" className="text-button" onClick={() => { setShowTemplateForm(false); setTemplateError(""); setTemplateLabel(""); }}>Отмена</button>{templateError && <div className="file-error" role="alert">{templateError}</div>}</div> : <button type="button" className="text-button" onClick={() => setShowTemplateForm(true)}><Plus size={14} /> Создать шаблон из своего фото</button>}</div></div><div className="create-actions"><button type="button" className="secondary-button" onClick={onCancel}>Отмена</button><button type="submit" className="primary-button" disabled={!canCreate}>Опубликовать событие <ChevronRight size={16} /></button></div></div></form>;
+  return <form className="content-panel schedule-form" onSubmit={submit}><div className="section-heading"><div><span className="section-kicker">НОВОЕ СОБЫТИЕ</span><h2>Добавить встречу в поток</h2></div><button type="button" className="icon-button compact" aria-label="Закрыть форму" onClick={onCancel}><X size={16} /></button></div><div className="form-body"><div className="form-grid"><label className="form-field form-field-wide"><span>Название</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Например, Разбор рынка в прямом эфире" /></label><label className="form-field"><span>Тип события</span><select value={type} onChange={(event) => setType(event.target.value as ScheduleEvent["type"])}><option>Лекция</option><option>Практическая часть</option><option>Q&A</option><option>Разбор ДЗ</option><option>Бэктест</option><option>Пресессия</option></select>{isBookableSlotType(type) && <small className="form-field-hint">Индивидуальный слот: свободен для записи, пока его не займёт ученик — количество слотов на ученика настраивается в блоке «Лимиты записи» на странице «Расписание».</small>}</label><label className="form-field"><span>Дата</span><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label className="form-field"><span>Время (по Киеву)</span><input value={time} onChange={(event) => setTime(event.target.value)} placeholder="19:00 — 20:30" /></label><label className="form-field form-field-wide"><span>Описание</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={3} placeholder="Что будет происходить на встрече и что подготовить ученикам?" /></label></div><div className="schedule-cover-picker"><div><span className="form-section-label">Обложка события</span><p>Выберите готовый шаблон, загрузите фото только для этого события или сохраните новый шаблон для будущих событий.</p></div><div className="schedule-cover-grid">{coverTemplates.map((templateOption) => <div className="schedule-cover-option-wrap" key={templateOption.id}><button type="button" className={`schedule-cover-option ${!coverFileId && coverPath === templateOption.coverPath ? "selected" : ""}`} onClick={() => { setCoverPath(templateOption.coverPath); setCoverFileId(""); setCoverFileName(""); }}><span style={{ backgroundImage: `url("${scheduleCoverImageUrl(templateOption.coverPath)}")` }} /><strong>{templateOption.label}</strong></button><button type="button" className="schedule-cover-delete" aria-label={`Удалить шаблон «${templateOption.label}»`} onClick={() => void deleteTemplate(templateOption)}><X size={12} /></button></div>)}</div><label className="schedule-cover-upload"><Plus size={16} /><span>{coverUploading ? "Загружаем…" : coverFileName || "Выбрать изображение с компьютера"}</span><small>PNG, JPG, WEBP · до 5 МБ · только для этого события</small><input type="file" accept="image/png,image/jpeg,image/webp" disabled={coverUploading} onChange={(event) => { void handleCoverFile(event.target.files?.[0]); event.target.value = ""; }} /></label>{coverError && <div className="file-error" role="alert">{coverError}</div>}<div className="schedule-cover-template-create">{showTemplateForm ? <div className="schedule-cover-template-form"><input value={templateLabel} onChange={(event) => setTemplateLabel(event.target.value)} placeholder="Название шаблона" maxLength={60} /><label className="schedule-cover-upload compact"><Plus size={14} /><span>{templateSaving ? "Сохраняем…" : "Выбрать фото и сохранить как шаблон"}</span><input type="file" accept="image/png,image/jpeg,image/webp" disabled={templateSaving} onChange={(event) => { void handleCreateTemplate(event.target.files?.[0]); event.target.value = ""; }} /></label><button type="button" className="text-button" onClick={() => { setShowTemplateForm(false); setTemplateError(""); setTemplateLabel(""); }}>Отмена</button>{templateError && <div className="file-error" role="alert">{templateError}</div>}</div> : <button type="button" className="text-button" onClick={() => setShowTemplateForm(true)}><Plus size={14} /> Создать шаблон из своего фото</button>}</div></div><div className="create-actions"><button type="button" className="secondary-button" onClick={onCancel}>Отмена</button><button type="submit" className="primary-button" disabled={!canCreate}>Опубликовать событие <ChevronRight size={16} /></button></div></div></form>;
 }
 
 type SubmissionFormat = "comment" | "image" | "video";
@@ -6245,7 +6287,126 @@ function scheduleApiTypeToUi(type: ScheduleApiEvent["type"]): ScheduleEvent["typ
   return "Практическая часть";
 }
 
+/**
+ * Time zone schedule times are shown in — null = as stored (Kyiv). Module-level because
+ * scheduleApiToUi is called from many views' fetch callbacks; Home sets it from the session.
+ */
+let viewerTimeZone: string | null = null;
+function setViewerTimeZone(zone: string | null) {
+  viewerTimeZone = zone && zone !== EVENT_TIMEZONE ? zone : null;
+}
+
+function browserTimeZone(): string {
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || EVENT_TIMEZONE;
+    // Older ICU data still reports Kyiv under its pre-2022 spelling.
+    return zone === "Europe/Kiev" ? "Europe/Kyiv" : zone;
+  } catch {
+    return EVENT_TIMEZONE;
+  }
+}
+
+/** UTC instant → { date "YYYY-MM-DD", time "HH:MM" } as seen in `timeZone`. */
+function wallClockIn(instant: Date, timeZone: string): { date: string; time: string } {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(instant).map((part) => [part.type, part.value]));
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+}
+
+/**
+ * Kyiv "YYYY-MM-DD" + "13:00 — 14:00" → the same moment in the viewer's zone. Converted per event
+ * date, so a different DST schedule (Kyiv switches, Kazakhstan doesn't) is right on both sides of
+ * the switch. Free-text times that aren't "HH:MM[ — HH:MM]" are left as typed.
+ */
+export function convertEventTime(date: string, time: string, timeZone: string): { date: string; time: string } | null {
+  const match = time.match(/^\s*(\d{1,2}:\d{2})\s*(?:[—–-]\s*(\d{1,2}:\d{2}))?\s*$/);
+  if (!match) return null;
+  const start = wallClockIn(zonedTimeToUtc(date, match[1]), timeZone);
+  const end = match[2] ? wallClockIn(zonedTimeToUtc(date, match[2]), timeZone) : null;
+  return { date: start.date, time: end ? `${start.time} — ${end.time}` : start.time };
+}
+
+/** Common zones for this audience, labelled "Страна — город" (the IANA id carries the DST rules). */
+const COMMON_TIME_ZONES: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "Europe/Kyiv", label: "Украина — Киев" },
+  { id: "Europe/Warsaw", label: "Польша — Варшава" },
+  { id: "Europe/Berlin", label: "Германия — Берлин" },
+  { id: "Europe/Prague", label: "Чехия — Прага" },
+  { id: "Europe/Vienna", label: "Австрия — Вена" },
+  { id: "Europe/Bratislava", label: "Словакия — Братислава" },
+  { id: "Europe/Budapest", label: "Венгрия — Будапешт" },
+  { id: "Europe/Bucharest", label: "Румыния — Бухарест" },
+  { id: "Europe/Chisinau", label: "Молдова — Кишинёв" },
+  { id: "Europe/Vilnius", label: "Литва — Вильнюс" },
+  { id: "Europe/Riga", label: "Латвия — Рига" },
+  { id: "Europe/Tallinn", label: "Эстония — Таллин" },
+  { id: "Europe/Helsinki", label: "Финляндия — Хельсинки" },
+  { id: "Europe/Stockholm", label: "Швеция — Стокгольм" },
+  { id: "Europe/Oslo", label: "Норвегия — Осло" },
+  { id: "Europe/Copenhagen", label: "Дания — Копенгаген" },
+  { id: "Europe/Amsterdam", label: "Нидерланды — Амстердам" },
+  { id: "Europe/Brussels", label: "Бельгия — Брюссель" },
+  { id: "Europe/Paris", label: "Франция — Париж" },
+  { id: "Europe/Zurich", label: "Швейцария — Цюрих" },
+  { id: "Europe/Rome", label: "Италия — Рим" },
+  { id: "Europe/Madrid", label: "Испания — Мадрид" },
+  { id: "Europe/Lisbon", label: "Португалия — Лиссабон" },
+  { id: "Europe/London", label: "Великобритания — Лондон" },
+  { id: "Europe/Dublin", label: "Ирландия — Дублин" },
+  { id: "Europe/Athens", label: "Греция — Афины" },
+  { id: "Asia/Nicosia", label: "Кипр — Никосия" },
+  { id: "Europe/Istanbul", label: "Турция — Стамбул" },
+  { id: "Asia/Tbilisi", label: "Грузия — Тбилиси" },
+  { id: "Asia/Yerevan", label: "Армения — Ереван" },
+  { id: "Asia/Baku", label: "Азербайджан — Баку" },
+  { id: "Asia/Jerusalem", label: "Израиль — Иерусалим" },
+  { id: "Asia/Dubai", label: "ОАЭ — Дубай" },
+  { id: "Asia/Almaty", label: "Казахстан — Алматы" },
+  { id: "Asia/Tashkent", label: "Узбекистан — Ташкент" },
+  { id: "Asia/Bishkek", label: "Кыргызстан — Бишкек" },
+  { id: "Asia/Bangkok", label: "Таиланд — Бангкок" },
+  { id: "Asia/Makassar", label: "Индонезия — Бали" },
+  { id: "Asia/Singapore", label: "Сингапур" },
+  { id: "Asia/Tokyo", label: "Япония — Токио" },
+  { id: "America/New_York", label: "США — Нью-Йорк" },
+  { id: "America/Chicago", label: "США — Чикаго" },
+  { id: "America/Denver", label: "США — Денвер" },
+  { id: "America/Los_Angeles", label: "США — Лос-Анджелес" },
+  { id: "America/Toronto", label: "Канада — Торонто" },
+  { id: "America/Vancouver", label: "Канада — Ванкувер" },
+  { id: "America/Mexico_City", label: "Мексика — Мехико" },
+  { id: "America/Sao_Paulo", label: "Бразилия — Сан-Паулу" },
+  { id: "America/Argentina/Buenos_Aires", label: "Аргентина — Буэнос-Айрес" },
+  { id: "Australia/Sydney", label: "Австралия — Сидней" },
+];
+
+function timeZoneTitle(zone: string): string {
+  return COMMON_TIME_ZONES.find((item) => item.id === zone)?.label ?? zone.replace(/_/g, " ");
+}
+
+function allTimeZones(): string[] {
+  try { return (Intl as unknown as { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf?.("timeZone") ?? []; } catch { return []; }
+}
+
+/** "UTC+2" style offset of `timeZone` right now — for labels. */
+function timeZoneOffsetLabel(timeZone: string): string {
+  try {
+    const name = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "shortOffset" }).formatToParts(new Date()).find((part) => part.type === "timeZoneName")?.value ?? "GMT";
+    return name.replace("GMT", "UTC").replace(/^UTC$/, "UTC+0");
+  } catch {
+    return "";
+  }
+}
+
 function scheduleApiToUi(event: ScheduleApiEvent): ScheduleEvent {
+  const converted = viewerTimeZone ? convertEventTime(event.date, event.time, viewerTimeZone) : null;
+  const kyivTimeLabel = converted && (converted.time !== event.time || converted.date !== event.date) ? event.time : undefined;
+  if (converted && kyivTimeLabel) {
+    return { ...scheduleApiToUiAsStored({ ...event, date: converted.date, time: converted.time }), kyivDate: event.date, kyivTime: event.time, kyivTimeLabel };
+  }
+  return scheduleApiToUiAsStored(event);
+}
+
+function scheduleApiToUiAsStored(event: ScheduleApiEvent): ScheduleEvent {
   const parsedDate = new Date(`${event.date}T12:00:00`);
   return { id: event.id, date: event.date, day: event.date.slice(-2), month: parsedDate.toLocaleDateString("ru-RU", { month: "short" }).replace(".", "").toUpperCase(), weekday: parsedDate.toLocaleDateString("ru-RU", { weekday: "long" }), type: scheduleApiTypeToUi(event.type), title: event.title, time: event.time, live: event.live, description: event.description, recordingAvailable: event.recordingAvailable, recordingIds: event.recordings.filter((recording) => recording.status === "PUBLISHED").map((recording) => recording.id), coverPath: event.coverPath ?? undefined, bookedByStudentId: event.bookedByStudentId, bookedByStudentName: event.bookedByStudentName, isBookedByActor: event.isBookedByActor, slotLimit: event.slotLimit , streamEndedAt: event.streamEndedAt ?? null };
 }
@@ -6364,7 +6525,7 @@ function RichScheduleEventDetails({ event, liveNow, onOpenStreams: navigateToStr
   } else {
     footerAction = <button className="primary-button" disabled>{phase === "ended" ? "Эфир завершён" : phase === "past" ? "Событие прошло" : "Эфир ещё не начался"}</button>;
   }
-  return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal" role="dialog" aria-modal="true" aria-labelledby="rich-schedule-event-title"><div className="rich-event-topbar"><h2 id="rich-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>Участники потока</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong></div><h3>{event.title}</h3><div className="rich-event-line"><span>◉</span><span>Project FIX</span></div><div className="rich-event-line"><CalendarDays size={16} /><span>{formattedDate}</span></div><div className="rich-event-description">{event.description}</div>{isBookable && event.isBookedByActor && <div className="event-recording-note"><Target size={16} /><div><strong>Слот забронирован за вами</strong><span>Куратор свяжется с вами по расписанному времени.</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Запись доступна в разделе «Стримы» и останется там после завершения события.</span></div></div>}{!isBookable && !event.recordingAvailable && phase === "ended" && <div className="event-recording-note"><Play size={16} /><div><strong>Эфир завершён</strong><span>Запись скоро появится — куратор опубликует её здесь после проверки.</span></div></div>}</div><div className="rich-event-footer">{footerAction}</div></section></div>;
+  return <div className="event-details-overlay" role="presentation" onMouseDown={(mouseEvent) => { if (mouseEvent.target === mouseEvent.currentTarget) onClose(); }}><section className="event-details-modal rich-event-modal" role="dialog" aria-modal="true" aria-labelledby="rich-schedule-event-title"><div className="rich-event-topbar"><h2 id="rich-schedule-event-title">{event.title}</h2><button className="icon-button compact" aria-label="Закрыть детали события" onClick={onClose}><X size={20} /></button></div>{coverPath && <div className="rich-event-cover" role="img" aria-label={`Обложка события: ${event.title}`} style={{ backgroundImage: `url("${coverPath}")` }} />}<div className="rich-event-tabs"><span className="active">Сведения о событии</span><span>Участники потока</span></div><div className="rich-event-body"><div className="rich-event-date"><Clock3 size={17} /><strong>{event.weekday} · {event.time}</strong>{event.kyivTimeLabel && <span className="event-kyiv-time">по Киеву {event.kyivTimeLabel}</span>}</div><h3>{event.title}</h3><div className="rich-event-line"><span>◉</span><span>Project FIX</span></div><div className="rich-event-line"><CalendarDays size={16} /><span>{formattedDate}</span></div><div className="rich-event-description">{event.description}</div>{isBookable && event.isBookedByActor && <div className="event-recording-note"><Target size={16} /><div><strong>Слот забронирован за вами</strong><span>Куратор свяжется с вами по расписанному времени.</span></div></div>}{event.recordingAvailable && <div className="event-recording-note"><Play size={16} /><div><strong>Запись уже добавлена</strong><span>Запись доступна в разделе «Стримы» и останется там после завершения события.</span></div></div>}{!isBookable && !event.recordingAvailable && phase === "ended" && <div className="event-recording-note"><Play size={16} /><div><strong>Эфир завершён</strong><span>Запись скоро появится — куратор опубликует её здесь после проверки.</span></div></div>}</div><div className="rich-event-footer">{footerAction}</div></section></div>;
 }
 
 function startOfMonth(date: Date) {
@@ -6439,7 +6600,7 @@ function ScheduleEventCard({ event, selected, liveNow = false, mode = "student",
     actionButton = <button className="event-register" disabled>{phase === "ended" ? "Эфир завершён" : phase === "past" ? "Прошло" : "Скоро"}</button>;
   }
 
-  return <div className={`event-card schedule-event-card ${coverPath ? "has-cover" : ""} ${selected ? "selected" : ""}`} style={coverStyle}><button className="event-card-main" onClick={onOpen}><div className={`event-date ${eventTone(event)}`}><strong>{event.day}</strong><span>{event.month}</span></div><div className="event-info"><div className="event-type">{event.live && <span className="live-dot" />} {event.type.toUpperCase()}</div><h3>{event.title}</h3><p><Clock3 size={14} /> {event.weekday} · {event.time}</p>{isBookable && mode === "curator" && <p className="event-backtest-status">{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот свободен"}</p>}{!isBookable && mode === "curator" && event.streamEndedAt && <p className="event-backtest-status">Эфир завершён</p>}</div></button>{actionButton}{mode === "student" && event.recordingAvailable && onOpenStreams && <button className="event-recording-link" onClick={(clickEvent) => { clickEvent.stopPropagation(); onOpenStreams(); }}><Play size={14} /> Запись добавлена · смотреть в «Стримах»</button>}</div>;
+  return <div className={`event-card schedule-event-card ${coverPath ? "has-cover" : ""} ${selected ? "selected" : ""}`} style={coverStyle}><button className="event-card-main" onClick={onOpen}><div className={`event-date ${eventTone(event)}`}><strong>{event.day}</strong><span>{event.month}</span></div><div className="event-info"><div className="event-type">{event.live && <span className="live-dot" />} {event.type.toUpperCase()}</div><h3>{event.title}</h3><p><Clock3 size={14} /> {event.weekday} · {event.time}{event.kyivTimeLabel && <span className="event-kyiv-time">по Киеву {event.kyivTimeLabel}</span>}</p>{isBookable && mode === "curator" && <p className="event-backtest-status">{event.bookedByStudentName ? `Записан: ${event.bookedByStudentName}` : "Слот свободен"}</p>}{!isBookable && mode === "curator" && event.streamEndedAt && <p className="event-backtest-status">Эфир завершён</p>}</div></button>{actionButton}{mode === "student" && event.recordingAvailable && onOpenStreams && <button className="event-recording-link" onClick={(clickEvent) => { clickEvent.stopPropagation(); onOpenStreams(); }}><Play size={14} /> Запись добавлена · смотреть в «Стримах»</button>}</div>;
 }
 
 function eventCoverPath(event: ScheduleEvent): string | undefined {
@@ -6575,7 +6736,7 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
 
     <section className="content-panel live-room-upcoming">
       <div className="section-heading"><div><span className="section-kicker">РАСПИСАНИЕ</span><h2>Ближайшие эфиры</h2></div><CalendarDays size={18} className="heading-icon" /></div>
-      {upcoming.length > 0 ? <div className="live-room-upcoming-list">{upcoming.map((event) => <button className="live-room-upcoming-row" type="button" key={event.id} onClick={() => onNavigate("Расписание")}><div><strong>{event.title}</strong><span>{event.weekday}, {formatEventDate(event.date)} · {event.time}</span></div><ChevronRight size={16} /></button>)}</div> : <div className="empty-state compact"><CalendarDays size={20} /><strong>Эфиров пока не запланировано</strong><span>Загляни в «Расписание» — там появятся ближайшие встречи.</span></div>}
+      {upcoming.length > 0 ? <div className="live-room-upcoming-list">{upcoming.map((event) => <button className="live-room-upcoming-row" type="button" key={event.id} onClick={() => onNavigate("Расписание")}><div><strong>{event.title}</strong><span>{event.weekday}, {formatEventDate(event.date)} · {event.time}{event.kyivTimeLabel ? ` (по Киеву ${event.kyivTimeLabel})` : ""}</span></div><ChevronRight size={16} /></button>)}</div> : <div className="empty-state compact"><CalendarDays size={20} /><strong>Эфиров пока не запланировано</strong><span>Загляни в «Расписание» — там появятся ближайшие встречи.</span></div>}
     </section>
   </div>;
 }

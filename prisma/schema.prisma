@@ -202,6 +202,9 @@ model User {
   // practicum-service.ts#getWorkingPracticumId. Two staff members can point at different
   // practicums at the same time without affecting each other or the live-stream target.
   workingPracticumId        String?
+  /// IANA zone the student picked in "Профиль" ("Europe/Berlin"); null = take it from the browser.
+  /// Schedule times are stored as Kyiv wall-clock (schedule-time.ts) and only converted for display.
+  timeZone                  String?
   workingPracticum          Practicum?               @relation("UserWorkingPracticum", fields: [workingPracticumId], references: [id], onDelete: SetNull)
   startedStreamsFor         Practicum[]              @relation("PracticumStreamStartedBy")
 

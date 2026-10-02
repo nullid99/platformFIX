@@ -400,6 +400,7 @@ export class AuthService {
     profile: {
       email: string | null;
       emailVerifiedAt: Date | null;
+      timeZone: string | null;
       displayName: string | null;
       username: string | null;
       avatarUrl: string | null;
@@ -423,6 +424,7 @@ export class AuthService {
             status: true,
             email: true,
             emailVerifiedAt: true,
+            timeZone: true,
             workingPracticumId: true,
             externalIdentities: {
               orderBy: { createdAt: "asc" },
@@ -462,6 +464,7 @@ export class AuthService {
       profile: {
         email: session.user.email,
         emailVerifiedAt: session.user.emailVerifiedAt,
+        timeZone: session.user.timeZone,
         displayName: session.user.externalIdentities[0]?.displayName ?? null,
         username: session.user.externalIdentities[0]?.username ?? null,
         avatarUrl: session.user.externalIdentities[0]?.avatarUrl ?? null,
@@ -972,6 +975,19 @@ export class AuthService {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") throw new AuthServiceError("INVALID_INPUT", "This email is already used");
       throw new AuthServiceError("INVALID_INPUT", "Student email could not be updated");
     }
+  }
+
+  /** "Часовой пояс" in Профиль — an IANA zone name, or null for "Автоматически (по браузеру)". */
+  public async updateOwnTimeZone(actorId: string, rawTimeZone: string | null): Promise<{ timeZone: string | null }> {
+    const timeZone = rawTimeZone?.trim() || null;
+    if (timeZone) {
+      let valid = timeZone.length <= 64;
+      try { new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date()); } catch { valid = false; }
+      if (!valid) throw new AuthServiceError("INVALID_INPUT", "Неизвестный часовой пояс");
+    }
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { status: true } });
+    if (!actor || actor.status !== UserStatus.ACTIVE) throw new AuthServiceError("FORBIDDEN", "Account is not active");
+    return prisma.user.update({ where: { id: actorId }, data: { timeZone }, select: { timeZone: true } });
   }
 
   public async updateOwnEmail(actorId: string, rawEmail: string): Promise<{ email: string | null; emailVerifiedAt: Date | null; verificationSent: boolean }> {

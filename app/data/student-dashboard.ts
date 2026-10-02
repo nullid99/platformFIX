@@ -136,6 +136,11 @@ export type ScheduleEvent = {
   slotLimit?: number | null;
   /** ISO time the curator pressed "Завершить эфир" for this event, or null. */
   streamEndedAt?: string | null;
+  /** The event's own Kyiv date/time as stored — `date`/`time` above may be converted to the viewing student's time zone. */
+  kyivDate?: string;
+  kyivTime?: string;
+  /** Set only when `time` was converted and differs from Kyiv: shown as "по Киеву 13:00". */
+  kyivTimeLabel?: string;
 };
 
 export const studentDashboard = {

@@ -155,6 +155,19 @@ export class AuthController {
     }
   }
 
+  @Patch("profile/timezone")
+  public async updateTimeZone(@Req() request: RequestWithCookies, @Body() body: { timeZone?: unknown }) {
+    const session = await this.requireSession(request);
+    if (body?.timeZone !== null && body?.timeZone !== undefined && typeof body.timeZone !== "string") {
+      throw new BadRequestException("timeZone must be a string or null");
+    }
+    try {
+      return { data: await authService.updateOwnTimeZone(session.userId, typeof body?.timeZone === "string" ? body.timeZone : null) };
+    } catch (error) {
+      mapAuthError(error);
+    }
+  }
+
   @Patch("profile")
   public async updateProfile(
     @Req() request: RequestWithCookies,
