@@ -1,4 +1,4 @@
-import { Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { Inject, Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { streamService } from "@/app/server/streams";
 import { isStreamPrivate } from "@/app/server/streams/stream-visibility";
 import { activeStudentEmails, activeStudentIds } from "@/app/server/notifications/recipient-service";
@@ -40,7 +40,10 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
   private readonly state = new Map<string, PracticumLiveState>();
   private tickCount = 0;
 
-  constructor(private readonly gateway: StreamsGateway) {}
+  // Explicit @Inject: the API runs under tsx (esbuild), which doesn't emit decorator type
+  // metadata, so Nest can't infer this from the parameter type — it silently injected
+  // undefined and crashed the whole API the first time a broadcast was confirmed (2026-10-02).
+  constructor(@Inject(StreamsGateway) private readonly gateway: StreamsGateway) {}
 
   public onModuleInit(): void {
     // If the API restarts mid-broadcast, no room_started webhook re-fires (the room didn't just
@@ -84,7 +87,8 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
       if (!current.notified && sustainedMs >= SUSTAIN_BEFORE_NOTIFY_MS) {
         const gapSinceLastLive = current.lastLiveAt !== null ? now - current.lastLiveAt : Infinity;
         this.state.set(practicumId, { ...current, notified: true, lastLiveAt: now });
-        void this.handleConfirmedLive(practicumId, gapSinceLastLive >= NEW_SESSION_GAP_MS);
+        // Never let a notification problem take the API down mid-broadcast.
+        void this.handleConfirmedLive(practicumId, gapSinceLastLive >= NEW_SESSION_GAP_MS).catch((error: unknown) => console.error("Stream live handling failed", error instanceof Error ? error.message : "unknown error"));
       } else if (current.notified) {
         // Only a *confirmed* broadcast refreshes lastLiveAt. Refreshing it while still inside the
         // sustain window (as this used to, unconditionally) meant the confirming tick always saw
@@ -102,7 +106,7 @@ export class StreamLiveNotifier implements OnModuleInit, OnModuleDestroy {
     await streamService.startNewChatSession(practicumId).catch((error: unknown) => {
       console.error("Stream chat session reset failed", error instanceof Error ? error.message : "unknown error");
     });
-    this.gateway.broadcastChatReset();
+    try { this.gateway.broadcastChatReset(); } catch (error) { console.error("Stream chat reset broadcast failed", error instanceof Error ? error.message : "unknown error"); }
     // Private stream (1:1, or recording something to publish later) — students already can't
     // get into it (see getPlaybackStatus), and shouldn't get an email/bell telling them it's
     // live either.

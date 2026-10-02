@@ -37,4 +37,11 @@ async function bootstrap(): Promise<void> {
   console.log(`FIX API listening on port ${port}`);
 }
 
+// A stray rejected promise in a background job (notifiers, webhooks — mostly fire-and-forget
+// `void` calls) must be logged, not kill the API for every user: on 2026-10-02 one such error in
+// the live-stream notifier restarted the whole server mid-broadcast.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection", reason instanceof Error ? reason.stack ?? reason.message : reason);
+});
+
 void bootstrap();
