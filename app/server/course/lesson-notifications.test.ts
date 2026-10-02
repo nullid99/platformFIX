@@ -55,14 +55,22 @@ describe("lesson notifications follow the lesson's open/closed state", () => {
     expect(await bells("NEW_ASSIGNMENT")).toEqual([]);
   });
 
-  it("opening the lesson sends 'Урок открыт'", async () => {
+  it("opening the lesson sends 'Урок открыт' and a bell for the ДЗ already inside (sidebar counter)", async () => {
     await courseService.setModuleAccess(curatorId, moduleId, true);
     expect(await bells("MODULE_OPENED")).toEqual([{ title: `Открыт урок: Урок ${suffix}` }]);
+    expect(await bells("NEW_ASSIGNMENT")).toEqual([{ title: "Новое задание: ДЗ в закрытом уроке" }]);
   });
 
   it("open lesson: a new ДЗ is announced", async () => {
     const created = await assignmentService.create(curatorId, { moduleId, title: "ДЗ в открытом уроке", description: "fixture", requirements: [], allowedFormats: [] });
     assignmentIds.push(created.id);
-    expect(await bells("NEW_ASSIGNMENT")).toEqual([{ title: "Новое задание: ДЗ в открытом уроке" }]);
+    const deadline = Date.now() + 1_500;
+    let titles: string[] = [];
+    while (Date.now() < deadline) {
+      titles = (await bells("NEW_ASSIGNMENT")).map((row) => row.title);
+      if (titles.length >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(titles.sort()).toEqual(["Новое задание: ДЗ в закрытом уроке", "Новое задание: ДЗ в открытом уроке"]);
   });
 });

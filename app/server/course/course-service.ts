@@ -241,11 +241,41 @@ export class CourseService {
       void notificationService.createMany(newlyOpenedStudentIds, "MODULE_OPENED", `Открыт урок: ${courseModule.title}`, undefined, moduleId)
         .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
       void this.emailModuleOpened(newlyOpenedStudentIds, courseModule.title, moduleId);
+      void this.announceLessonContent(newlyOpenedStudentIds, moduleId);
     }
     return result;
   }
 
   /** "Урок открыт" email — the one email about a lesson; nothing is mailed while it's closed. */
+  /**
+   * Bell rows (no email — the one "Урок открыт" email covers it) for every ДЗ and recording already
+   * sitting in a lesson that just opened. Nothing inside a closed lesson is announced when it's
+   * added, so without this the "Задания"/"Записи" sidebar counters — which count exactly these
+   * unread bells — stayed empty after opening a lesson that already had content (2026-10-02).
+   */
+  private async announceLessonContent(studentIds: readonly string[], moduleId: string): Promise<void> {
+    try {
+      if (studentIds.length === 0) return;
+      const [courseModule, assignments, media] = await Promise.all([
+        prisma.module.findUnique({ where: { id: moduleId }, select: { title: true } }),
+        prisma.assignment.findMany({ where: { moduleId, status: AssignmentStatus.PUBLISHED }, orderBy: { createdAt: "asc" }, select: { id: true, title: true } }),
+        prisma.mediaAsset.findMany({ where: { moduleId, status: MediaAssetStatus.PUBLISHED }, orderBy: [{ position: "asc" }, { createdAt: "asc" }], select: { id: true, title: true, audience: true } }),
+      ]);
+      for (const assignment of assignments) {
+        await notificationService.createMany(studentIds, "NEW_ASSIGNMENT", `Новое задание: ${assignment.title}`, courseModule?.title, assignment.id);
+      }
+      const advancedIds = media.some((item) => item.audience === MediaAudience.ADVANCED)
+        ? (await prisma.user.findMany({ where: { id: { in: [...studentIds] }, isAdvanced: true }, select: { id: true } })).map((student) => student.id)
+        : [];
+      for (const item of media) {
+        const recipients = item.audience === MediaAudience.ADVANCED ? advancedIds : studentIds;
+        if (recipients.length > 0) await notificationService.createMany(recipients, "NEW_MEDIA", `Новая запись: ${item.title ?? "без названия"}`, undefined, item.id);
+      }
+    } catch (error) {
+      console.error("Lesson content notification dispatch failed", error instanceof Error ? error.message : "unknown error");
+    }
+  }
+
   private async emailModuleOpened(studentIds: readonly string[], moduleTitle: string, moduleId: string): Promise<void> {
     try {
       const recipients = await prisma.user.findMany({ where: { id: { in: [...studentIds] }, email: { not: null } }, select: { email: true } });
@@ -282,6 +312,7 @@ export class CourseService {
       void notificationService.create(studentId, "MODULE_OPENED", `Открыт урок: ${courseModule.title}`, undefined, moduleId)
         .catch((error: unknown) => console.error("Module-opened notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
       void this.emailModuleOpened([studentId], courseModule.title, moduleId);
+      void this.announceLessonContent([studentId], moduleId);
     }
     return { moduleId, studentId, status: access.status, isOverride: access.isOverride };
   }
