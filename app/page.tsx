@@ -4863,6 +4863,35 @@ function formatHostTime(iso: string): string {
 }
 
 /**
+ * "Эфир пойдёт в поток: …" on "Стримы", with a warning when that's likely a mistake — a bigger
+ * unfinished поток exists (e.g. left on a test поток after testing), or the curator's own working
+ * поток (what their "Расписание" shows) is a different one.
+ */
+function StreamPracticumNote() {
+  const [info, setInfo] = useState<StreamPracticumApiDto | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`${API_ORIGIN}/api/streams/target`, { credentials: "include", cache: "no-store" })
+      .then((response) => response.ok ? response.json() as Promise<{ data?: StreamTargetApiDto }> : null)
+      .then((payload) => { if (!cancelled) setInfo(payload?.data?.practicum ?? null); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+  if (!info) return null;
+  const warnings = [
+    info.biggerPracticum && `В потоке «${info.biggerPracticum.title}» ${pluralizeStudents(info.biggerPracticum.students)} — если эфир для них, владелец должен назначить этот поток в «Потоках» → «Назначить для эфиров».`,
+    info.workingPracticumTitle && `Ваш рабочий поток — «${info.workingPracticumTitle}» (его вы видите в «Расписании»), а эфир пойдёт в «${info.title}». «Начать стрим» сработает только на событиях потока «${info.title}».`,
+  ].filter(Boolean) as string[];
+  return <div className={`stream-practicum-note ${warnings.length ? "is-warning" : ""}`} role={warnings.length ? "alert" : "status"}>
+    {warnings.length ? <AlertTriangle size={16} /> : <UsersRoundIcon />}
+    <div>
+      <strong>Эфир пойдёт в поток: {info.title} · {pluralizeStudents(info.students)}</strong>
+      {warnings.map((warning) => <span key={warning}>{warning}</span>)}
+    </div>
+  </div>;
+}
+
+/**
  * "Эфир ведёт: Имя" on "Стримы" — all curators share one OBS key, so the platform shows who pressed
  * "Начать стрим" (StreamService#resolveStreamHost); a second curator then knows not to start OBS too.
  */
@@ -5081,7 +5110,8 @@ function ArchivedChatPanel({ mediaId }: { mediaId: string }) {
 }
 
 type StreamHostApiDto = { name: string; startedAt: string; isMe: boolean } | null;
-type StreamTargetApiDto = { host?: StreamHostApiDto; moduleId: string | null; moduleTitle: string | null; scheduleEventId: string | null; scheduleEventTitle: string | null; mediaKind: "STREAM" | "QA" | null };
+type StreamPracticumApiDto = { title: string; students: number; biggerPracticum: { title: string; students: number } | null; workingPracticumTitle: string | null };
+type StreamTargetApiDto = { host?: StreamHostApiDto; practicum?: StreamPracticumApiDto; moduleId: string | null; moduleTitle: string | null; scheduleEventId: string | null; scheduleEventTitle: string | null; mediaKind: "STREAM" | "QA" | null };
 
 function StreamTargetPicker({ upcoming, openSignal = 0, onSaved }: { upcoming: ScheduleEvent[]; openSignal?: number; onSaved?: () => void }) {
   const [mode, setMode] = useState<"none" | "module" | "event">("none");
@@ -5366,6 +5396,7 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
       <button className="primary-button compact-button" type="button" onClick={() => setTargetPickerSignal((current) => current + 1)}>Выбрать</button>
     </div>}
 
+    <StreamPracticumNote />
     <StreamHostNote status={status} />
 
     <StreamTargetPicker upcoming={upcoming} openSignal={targetPickerSignal} onSaved={() => void refreshStatus()} />

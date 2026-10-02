@@ -70,9 +70,23 @@ export type RecordingStorageStatusDto = { totalBytes: number; usedBytes: number;
 /** "Эфир ведёт: Имя" — who pressed "Начать стрим" for the current/next broadcast. */
 export type StreamHostDto = { name: string; startedAt: string; isMe: boolean } | null;
 
+/**
+ * Which поток a broadcast goes to (the one "Назначен для эфиров" in "Потоки") and two hints for
+ * the "Стримы" page: a bigger unfinished поток exists (typically: switched to a test поток and
+ * forgot to switch back), and the curator's own working поток differs from it.
+ */
+export type StreamPracticumDto = {
+  title: string;
+  students: number;
+  biggerPracticum: { title: string; students: number } | null;
+  workingPracticumTitle: string | null;
+};
+
 export type StreamTargetDto = {
   /** Staff only. */
   host?: StreamHostDto;
+  /** Staff only. */
+  practicum?: StreamPracticumDto;
   moduleId: string | null;
   moduleTitle: string | null;
   scheduleEventId: string | null;
@@ -305,7 +319,28 @@ export class StreamService {
     const practicum = await this.assertCuratorPracticum(actorId);
     const current = await prisma.practicum.findUnique({ where: { id: practicum.id }, select: { pendingStreamModuleId: true, pendingStreamScheduleEventId: true, pendingStreamMediaKind: true } });
     const target = await this.resolveStreamTarget(current?.pendingStreamModuleId ?? null, current?.pendingStreamScheduleEventId ?? null, current?.pendingStreamMediaKind ?? null);
-    return { ...target, host: await this.resolveStreamHost(practicum.id, actorId) };
+    const [host, streamPracticum] = await Promise.all([this.resolveStreamHost(practicum.id, actorId), this.resolveStreamPracticum(practicum.id, practicum.title, actorId)]);
+    return { ...target, host, practicum: streamPracticum };
+  }
+
+  private async resolveStreamPracticum(practicumId: string, title: string, actorId: string): Promise<StreamPracticumDto> {
+    const [counts, practicums, actor] = await Promise.all([
+      prisma.enrollment.groupBy({ by: ["practicumId"], where: { status: "ACTIVE" }, _count: { _all: true } }),
+      prisma.practicum.findMany({ select: { id: true, title: true, completedAt: true } }),
+      prisma.user.findUnique({ where: { id: actorId }, select: { workingPracticumId: true, workingPracticum: { select: { title: true } } } }),
+    ]);
+    const studentsIn = (id: string) => counts.find((row) => row.practicumId === id)?._count._all ?? 0;
+    const students = studentsIn(practicumId);
+    const bigger = practicums
+      .filter((item) => item.id !== practicumId && !item.completedAt && studentsIn(item.id) > students)
+      .sort((left, right) => studentsIn(right.id) - studentsIn(left.id))[0];
+    return {
+      title,
+      students,
+      biggerPracticum: bigger ? { title: bigger.title, students: studentsIn(bigger.id) } : null,
+      // null = no personal pick (falls back to the stream поток) or the same one — nothing to warn about.
+      workingPracticumTitle: actor?.workingPracticumId && actor.workingPracticumId !== practicumId ? actor.workingPracticum?.title ?? null : null,
+    };
   }
 
   /**

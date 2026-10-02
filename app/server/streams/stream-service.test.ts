@@ -215,4 +215,11 @@ describe("stream-service: broadcast started from a schedule event", () => {
     const afterFinish = await streamService.finishStream(curatorId, eventId);
     expect(afterFinish.host).toBeNull();
   });
+
+  it("tells curators which поток the broadcast goes to", async () => {
+    const target = await streamService.getStreamTarget(curatorId);
+    const active = await prisma.practicum.findUnique({ where: { id: practicumId }, select: { title: true } });
+    expect(target.practicum?.title).toBe(active?.title);
+    expect(typeof target.practicum?.students).toBe("number");
+  });
 });
