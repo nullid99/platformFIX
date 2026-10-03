@@ -58,3 +58,17 @@ export function formatZonedDateTime(date: Date, timeZone: string = EVENT_TIMEZON
   const parts = Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]));
   return `${parts.day}.${parts.month}.${parts.year} ${parts.hour}:${parts.minute}`;
 }
+
+/**
+ * A schedule time label ("13:00" or "13:00 — 14:00", Kyiv wall-clock on `dateKey`) shown in another
+ * zone — e.g. a student's chosen zone in their reminder email. Null for free text that isn't a time.
+ */
+export function eventTimeInZone(dateKey: string, time: string, timeZone: string): string | null {
+  const match = time.match(/^\s*(\d{1,2}:\d{2})\s*(?:[—–-]\s*(\d{1,2}:\d{2}))?\s*$/);
+  if (!match) return null;
+  const toZone = (hhmm: string) => {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(zonedTimeToUtc(dateKey, hhmm)).map((part) => [part.type, part.value]));
+    return `${parts.hour}:${parts.minute}`;
+  };
+  return match[2] ? `${toZone(match[1])} — ${toZone(match[2])}` : toZone(match[1]);
+}

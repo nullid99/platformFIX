@@ -308,6 +308,23 @@ export async function sendScheduleReminderNotification(input: { to: string; even
   }
 }
 
+/** "Через 15 минут" for students (since 2026-10-03; it used to go to curators only). */
+export async function sendStudentEventReminderNotification(input: { to: string; eventTitle: string; eventTypeLabel: string; timeLabel: string; eventId: string }): Promise<void> {
+  try {
+    const content: ContentNotificationInput = {
+      eyebrow: "СКОРО НАЧАЛО",
+      title: input.eventTitle,
+      body: `${input.eventTypeLabel} начнётся через 15 минут — ${input.timeLabel}. Когда эфир начнётся, в расписании появится кнопка «Присоединиться».`,
+      ctaLabel: "Открыть расписание",
+      ctaPath: `/?eventId=${encodeURIComponent(input.eventId)}`,
+      accent: "#eab46b",
+    };
+    await sendMutableEmail({ to: input.to, subject: `Через 15 минут · ${input.eventTitle}`, html: notificationHtml(content), text: notificationText(content) });
+  } catch (error) {
+    console.error("Student event reminder email delivery failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
 export async function sendStreamLiveNotification(input: { to: string; topic: string | null }): Promise<void> {
   try {
     const content: ContentNotificationInput = {

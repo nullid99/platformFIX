@@ -1,9 +1,9 @@
 import { Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { ScheduleEventType } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
-import { zonedTimeToUtc } from "@/app/domain/schedule-time";
-import { activeCuratorEmails, activeCuratorIds } from "@/app/server/notifications/recipient-service";
-import { sendScheduleReminderNotification } from "@/app/server/notifications/email-service";
+import { EVENT_TIMEZONE, eventTimeInZone, zonedTimeToUtc } from "@/app/domain/schedule-time";
+import { activeStudentIds } from "@/app/server/notifications/recipient-service";
+import { sendStudentEventReminderNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 
 const POLL_INTERVAL_MS = 60_000;
@@ -28,8 +28,10 @@ function eventStartsAt(event: { date: Date; time: string }): Date | null {
 }
 
 /**
- * Reminds curators 15 minutes before any scheduled event (Q&A, backtest review, lecture, etc.)
- * so they have time to get set up before going live — independent of any open browser tab.
+ * "Через 15 минут" — reminds the поток's students 15 minutes before a scheduled event (lecture,
+ * Q&A, …); for an individual slot (Бэктест/Пресессия) only the student who booked it. Went to
+ * curators only until 2026-10-03, when it was switched to students at the curators' request. The
+ * time in the email is in the student's own zone if they picked one in Профиль, else Kyiv.
  */
 @Injectable()
 export class ScheduleReminderNotifier implements OnModuleInit, OnModuleDestroy {
@@ -48,7 +50,10 @@ export class ScheduleReminderNotifier implements OnModuleInit, OnModuleDestroy {
 
   private async tick(): Promise<void> {
     const now = Date.now();
-    const events = await prisma.scheduleEvent.findMany({ select: { id: true, type: true, title: true, date: true, time: true } }).catch((error: unknown) => {
+    const events = await prisma.scheduleEvent.findMany({
+      where: { practicum: { completedAt: null } },
+      select: { id: true, practicumId: true, type: true, title: true, date: true, time: true, bookedByStudentId: true },
+    }).catch((error: unknown) => {
       console.error("Schedule reminder poll failed", error instanceof Error ? error.message : "unknown error");
       return [];
     });
@@ -60,17 +65,26 @@ export class ScheduleReminderNotifier implements OnModuleInit, OnModuleDestroy {
       const msUntilStart = startsAt.getTime() - now;
       if (msUntilStart <= 0 || msUntilStart > REMINDER_LEAD_MS) continue;
       this.notified.add(event.id);
-      void this.notifyCurators(event);
+      void this.notifyStudents(event);
     }
   }
 
-  private async notifyCurators(event: { id: string; type: ScheduleEventType; title: string; time: string }): Promise<void> {
+  private async notifyStudents(event: { id: string; practicumId: string; type: ScheduleEventType; title: string; date: Date; time: string; bookedByStudentId: string | null }): Promise<void> {
     const typeLabel = EVENT_TYPE_LABELS[event.type] ?? event.type;
     try {
-      const emails = await activeCuratorEmails();
-      await Promise.all(emails.map((to) => sendScheduleReminderNotification({ to, eventTitle: event.title, eventTypeLabel: typeLabel, eventTime: event.time, eventId: event.id })));
-      const curatorIds = await activeCuratorIds();
-      await notificationService.createMany(curatorIds, "SCHEDULE_REMINDER", `Через 15 минут: ${event.title}`, typeLabel, event.id);
+      const isIndividualSlot = event.type === ScheduleEventType.BACKTEST || event.type === ScheduleEventType.PRE_SESSION;
+      const studentIds = isIndividualSlot
+        ? (event.bookedByStudentId ? [event.bookedByStudentId] : [])
+        : await activeStudentIds(event.practicumId);
+      if (studentIds.length === 0) return;
+      await notificationService.createMany(studentIds, "SCHEDULE_REMINDER", `Через 15 минут: ${event.title}`, typeLabel, event.id);
+      const dateKey = event.date.toISOString().slice(0, 10);
+      const recipients = await prisma.user.findMany({ where: { id: { in: studentIds }, email: { not: null } }, select: { email: true, timeZone: true } });
+      await Promise.all(recipients.map((recipient) => {
+        const ownTime = recipient.timeZone && recipient.timeZone !== EVENT_TIMEZONE ? eventTimeInZone(dateKey, event.time, recipient.timeZone) : null;
+        const timeLabel = ownTime && ownTime !== event.time ? `в ${ownTime} по вашему времени (по Киеву ${event.time})` : `в ${event.time} по Киеву`;
+        return recipient.email && sendStudentEventReminderNotification({ to: recipient.email, eventTitle: event.title, eventTypeLabel: typeLabel, timeLabel, eventId: event.id });
+      }));
     } catch (error) {
       console.error("Schedule reminder dispatch failed", error instanceof Error ? error.message : "unknown error");
     }
