@@ -324,17 +324,43 @@ function formatVideoTime(seconds: number): string {
 /**
  * A recorded LiveKit broadcast, played back with our own minimal controls instead of the
  * browser's native `<video controls>` bar — deliberately narrower than the native set (no
- * playback-speed menu, no download, no picture-in-picture) to keep the player visually quiet and
- * consistent with the rest of the UI, matching the live surface's own custom mute affordance
- * above rather than mixing native and custom chrome in the same component.
+ * download, no picture-in-picture) to keep the player visually quiet and consistent with the rest
+ * of the UI. Playback speed was added 2026-10-03 at students' request for rewatching (Vimeo
+ * embeds have their own speed control).
  */
+const PLAYBACK_RATES = [1, 1.25, 1.5, 2] as const;
+const PLAYBACK_RATE_KEY = "fix-playback-rate";
+
+function readSavedPlaybackRate(): number {
+  try {
+    const saved = Number(window.localStorage.getItem(PLAYBACK_RATE_KEY));
+    return (PLAYBACK_RATES as readonly number[]).includes(saved) ? saved : 1;
+  } catch {
+    return 1;
+  }
+}
 function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenRef: RefObject<HTMLDivElement | null> }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  // Remembered per browser, so the next recording starts at the speed the student last picked.
+  const [playbackRate, setPlaybackRate] = useState(() => (typeof window === "undefined" ? 1 : readSavedPlaybackRate()));
   const { fullscreen, toggle: toggleFullscreen, exit: exitFullscreen } = useVideoFullscreen(fullscreenRef);
+  const applyPlaybackRate = (rate: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    // defaultPlaybackRate too — the browser resets playbackRate to it whenever the source reloads.
+    video.defaultPlaybackRate = rate;
+    video.playbackRate = rate;
+  };
+  const cyclePlaybackRate = () => {
+    const next = PLAYBACK_RATES[(PLAYBACK_RATES.indexOf(playbackRate as (typeof PLAYBACK_RATES)[number]) + 1) % PLAYBACK_RATES.length];
+    setPlaybackRate(next);
+    applyPlaybackRate(next);
+    try { window.localStorage.setItem(PLAYBACK_RATE_KEY, String(next)); } catch { /* private mode — speed just isn't remembered */ }
+  };
 
   const togglePlay = () => { const video = videoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause(); };
   // In fullscreen, a tap on the video exits instead of toggling play/pause — Escape works too,
@@ -358,12 +384,13 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
       onPlay={() => setPlaying(true)}
       onPause={() => setPlaying(false)}
       onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-      onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
+      onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); applyPlaybackRate(playbackRate); }}
     />
     <div className="recorded-video-controls">
       <button type="button" onClick={togglePlay} aria-label={playing ? "Пауза" : "Воспроизвести"}>{playing ? <Pause size={16} /> : <Play size={16} />}</button>
       <span className="recorded-video-time">{formatVideoTime(currentTime)} / {formatVideoTime(duration)}</span>
       <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
+      <button type="button" className="recorded-video-speed" onClick={cyclePlaybackRate} aria-label={`Скорость воспроизведения: ${playbackRate}x. Нажмите, чтобы изменить`} title="Скорость воспроизведения">{String(playbackRate).replace(".", ",")}x</button>
       <button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button>
       <button type="button" onClick={toggleFullscreen} aria-label={fullscreen ? "Свернуть" : "На весь экран"}>{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
     </div>

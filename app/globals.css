@@ -8454,3 +8454,6 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 
 /* "по Киеву 13:00" next to a student's converted event time (see scheduleApiToUi). */
 .event-kyiv-time { margin-left: 8px; color: #7f93a8; font-size: 11px; font-weight: 400; white-space: nowrap; }
+
+/* Playback speed on our own recording player (RecordedVideoSurface) — wider than the icon buttons to fit "1,25x". */
+.recorded-video-controls button.recorded-video-speed { width: auto; min-width: 40px; padding: 0 6px; font: 600 12px 'DM Mono', monospace; }
