@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, forwardRef, Fragment, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject } from "react";
+import { createContext, forwardRef, Fragment, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type FormEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import Image from "next/image";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -232,10 +232,50 @@ function useVideoFullscreen(ref: RefObject<HTMLDivElement | null>) {
   return { fullscreen, toggle: () => (fullscreen ? exit() : enter()), exit };
 }
 
+const VOLUME_KEY = "fix-volume";
+
+/** Last volume the viewer picked (0..1), shared by the live and recording players. */
+function readSavedVolume(): number {
+  try {
+    const raw = window.localStorage.getItem(VOLUME_KEY);
+    const saved = raw === null ? NaN : Number(raw);
+    return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 1;
+  } catch {
+    return 1;
+  }
+}
+
+function saveVolume(volume: number) {
+  try { window.localStorage.setItem(VOLUME_KEY, String(volume)); } catch { /* private mode — just not remembered */ }
+}
+
+/**
+ * Volume slider next to the mute button (added 2026-10-04 — before, sound was only on/off).
+ * Dragging up from zero unmutes, dragging to zero mutes. On iPhone/iPad the browser ignores
+ * page volume (hardware buttons only), so there it simply has no effect.
+ */
+function VolumeSlider({ volume, muted, onChange }: { volume: number; muted: boolean; onChange: (volume: number) => void }) {
+  const shown = muted ? 0 : volume;
+  return <input
+    type="range"
+    className="video-volume-slider"
+    min={0}
+    max={1}
+    step={0.05}
+    value={shown}
+    onChange={(event) => onChange(Number(event.target.value))}
+    aria-label={`Громкость: ${Math.round(shown * 100)}%`}
+    title={`Громкость: ${Math.round(shown * 100)}%`}
+    style={{ "--volume-fill": `${Math.round(shown * 100)}%` } as CSSProperties}
+  />;
+}
+
 function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlaybackProps & { fullscreenRef: RefObject<HTMLDivElement | null> }) {
   const videoElRef = useRef<HTMLVideoElement>(null);
   const videoPublicationRef = useRef<RemoteTrackPublication | null>(null);
   const [muted, setMuted] = useState(true);
+  const [volume, setVolume] = useState(() => (typeof window === "undefined" ? 1 : readSavedVolume()));
+  const volumeRef = useRef(volume);
   const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [quality, setQuality] = useState<VideoQuality | "auto">("auto");
@@ -265,6 +305,7 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
         // Undo attachToElement's own muted heuristic (see mutedRef comment above) so the element
         // always matches what the mute button is actually showing.
         videoElRef.current.muted = mutedRef.current;
+        videoElRef.current.volume = volumeRef.current;
       }
     });
     void room.connect(LIVEKIT_URL, tokenRef.current).catch((error: unknown) => console.error("LiveKit connect failed", error));
@@ -279,7 +320,19 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
     const video = videoElRef.current;
     if (!video) return;
     video.muted = !video.muted;
+    // Unmuting from a slider left at zero would still be silent — bring it back to audible.
+    if (!video.muted && video.volume === 0) { video.volume = 0.5; volumeRef.current = 0.5; setVolume(0.5); saveVolume(0.5); }
     setMuted(video.muted);
+  };
+  const changeVolume = (next: number) => {
+    const video = videoElRef.current;
+    volumeRef.current = next;
+    setVolume(next);
+    saveVolume(next);
+    if (!video) return;
+    video.volume = next;
+    const nextMuted = next === 0;
+    if (video.muted !== nextMuted) { video.muted = nextMuted; setMuted(nextMuted); }
   };
 
   // "Авто" hands control back to adaptiveStream's own resize-driven quality selection; picking a
@@ -307,7 +360,7 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
           {QUALITY_OPTIONS.map((option) => <button type="button" key={option.label} role="menuitemradio" aria-checked={quality === option.value} className={quality === option.value ? "active" : ""} onClick={() => selectQuality(option.value)}>{option.label}</button>)}
         </div>}
       </div>
-      <button type="button" className="livekit-video-control-button" aria-label={muted ? "Включить звук" : "Выключить звук"} onClick={toggleMute}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
+      <div className="video-volume-group"><button type="button" className="livekit-video-control-button" aria-label={muted ? "Включить звук" : "Выключить звук"} onClick={toggleMute}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button><VolumeSlider volume={volume} muted={muted} onChange={changeVolume} /></div>
       <button type="button" className="livekit-video-control-button" aria-label={fullscreen ? "Свернуть" : "На весь экран"} onClick={toggleFullscreen}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
     </div>
   </>;
@@ -357,6 +410,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [volume, setVolume] = useState(() => (typeof window === "undefined" ? 1 : readSavedVolume()));
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   // A click on the seek bar before the recording's length is known (stream recordings are large
@@ -389,7 +443,22 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   // but not everyone knows that, and the fullscreen toggle button itself is easy to lose track
   // of once the player fills the whole screen.
   const handleVideoClick = () => { if (fullscreen) { exitFullscreen(); return; } togglePlay(); };
-  const toggleMute = () => { const video = videoRef.current; if (!video) return; video.muted = !video.muted; setMuted(video.muted); };
+  const toggleMute = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    if (!video.muted && video.volume === 0) { video.volume = 0.5; setVolume(0.5); saveVolume(0.5); }
+    setMuted(video.muted);
+  };
+  const changeVolume = (next: number) => {
+    const video = videoRef.current;
+    setVolume(next);
+    saveVolume(next);
+    if (!video) return;
+    video.volume = next;
+    const nextMuted = next === 0;
+    if (video.muted !== nextMuted) { video.muted = nextMuted; setMuted(nextMuted); }
+  };
   const seekTo = (event: ReactMouseEvent<HTMLDivElement>) => {
     const video = videoRef.current;
     if (!video) return;
@@ -411,6 +480,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   const handleLoadedMetadata = (video: HTMLVideoElement) => {
     setDuration(video.duration);
     applyPlaybackRate(playbackRate);
+    video.volume = volume;
     if (pendingSeekRef.current !== null) {
       video.currentTime = pendingSeekRef.current * video.duration;
       setCurrentTime(pendingSeekRef.current * video.duration);
@@ -456,7 +526,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
       <span className="recorded-video-time">{seekPending ? "Загрузка…" : `${formatVideoTime(currentTime)} / ${formatVideoTime(duration)}`}</span>
       <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
       <button type="button" className="recorded-video-speed" onClick={cyclePlaybackRate} aria-label={`Скорость воспроизведения: ${playbackRate}x. Нажмите, чтобы изменить`} title="Скорость воспроизведения">{String(playbackRate).replace(".", ",")}x</button>
-      <button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button>
+      <div className="video-volume-group"><button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button><VolumeSlider volume={volume} muted={muted} onChange={changeVolume} /></div>
       <button type="button" onClick={toggleFullscreen} aria-label={fullscreen ? "Свернуть" : "На весь экран"}>{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
     </div>
   </div>;

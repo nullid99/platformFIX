@@ -8461,3 +8461,20 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 /* "Продолжаем с 20:15 · С начала" over our recording player (RecordedVideoSurface). */
 .recorded-video-resume { position: absolute; left: 12px; top: 12px; z-index: 6; padding: 6px 10px; border-radius: 6px; background: rgba(0, 0, 0, .72); color: #fff; font-size: 12px; }
 .recorded-video-resume button { padding: 0; border: 0; background: none; color: #8fc1ff; font: inherit; text-decoration: underline; cursor: pointer; }
+
+/* Volume slider next to the mute button in both players (VolumeSlider). */
+.video-volume-group { display: flex; align-items: center; gap: 4px; }
+.video-volume-slider {
+  width: 76px;
+  height: 4px;
+  margin: 0 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, #fff var(--volume-fill, 100%), rgba(255, 255, 255, .3) var(--volume-fill, 100%));
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.video-volume-slider::-webkit-slider-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 0; appearance: none; -webkit-appearance: none; }
+.video-volume-slider::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 0; }
+.video-volume-slider::-moz-range-track { background: transparent; }
+@media (max-width: 600px) { .video-volume-slider { width: 56px; } }
