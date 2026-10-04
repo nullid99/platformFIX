@@ -192,8 +192,11 @@ export class DiscussionService {
     if (actor.role === UserRole.STUDENT && (await getStudentActivePracticum(actorId))?.completedAt) {
       throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — писать в обсуждении уже нельзя.");
     }
-    const body = requiredText(input.body, "body", MAX_BODY_LENGTH);
     const attachments = normalizeAttachments(input.attachments);
+    // A follow-up can be just a screenshot (2026-10-04: students couldn't attach anything after
+    // the first question) — text is required only when nothing is attached.
+    const body = attachments.length > 0 && typeof input.body === "string" && !input.body.trim() ? "" : requiredText(input.body, "body", MAX_BODY_LENGTH);
+    const notificationBody = body || `Вложений: ${attachments.length}`;
     const sourceUrl = optionalUrl(input.sourceUrl);
     await this.assertFilesOwned(actorId, attachments);
     const status = actor.role === UserRole.STUDENT ? DiscussionStatus.WAITING : DiscussionStatus.ANSWERED;
@@ -215,10 +218,10 @@ export class DiscussionService {
       to: recipient.email,
       threadTitle: thread.title,
       senderName,
-      body,
+      body: notificationBody,
       threadId: thread.id,
     })] : [])).catch((error: unknown) => console.error("Discussion reply recipient lookup failed", error instanceof Error ? error.message : "unknown error"));
-    void Promise.all(recipients.map((recipient) => notificationService.create(recipient.id, "DISCUSSION_REPLY", `${senderName}: ${thread.title}`, body, thread.id)))
+    void Promise.all(recipients.map((recipient) => notificationService.create(recipient.id, "DISCUSSION_REPLY", `${senderName}: ${thread.title}`, notificationBody, thread.id)))
       .catch((error: unknown) => console.error("Discussion reply notification dispatch failed", error instanceof Error ? error.message : "unknown error"));
     // Known false when the replier is the student (the check above already threw otherwise);
     // resolved properly for a curator reply, whose own practicum status wasn't checked.

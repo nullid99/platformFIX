@@ -8495,3 +8495,7 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 /* Links inside answers, curator comments and discussion messages (linkifyText). */
 .text-link { color: #8fc1ff; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .text-link:hover { color: #b8d8ff; }
+
+/* Student follow-up in a discussion: textarea + "+" attach button, like the curator's reply. */
+.student-discussion-reply > div.student-discussion-input-wrap, .learner-course-view .student-discussion-reply > div.student-discussion-input-wrap { display: block; position: relative; }
+.student-discussion-input-wrap textarea { padding-right: 44px; }

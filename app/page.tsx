@@ -7448,19 +7448,36 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
   const [replyOpen, setReplyOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // Files in follow-ups too, same as the curator's reply (2026-10-04: only the first question could
+  // carry a screenshot — the reply form had no picker at all).
+  const replyAttachments = useDiscussionAttachments();
+  const handleReplyPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const images = Array.from(event.clipboardData.items).filter((item) => item.type.startsWith("image/"));
+    if (images.length === 0) return;
+    event.preventDefault();
+    replyAttachments.addFiles(images.flatMap((item, index) => {
+      const file = item.getAsFile();
+      return file ? [new File([file], `screenshot-${Date.now()}-${index}.${item.type.split("/")[1] || "png"}`, { type: item.type })] : [];
+    }));
+  };
   const sendReply = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!reply.trim() || saving || thread.status === "CLOSED") return;
+    if ((!reply.trim() && replyAttachments.attachments.length === 0) || saving || thread.status === "CLOSED") return;
     setSaving(true);
     setError("");
+    let uploadedFileIds: string[] = [];
     try {
-      const response = await fetch(`${API_ORIGIN}/api/discussions/${thread.id}/messages`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: reply.trim() }) });
+      const uploaded = await replyAttachments.uploadAll();
+      uploadedFileIds = uploaded.uploadedFileIds;
+      const response = await fetch(`${API_ORIGIN}/api/discussions/${thread.id}/messages`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: reply.trim(), attachments: uploaded.payload }) });
       const payload = await response.json().catch(() => ({})) as { data?: DiscussionApiThread; message?: string };
       if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось отправить ответ.");
       onUpdate(mapDiscussionApiThread(payload.data));
       setReply("");
+      replyAttachments.clear();
       setReplyOpen(false);
     } catch (reason: unknown) {
+      for (const fileId of uploadedFileIds) void fetch(`${API_ORIGIN}/api/files/${fileId}`, { method: "DELETE", credentials: "include" });
       setError(reason instanceof Error ? reason.message : "Не удалось отправить ответ.");
     } finally {
       setSaving(false);
@@ -7471,7 +7488,7 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
     <div className="student-discussion-messages">{thread.messages.map((message) => <article className={`student-discussion-message ${message.author}`} key={message.id}><div className="student-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{linkifyText(message.body)}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
     <div className="student-discussion-status-note"><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</span><span>{thread.practicumCompleted ? "Поток завершён — переписка доступна только для чтения." : thread.status === "CLOSED" ? "Вопрос закрыт. Для нового обращения создай отдельную тему." : "История сохраняется, а диалог можно продолжить в любой момент."}</span></div>
     {thread.status !== "CLOSED" && !thread.practicumCompleted && <div className="student-discussion-actions"><button className="primary-button" type="button" onClick={() => setReplyOpen((current) => !current)}>{replyOpen ? "Скрыть ответ" : "Ответить ещё"}</button></div>}
-    {replyOpen && thread.status !== "CLOSED" && !thread.practicumCompleted && <form className="student-discussion-reply" onSubmit={sendReply}><label htmlFor="student-discussion-reply">ОТВЕТ В ЭТОЙ ТЕМЕ</label><textarea id="student-discussion-reply" onKeyDown={continueNumberedList} value={reply} onChange={(event) => setReply(event.target.value)} rows={4} placeholder="Напиши уточнение или следующий вопрос куратору…" /><div><span>Ответ добавится в историю и снова передаст тему куратору.</span><button className="primary-button" type="submit" disabled={!reply.trim() || saving}>{saving ? "Отправляем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div></form>}
+    {replyOpen && thread.status !== "CLOSED" && !thread.practicumCompleted && <form className="student-discussion-reply" onSubmit={sendReply}><label htmlFor="student-discussion-reply">ОТВЕТ В ЭТОЙ ТЕМЕ</label><div className="student-discussion-input-wrap"><textarea id="student-discussion-reply" onKeyDown={continueNumberedList} value={reply} onChange={(event) => setReply(event.target.value)} onPaste={handleReplyPaste} rows={4} placeholder="Напиши уточнение или следующий вопрос куратору… Скриншот можно вставить через Ctrl+V" /><label className="discussion-reply-attach-button" htmlFor="student-discussion-reply-attachment" title="Прикрепить файлы" aria-label="Прикрепить файлы"><Plus size={18} /><input id="student-discussion-reply-attachment" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { replyAttachments.addFiles(event.target.files); event.target.value = ""; }} /></label></div>{replyAttachments.error && <div className="file-error" role="alert">{replyAttachments.error}</div>}<DiscussionAttachmentPreviewList attachments={replyAttachments.attachments} onRemove={replyAttachments.removeAt} /><div><span>Ответ добавится в историю и снова передаст тему куратору.</span><button className="primary-button" type="submit" disabled={(!reply.trim() && replyAttachments.attachments.length === 0) || saving}>{saving ? "Отправляем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div></form>}
     {error && <div className="file-error student-discussion-error" role="alert">{error}</div>}
   </section>;
 }
