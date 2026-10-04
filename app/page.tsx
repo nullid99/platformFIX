@@ -331,6 +331,20 @@ function formatVideoTime(seconds: number): string {
 const PLAYBACK_RATES = [1, 1.25, 1.5, 2] as const;
 const PLAYBACK_RATE_KEY = "fix-playback-rate";
 
+/** Where a student stopped in a recording, per recording URL — see RecordedVideoSurface. */
+function positionKey(src: string): string {
+  return `fix-video-pos:${src}`;
+}
+
+function readSavedPosition(src: string): number {
+  try {
+    const saved = Number(window.localStorage.getItem(positionKey(src)));
+    return Number.isFinite(saved) && saved > 0 ? saved : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function readSavedPlaybackRate(): number {
   try {
     const saved = Number(window.localStorage.getItem(PLAYBACK_RATE_KEY));
@@ -345,6 +359,14 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   const [muted, setMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  // A click on the seek bar before the recording's length is known (stream recordings are large
+  // MP4s with their index at the end, so this can take a few seconds) used to be silently ignored —
+  // "I click on minute 20 and nothing happens" (2026-10-04). Remember it and apply on load.
+  const pendingSeekRef = useRef<number | null>(null);
+  const [seekPending, setSeekPending] = useState(false);
+  // Resume where the student stopped last time (saved every few seconds while playing).
+  const lastSavedRef = useRef(0);
+  const [resumedFrom, setResumedFrom] = useState<number | null>(null);
   // Remembered per browser, so the next recording starts at the speed the student last picked.
   const [playbackRate, setPlaybackRate] = useState(() => (typeof window === "undefined" ? 1 : readSavedPlaybackRate()));
   const { fullscreen, toggle: toggleFullscreen, exit: exitFullscreen } = useVideoFullscreen(fullscreenRef);
@@ -370,9 +392,50 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   const toggleMute = () => { const video = videoRef.current; if (!video) return; video.muted = !video.muted; setMuted(video.muted); };
   const seekTo = (event: ReactMouseEvent<HTMLDivElement>) => {
     const video = videoRef.current;
-    if (!video || !duration) return;
+    if (!video) return;
     const bounds = event.currentTarget.getBoundingClientRect();
-    video.currentTime = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)) * duration;
+    const fraction = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width));
+    setResumedFrom(null);
+    if (duration && Number.isFinite(duration)) {
+      video.currentTime = fraction * duration;
+      // Paused video fires no timeupdate, so the time label and progress bar used to stay at 0:00
+      // after a click — the seek had happened, it just looked like it hadn't.
+      setCurrentTime(fraction * duration);
+      return;
+    }
+    pendingSeekRef.current = fraction;
+    setSeekPending(true);
+    video.preload = "auto";
+    if (video.readyState === 0) video.load();
+  };
+  const handleLoadedMetadata = (video: HTMLVideoElement) => {
+    setDuration(video.duration);
+    applyPlaybackRate(playbackRate);
+    if (pendingSeekRef.current !== null) {
+      video.currentTime = pendingSeekRef.current * video.duration;
+      setCurrentTime(pendingSeekRef.current * video.duration);
+      pendingSeekRef.current = null;
+      setSeekPending(false);
+      return;
+    }
+    // Pick up where they left off — unless that was the very start or the very end.
+    const saved = readSavedPosition(src);
+    if (saved > 30 && saved < video.duration - 30) {
+      video.currentTime = saved;
+      setCurrentTime(saved);
+      setResumedFrom(saved);
+    }
+  };
+  const handleTimeUpdate = (video: HTMLVideoElement) => {
+    setCurrentTime(video.currentTime);
+    if (Math.abs(video.currentTime - lastSavedRef.current) < 5) return;
+    lastSavedRef.current = video.currentTime;
+    try { window.localStorage.setItem(positionKey(src), String(Math.floor(video.currentTime))); } catch { /* private mode */ }
+  };
+  const restartFromBeginning = () => {
+    const video = videoRef.current;
+    if (video) video.currentTime = 0;
+    setResumedFrom(null);
   };
 
   return <div className="recorded-video-surface">
@@ -383,12 +446,14 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
       onClick={handleVideoClick}
       onPlay={() => setPlaying(true)}
       onPause={() => setPlaying(false)}
-      onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-      onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); applyPlaybackRate(playbackRate); }}
+      onTimeUpdate={(event) => handleTimeUpdate(event.currentTarget)}
+      onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime)}
+      onLoadedMetadata={(event) => handleLoadedMetadata(event.currentTarget)}
     />
+    {resumedFrom !== null && <div className="recorded-video-resume">Продолжаем с {formatVideoTime(resumedFrom)} · <button type="button" onClick={restartFromBeginning}>С начала</button></div>}
     <div className="recorded-video-controls">
       <button type="button" onClick={togglePlay} aria-label={playing ? "Пауза" : "Воспроизвести"}>{playing ? <Pause size={16} /> : <Play size={16} />}</button>
-      <span className="recorded-video-time">{formatVideoTime(currentTime)} / {formatVideoTime(duration)}</span>
+      <span className="recorded-video-time">{seekPending ? "Загрузка…" : `${formatVideoTime(currentTime)} / ${formatVideoTime(duration)}`}</span>
       <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
       <button type="button" className="recorded-video-speed" onClick={cyclePlaybackRate} aria-label={`Скорость воспроизведения: ${playbackRate}x. Нажмите, чтобы изменить`} title="Скорость воспроизведения">{String(playbackRate).replace(".", ",")}x</button>
       <button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button>
