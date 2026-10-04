@@ -2604,7 +2604,9 @@ function CuratorReviewWorkspace({ onNavigate }: { onNavigate?: (nextNav: Curator
   useEffect(() => {
     const handleSubmitted = (event: Event) => {
       if (event.type !== assignmentSubmittedEvent) return;
-      void fetchReviewQueue().then((queue) => { setLocalQueue(queue); setSelectedId(queue[0]?.id ?? ""); }).catch(() => setLocalQueue([]));
+      // Keep the work the curator is on — "Взять на проверку" refreshes the queue, and resetting to
+      // queue[0] jumped them to someone else's work right after claiming (2026-10-04).
+      void fetchReviewQueue().then((queue) => { setLocalQueue(queue); setSelectedId((current) => (queue.some((item) => item.id === current) ? current : queue[0]?.id ?? "")); }).catch(() => setLocalQueue([]));
     };
     void fetchReviewQueue().then((queue) => { setLocalQueue(queue); setSelectedId(queue[0]?.id ?? ""); }).catch(() => setLocalQueue([]));
     window.addEventListener(assignmentSubmittedEvent, handleSubmitted);
@@ -2630,7 +2632,26 @@ function CuratorReviewWorkspace({ onNavigate }: { onNavigate?: (nextNav: Curator
   }, []);
   const studentOptions = useMemo(() => [...new Set(localQueue.map((item) => item.studentName).filter(Boolean))].sort((left, right) => left.localeCompare(right, "ru")), [localQueue]);
   const studentQueue = studentFilter ? localQueue.filter((item) => item.studentName === studentFilter) : localQueue;
-  const isActiveItem = (item: ReviewQueueItem) => item.status === "На проверке" || item.status === "Нужна доработка";
+  // "Активные" = waiting for a curator. A work sent back for revision is waiting for the student,
+  // so it lives under "Доработка" only (2026-10-04: it used to stay here and the list never shrank).
+  const isActiveItem = (item: ReviewQueueItem) => item.status === "На проверке";
+  // The whole workspace fits the screen: the list and the review panel each scroll on their own,
+  // the page itself doesn't grow with the queue (curators lost the bottom works and the panel).
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const [workspaceHeight, setWorkspaceHeight] = useState<number | null>(null);
+  useEffect(() => {
+    const measure = () => {
+      const element = workspaceRef.current;
+      if (!element || window.innerWidth <= 1000) { setWorkspaceHeight(null); return; }
+      const scroller = element.closest(".content-area");
+      const scrolled = scroller && scroller.scrollHeight > scroller.clientHeight ? scroller.scrollTop : window.scrollY;
+      const top = element.getBoundingClientRect().top + scrolled;
+      setWorkspaceHeight(Math.max(420, window.innerHeight - top - 20));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
   const matchesFilter = (item: ReviewQueueItem, id: typeof filter) => id === "all" ? true : id === "active" ? isActiveItem(item) : item.status === id;
   const filteredQueue = studentQueue.filter((item) => matchesFilter(item, filter));
   const selectedItem = filteredQueue.find((item) => item.id === selectedId) ?? filteredQueue[0] ?? emptyReviewQueueItem;
@@ -2642,7 +2663,7 @@ function CuratorReviewWorkspace({ onNavigate }: { onNavigate?: (nextNav: Curator
     { id: "all", label: "Все" },
   ];
 
-  return <div className="curator-workspace">
+  return <div className="curator-workspace review-workspace-fit" ref={workspaceRef} style={workspaceHeight ? { "--review-fit-height": `${workspaceHeight}px` } as CSSProperties : undefined}>
     <section className="content-panel review-queue">
       <div className="section-heading"><div><span className="section-kicker">{baseCuratorDashboard.cohort.name.toUpperCase()}</span><h2>Очередь проверки</h2></div><div className="section-heading-actions"><span className="progress-inline">{studentCount === null ? "…" : pluralizeStudents(studentCount)}</span>{onNavigate && <button className="primary-button compact-button curator-create-assignment-button" onClick={() => onNavigate("Создать задание")}><Plus size={15} /> Создать задание</button>}</div></div>
       <div className="assignment-filter curator-filter">{filters.map((item) => { const count = studentQueue.filter((queueItem) => matchesFilter(queueItem, item.id)).length; return <button className={`filter-chip ${filter === item.id ? "active" : ""}`} key={item.id} onClick={() => setFilter(item.id)} aria-pressed={filter === item.id}>{item.label} <span>{count}</span></button>; })}</div>

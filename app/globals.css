@@ -8482,3 +8482,12 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 /* "−5 с" / "+5 с" / "▶" flash over the recording player on a keyboard shortcut. */
 .recorded-video-key-hint { position: absolute; left: 50%; top: 50%; z-index: 7; transform: translate(-50%, -50%); padding: 10px 16px; border-radius: 10px; background: rgba(0, 0, 0, .65); color: #fff; font: 600 18px 'DM Mono', monospace; pointer-events: none; animation: recorded-video-key-hint .7s ease forwards; }
 @keyframes recorded-video-key-hint { 0% { opacity: 0; } 15% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
+
+/* "Очередь проверки" fits the screen (CuratorReviewWorkspace measures the height): the queue list
+   and the review panel scroll inside, the page doesn't grow with every new submission. Desktop only. */
+@media (min-width: 1001px) {
+  .curator-workspace.review-workspace-fit { height: var(--review-fit-height, auto); align-items: stretch; }
+  .review-workspace-fit .review-queue { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .review-workspace-fit .review-queue-list { flex: 1; min-height: 0; max-height: none; }
+  .review-workspace-fit .curator-review { min-height: 0; max-height: 100%; overflow-y: auto; overscroll-behavior: contain; }
+}
