@@ -406,8 +406,45 @@ function readSavedPlaybackRate(): number {
     return 1;
   }
 }
+/**
+ * Which recording player the keyboard controls — the one last clicked/played. A lesson page can
+ * hold several recordings, and only one should react to an arrow key.
+ */
+let activeRecordedPlayer: symbol | null = null;
+
+/** Keystrokes meant for a text field (chat, ДЗ answer, search…) never reach the player. */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  if (tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (tag !== "INPUT") return false;
+  const type = (target as HTMLInputElement).type;
+  return !["button", "checkbox", "radio", "submit", "reset", "file", "color", "image"].includes(type);
+}
+
 function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenRef: RefObject<HTMLDivElement | null> }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  // YouTube-style keys (asked for by students 2026-10-04): ←/→ ±5 s, space play/pause, M mute,
+  // F fullscreen — for the player last interacted with, and never while typing in a text field.
+  const playerId = useRef(Symbol("recorded-player"));
+  const [keyHint, setKeyHint] = useState<{ text: string; at: number } | null>(null);
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
+  useEffect(() => {
+    const id = playerId.current;
+    if (activeRecordedPlayer === null) activeRecordedPlayer = id;
+    const listener = (event: KeyboardEvent) => keyHandlerRef.current(event);
+    window.addEventListener("keydown", listener);
+    return () => {
+      window.removeEventListener("keydown", listener);
+      if (activeRecordedPlayer === id) activeRecordedPlayer = null;
+    };
+  }, []);
+  useEffect(() => {
+    if (!keyHint) return;
+    const timer = window.setTimeout(() => setKeyHint((current) => (current?.at === keyHint.at ? null : current)), 700);
+    return () => window.clearTimeout(timer);
+  }, [keyHint]);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(() => (typeof window === "undefined" ? 1 : readSavedVolume()));
@@ -508,13 +545,45 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
     setResumedFrom(null);
   };
 
-  return <div className="recorded-video-surface">
+  const handleKey = (event: KeyboardEvent) => {
+    const video = videoRef.current;
+    if (!video || activeRecordedPlayer !== playerId.current) return;
+    if (event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) return;
+    const showHint = (text: string) => setKeyHint({ text, at: Date.now() });
+    const key = event.key.toLowerCase();
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const delta = event.key === "ArrowLeft" ? -5 : 5;
+      const limit = Number.isFinite(video.duration) ? video.duration : Infinity;
+      const next = Math.min(limit, Math.max(0, video.currentTime + delta));
+      video.currentTime = next;
+      setCurrentTime(next);
+      setResumedFrom(null);
+      showHint(delta < 0 ? "−5 с" : "+5 с");
+    } else if (event.key === " " || key === "k" || key === "л") {
+      // Space on a focused button would also "click" it — handle it here once instead.
+      event.preventDefault();
+      showHint(video.paused ? "▶" : "❚❚");
+      togglePlay();
+    } else if (key === "m" || key === "ь") {
+      toggleMute();
+      showHint(video.muted ? "Звук выкл" : "Звук вкл");
+    } else if (key === "f" || key === "а") {
+      toggleFullscreen();
+    }
+  };
+  const claimKeyboard = () => { activeRecordedPlayer = playerId.current; };
+  // Latest-handler ref: the window listener (registered once) always calls this render's handler.
+  useEffect(() => { keyHandlerRef.current = handleKey; });
+
+  return <div className="recorded-video-surface" onPointerDown={claimKeyboard} onFocusCapture={claimKeyboard} title="Клавиши: ← → — 5 секунд назад/вперёд, пробел — пауза, M — звук, F — весь экран">
+    {keyHint && <div className="recorded-video-key-hint" key={keyHint.at}>{keyHint.text}</div>}
     <video
       ref={videoRef}
       src={src}
       playsInline
       onClick={handleVideoClick}
-      onPlay={() => setPlaying(true)}
+      onPlay={() => { setPlaying(true); claimKeyboard(); }}
       onPause={() => setPlaying(false)}
       onTimeUpdate={(event) => handleTimeUpdate(event.currentTarget)}
       onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime)}

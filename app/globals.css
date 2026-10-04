@@ -8478,3 +8478,7 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 .video-volume-slider::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 0; }
 .video-volume-slider::-moz-range-track { background: transparent; }
 @media (max-width: 600px) { .video-volume-slider { width: 56px; } }
+
+/* "−5 с" / "+5 с" / "▶" flash over the recording player on a keyboard shortcut. */
+.recorded-video-key-hint { position: absolute; left: 50%; top: 50%; z-index: 7; transform: translate(-50%, -50%); padding: 10px 16px; border-radius: 10px; background: rgba(0, 0, 0, .65); color: #fff; font: 600 18px 'DM Mono', monospace; pointer-events: none; animation: recorded-video-key-hint .7s ease forwards; }
+@keyframes recorded-video-key-hint { 0% { opacity: 0; } 15% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
