@@ -8491,3 +8491,7 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
   .review-workspace-fit .review-queue-list { flex: 1; min-height: 0; max-height: none; }
   .review-workspace-fit .curator-review { min-height: 0; max-height: 100%; overflow-y: auto; overscroll-behavior: contain; }
 }
+
+/* Links inside answers, curator comments and discussion messages (linkifyText). */
+.text-link { color: #8fc1ff; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.text-link:hover { color: #b8d8ff; }
