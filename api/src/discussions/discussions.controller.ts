@@ -93,6 +93,12 @@ export class DiscussionsController {
     try { return { data: await discussionService.reply(session.userId, threadId, messageInput(body)) }; } catch (error) { mapError(error); }
   }
 
+  @Post(":threadId/answered")
+  public async markAnswered(@Req() request: RequestWithCookies, @Param("threadId") threadId: string) {
+    const session = await this.requireSession(request);
+    try { return { data: await discussionService.markAnswered(session.userId, threadId) }; } catch (error) { mapError(error); }
+  }
+
   @Post(":threadId/close")
   public async close(@Req() request: RequestWithCookies, @Param("threadId") threadId: string) {
     const session = await this.requireSession(request);

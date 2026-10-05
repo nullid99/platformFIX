@@ -229,6 +229,19 @@ export class DiscussionService {
     return this.toDto(thread, { practicumCompleted });
   }
 
+  /**
+   * Curator "Ответ не нужен" — the student only wrote "спасибо", nothing to answer (2026-10-06).
+   * Marks the thread answered without posting a message or notifying anyone; the student can
+   * still write again, which makes it WAITING as usual. Closing stays the student's own action.
+   */
+  public async markAnswered(actorId: string, threadId: string) {
+    const actor = await this.assertParticipant(actorId, threadId);
+    if (actor.role === UserRole.STUDENT) throw new AuthServiceError("FORBIDDEN", "Only staff can mark a discussion as answered");
+    const thread = await prisma.discussionThread.update({ where: { id: threadId }, data: { status: DiscussionStatus.ANSWERED }, include: threadInclude() });
+    const practicumCompleted = Boolean((await getStudentActivePracticum(thread.studentId))?.completedAt);
+    return this.toDto(thread, { practicumCompleted });
+  }
+
   public async close(studentId: string, threadId: string) {
     const actor = await this.assertParticipant(studentId, threadId);
     if (actor.role !== UserRole.STUDENT) throw new AuthServiceError("FORBIDDEN", "Only the student can close this discussion");

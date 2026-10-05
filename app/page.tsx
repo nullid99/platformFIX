@@ -1916,6 +1916,31 @@ const MAX_DISCUSSION_ATTACHMENTS = 5;
 
 // Shared across every multi-file attach point (discussion composers, assignment submission) —
 // all need the same select-many/preview/remove/upload behavior; only the surrounding JSX differs.
+/**
+ * A discussion opens at its latest message — it used to open at the first one and everyone had to
+ * scroll down every time (2026-10-06). Stays pinned to the bottom while attachments load and on
+ * new messages, unless the reader has scrolled up to reread something.
+ */
+function DiscussionMessageList({ className, threadKey, messageCount, children }: { className: string; threadKey: string; messageCount: number; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  useEffect(() => { pinned.current = true; }, [threadKey]);
+  useEffect(() => {
+    const element = ref.current;
+    if (element && pinned.current) element.scrollTop = element.scrollHeight;
+  }, [threadKey, messageCount]);
+  const handleScroll = () => {
+    const element = ref.current;
+    if (element) pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+  };
+  // Images/videos in attachments grow the list after the first scroll — follow them down.
+  const handleLoad = () => {
+    const element = ref.current;
+    if (element && pinned.current) element.scrollTop = element.scrollHeight;
+  };
+  return <div className={className} ref={ref} onScroll={handleScroll} onLoadCapture={handleLoad}>{children}</div>;
+}
+
 function useDiscussionAttachments() {
   const [attachments, setAttachments] = useState<PendingDiscussionAttachment[]>([]);
   const [error, setError] = useState("");
@@ -2074,6 +2099,24 @@ function CuratorDiscussionsView() {
   const moduleThreads = moduleFilter === "all" ? threads : threads.filter((thread) => thread.module === moduleFilter);
   const visibleThreads = filter === "all" ? moduleThreads : moduleThreads.filter((thread) => thread.status === filter);
   const selectedThread = visibleThreads.find((thread) => thread.id === selectedId) ?? visibleThreads[0];
+  const [markingAnswered, setMarkingAnswered] = useState(false);
+  // "Ответ не нужен": the student only wrote "спасибо" — clear "Ждёт ответа" without replying.
+  const markAnswered = async () => {
+    if (!selectedThread || markingAnswered) return;
+    setMarkingAnswered(true);
+    setReplyError("");
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/discussions/${selectedThread.id}/answered`, { method: "POST", credentials: "include" });
+      const payload = await response.json().catch(() => ({})) as { data?: DiscussionApiThread; message?: string };
+      if (!response.ok || !payload.data) throw new Error(payload.message ?? "Не удалось обновить тему.");
+      const nextThread = mapDiscussionApiThread(payload.data);
+      setThreads((current) => current.map((thread) => thread.id === nextThread.id ? nextThread : thread));
+    } catch (error: unknown) {
+      setReplyError(error instanceof Error ? error.message : "Не удалось обновить тему.");
+    } finally {
+      setMarkingAnswered(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -2149,10 +2192,10 @@ function CuratorDiscussionsView() {
         <div className="curator-discussion-thread-list">{loading ? <div className="empty-state"><MessageSquareText size={22} /><strong>Загружаем обсуждения…</strong><span>Проверяем темы из базы данных.</span></div> : loadError ? <div className="empty-state"><MessageSquareText size={22} /><strong>Не удалось загрузить обсуждения</strong><span>{loadError}</span></div> : visibleThreads.length > 0 ? visibleThreads.map((thread) => <button className={`curator-discussion-thread-row ${thread.id === selectedThread?.id ? "selected" : ""}`} type="button" key={thread.id} onClick={() => setSelectedId(thread.id)}>{thread.avatarUrl ? <Image className="profile-avatar profile-avatar-image" src={thread.avatarUrl} alt={thread.student} width={34} height={34} unoptimized /> : <div className={`profile-avatar ${thread.status === "ANSWERED" ? "curator" : ""}`}>{thread.initials}</div>}<div><strong>{thread.title}</strong><span><span className={thread.studentIsAdvanced ? "student-name-advanced" : undefined}>{thread.student}</span>{thread.studentIsAdvanced && <em className="adv-tag" title="Advanced">ADV</em>} · {thread.module}</span><small>{thread.updatedAt} · {thread.messages.length} {thread.messages.length === 1 ? "сообщение" : "сообщения"}</small></div><b className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</b><ChevronRight size={15} /></button>) : <div className="empty-state"><MessageSquareText size={22} /><strong>Обсуждений пока нет</strong><span>Новые вопросы появятся здесь после отправки учеником.</span></div>}</div>
       </section>
       {selectedThread ? <section className="content-panel curator-discussion-detail">
-        <div className="curator-discussion-detail-head"><div><span className="section-kicker">{selectedThread.module}</span><h2>{selectedThread.title}</h2><p><span className={selectedThread.studentIsAdvanced ? "student-name-advanced" : undefined}>{selectedThread.student}</span>{selectedThread.studentIsAdvanced && <em className="adv-tag" title="Advanced">ADV</em>}{selectedThread.assignment ? ` · ${selectedThread.assignment}` : ""}</p></div><span className={`curator-discussion-status ${selectedThread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(selectedThread.status)}</span></div>
+        <div className="curator-discussion-detail-head"><div><span className="section-kicker">{selectedThread.module}</span><h2>{selectedThread.title}</h2><p><span className={selectedThread.studentIsAdvanced ? "student-name-advanced" : undefined}>{selectedThread.student}</span>{selectedThread.studentIsAdvanced && <em className="adv-tag" title="Advanced">ADV</em>}{selectedThread.assignment ? ` · ${selectedThread.assignment}` : ""}</p></div><div className="curator-discussion-head-actions"><span className={`curator-discussion-status ${selectedThread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(selectedThread.status)}</span>{(selectedThread.status === "NEW" || selectedThread.status === "WAITING") && <button type="button" className="secondary-button compact" disabled={markingAnswered} onClick={() => void markAnswered()} title="Например, ученик написал «спасибо». Тема перестанет ждать ответа, ученику ничего не придёт. Если он напишет снова — тема опять появится как ждущая ответа.">{markingAnswered ? "Сохраняем…" : "Ответ не нужен"}</button>}</div></div>
         <div className="curator-discussion-module-cover" role="img" aria-label={`Обложка ${selectedThread.module}`} style={{ backgroundImage: `linear-gradient(90deg, rgba(4,7,12,.94), rgba(4,7,12,.72)), url("${selectedThread.coverPath ?? discussionCoverForContext({ module: selectedThread.module })}")` }}><strong>{selectedThread.module}</strong></div>
         <div className="curator-discussion-context">{selectedThread.assignment && <span><FileCheck2 size={14} /> {selectedThread.assignment}</span>}<span><MessageSquareText size={14} /> Личная тема ученика</span></div>
-        <div className="curator-discussion-messages">{selectedThread.messages.map((message) => <article className={`curator-discussion-message ${message.author}`} key={message.id}><div className="curator-discussion-message-meta"><StudentName name={message.name} advanced={message.author === "student" && selectedThread.studentIsAdvanced} /><span>{message.time}</span></div><p>{linkifyText(message.body)}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
+        <DiscussionMessageList className="curator-discussion-messages" threadKey={selectedThread.id} messageCount={selectedThread.messages.length}>{selectedThread.messages.map((message) => <article className={`curator-discussion-message ${message.author}`} key={message.id}><div className="curator-discussion-message-meta"><StudentName name={message.name} advanced={message.author === "student" && selectedThread.studentIsAdvanced} /><span>{message.time}</span></div><p>{linkifyText(message.body)}</p><DiscussionMessageAttachments message={message} /></article>)}</DiscussionMessageList>
         <form className="curator-discussion-reply" onSubmit={sendReply}><label htmlFor="curator-discussion-reply">ОТВЕТ КУРАТОРА</label><div className="curator-discussion-input-wrap"><textarea id="curator-discussion-reply" onKeyDown={continueNumberedList} value={reply} onChange={(event) => setReply(event.target.value)} onPaste={handleReplyPaste} placeholder="Напишите ответ…" rows={4} /><label className="discussion-reply-attach-button" htmlFor="curator-discussion-reply-attachment" title="Прикрепить файлы" aria-label="Прикрепить файлы"><Plus size={18} /><input id="curator-discussion-reply-attachment" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { replyAttachments.addFiles(event.target.files); event.target.value = ""; }} /></label></div>{replyAttachments.error && <div className="file-error" role="alert">{replyAttachments.error}</div>}<DiscussionAttachmentPreviewList attachments={replyAttachments.attachments} onRemove={replyAttachments.removeAt} /><div><span className="curator-discussion-draft-note"><FileCheck2 size={14} /> Ответ сохранится в истории этой темы</span><button className="primary-button" type="submit" disabled={(!reply.trim() && replyAttachments.attachments.length === 0) || replySaving}>{replySaving ? "Сохраняем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div>{replyError && <div className="file-error" role="alert">{replyError}</div>}</form>
       </section> : <section className="content-panel curator-discussion-empty empty-state"><MessageSquareText size={22} /><strong>Выбери тему</strong><span>Справа появится история вопроса и форма ответа.</span></section>}
     </div>
@@ -7493,7 +7536,7 @@ function StudentDiscussionDetail({ thread, onClose, onUpdate }: { thread: Curato
   };
   return <section className="content-panel student-discussion-detail">
     <div className="student-discussion-detail-head"><div><span className="section-kicker">{thread.module}</span><h2>{thread.title}</h2><p>{thread.updatedAt}</p></div><button className="icon-button compact" type="button" aria-label="Закрыть историю вопроса" onClick={onClose}><X size={17} /></button></div>
-    <div className="student-discussion-messages">{thread.messages.map((message) => <article className={`student-discussion-message ${message.author}`} key={message.id}><div className="student-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{linkifyText(message.body)}</p><DiscussionMessageAttachments message={message} /></article>)}</div>
+    <DiscussionMessageList className="student-discussion-messages" threadKey={thread.id} messageCount={thread.messages.length}>{thread.messages.map((message) => <article className={`student-discussion-message ${message.author}`} key={message.id}><div className="student-discussion-message-meta"><strong>{message.name}</strong><span>{message.time}</span></div><p>{linkifyText(message.body)}</p><DiscussionMessageAttachments message={message} /></article>)}</DiscussionMessageList>
     <div className="student-discussion-status-note"><span className={`curator-discussion-status ${thread.status.toLowerCase()}`}>{curatorDiscussionStatusLabel(thread.status)}</span><span>{thread.practicumCompleted ? "Поток завершён — переписка доступна только для чтения." : thread.status === "CLOSED" ? "Вопрос закрыт. Для нового обращения создай отдельную тему." : "История сохраняется, а диалог можно продолжить в любой момент."}</span></div>
     {thread.status !== "CLOSED" && !thread.practicumCompleted && <div className="student-discussion-actions"><button className="primary-button" type="button" onClick={() => setReplyOpen((current) => !current)}>{replyOpen ? "Скрыть ответ" : "Ответить ещё"}</button></div>}
     {replyOpen && thread.status !== "CLOSED" && !thread.practicumCompleted && <form className="student-discussion-reply" onSubmit={sendReply}><label htmlFor="student-discussion-reply">ОТВЕТ В ЭТОЙ ТЕМЕ</label><div className="student-discussion-input-wrap"><textarea id="student-discussion-reply" onKeyDown={continueNumberedList} value={reply} onChange={(event) => setReply(event.target.value)} onPaste={handleReplyPaste} rows={4} placeholder="Напиши уточнение или следующий вопрос куратору… Скриншот можно вставить через Ctrl+V" /><label className="discussion-reply-attach-button" htmlFor="student-discussion-reply-attachment" title="Прикрепить файлы" aria-label="Прикрепить файлы"><Plus size={18} /><input id="student-discussion-reply-attachment" type="file" multiple accept="image/png,image/jpeg,application/pdf,video/mp4,video/webm" onChange={(event) => { replyAttachments.addFiles(event.target.files); event.target.value = ""; }} /></label></div>{replyAttachments.error && <div className="file-error" role="alert">{replyAttachments.error}</div>}<DiscussionAttachmentPreviewList attachments={replyAttachments.attachments} onRemove={replyAttachments.removeAt} /><div><span>Ответ добавится в историю и снова передаст тему куратору.</span><button className="primary-button" type="submit" disabled={(!reply.trim() && replyAttachments.attachments.length === 0) || saving}>{saving ? "Отправляем…" : "Отправить ответ"} <ChevronRight size={15} /></button></div></form>}
