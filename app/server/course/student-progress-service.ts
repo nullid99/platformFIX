@@ -124,7 +124,10 @@ export async function getStudentProgress(actorId: string, practicumId: string): 
     const progressPercent = totalModules > 0 ? Math.round((completedModules / totalModules) * 100) : 0;
     const lastActiveAt = enrollment.student.sessions[0]?.lastActiveAt ?? null;
     const daysSinceActive = lastActiveAt ? (now.getTime() - lastActiveAt.getTime()) / 86_400_000 : Infinity;
-    const needsAttention = counts.needsRevision > 0 || (progressPercent < 100 && daysSinceActive > INACTIVITY_THRESHOLD_DAYS);
+    // Only inactivity. A work sent back for revision used to flag the student on its own, the moment
+    // the curator pressed the button — everyone just returned showed "Требует внимания" (2026-10-06).
+    // A revision still shapes the reminder text below when an inactive student has one.
+    const needsAttention = progressPercent < 100 && daysSinceActive > INACTIVITY_THRESHOLD_DAYS;
 
     return {
       id: enrollment.studentId,
