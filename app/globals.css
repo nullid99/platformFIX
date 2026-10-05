@@ -50,8 +50,17 @@ body { margin: 0; color: var(--text); background: var(--bg); font-family: var(--
 }
 :root[data-theme="light"] .content-area img,
 :root[data-theme="light"] .content-area video,
+:root[data-theme="light"] .content-area iframe,
 :root[data-theme="light"] .content-area [role="img"] {
   filter: invert(1) hue-rotate(180deg);
+}
+/* iframe = Vimeo/YouTube players, PDF and file previews — someone else's page, shown as is
+   (2026-10-05: a Vimeo recording came out as a negative). Their own fullscreen button puts the
+   iframe/video itself into the top layer, outside .content-area's filter, so the compensation
+   must go too or the fullscreen picture would be the negative. */
+:root[data-theme="light"] .content-area iframe:fullscreen,
+:root[data-theme="light"] .content-area video:fullscreen {
+  filter: none;
 }
 /* .sidebar's real light palette (not filter-based — see the big comment above for why). Every
    color the sidebar and its children use in the base/dark styles gets a direct light equivalent
@@ -8328,6 +8337,7 @@ html.pseudo-fullscreen-lock body {
 :root[data-theme="light"].pseudo-fullscreen-lock .app-shell .content-area,
 :root[data-theme="light"].pseudo-fullscreen-lock .content-area img,
 :root[data-theme="light"].pseudo-fullscreen-lock .content-area video,
+:root[data-theme="light"].pseudo-fullscreen-lock .content-area iframe,
 :root[data-theme="light"].pseudo-fullscreen-lock .content-area [role="img"] {
   filter: none;
 }
