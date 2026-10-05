@@ -460,7 +460,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   const [resumedFrom, setResumedFrom] = useState<number | null>(null);
   // Remembered per browser, so the next recording starts at the speed the student last picked.
   const [playbackRate, setPlaybackRate] = useState(() => (typeof window === "undefined" ? 1 : readSavedPlaybackRate()));
-  const { fullscreen, toggle: toggleFullscreen, exit: exitFullscreen } = useVideoFullscreen(fullscreenRef);
+  const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef);
   const applyPlaybackRate = (rate: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -476,10 +476,10 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   };
 
   const togglePlay = () => { const video = videoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause(); };
-  // In fullscreen, a tap on the video exits instead of toggling play/pause — Escape works too,
-  // but not everyone knows that, and the fullscreen toggle button itself is easy to lose track
-  // of once the player fills the whole screen.
-  const handleVideoClick = () => { if (fullscreen) { exitFullscreen(); return; } togglePlay(); };
+  // A click is play/pause in fullscreen too, like YouTube — it used to exit fullscreen, which
+  // students kept doing by accident when they only wanted to pause (2026-10-06). Double-click
+  // toggles fullscreen; the control-bar button and Escape still exit.
+  const handleVideoClick = () => togglePlay();
   const toggleMute = () => {
     const video = videoRef.current;
     if (!video) return;
@@ -583,6 +583,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
       src={src}
       playsInline
       onClick={handleVideoClick}
+      onDoubleClick={toggleFullscreen}
       onPlay={() => { setPlaying(true); claimKeyboard(); }}
       onPause={() => setPlaying(false)}
       onTimeUpdate={(event) => handleTimeUpdate(event.currentTarget)}
