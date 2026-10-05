@@ -62,6 +62,22 @@ body { margin: 0; color: var(--text); background: var(--bg); font-family: var(--
 :root[data-theme="light"] .content-area video:fullscreen {
   filter: none;
 }
+/* Same for our own players: they fullscreen their wrapper (video + controls, + chat for the live
+   room), which also leaves .content-area's filter — so the photo/video compensation inside it must
+   go, or a light chart comes out dark (2026-10-05, recording player). -webkit- in its own rule:
+   an unknown pseudo-class would void the whole list. */
+:root[data-theme="light"] .content-area :fullscreen img,
+:root[data-theme="light"] .content-area :fullscreen video,
+:root[data-theme="light"] .content-area :fullscreen iframe,
+:root[data-theme="light"] .content-area :fullscreen [role="img"] {
+  filter: none;
+}
+:root[data-theme="light"] .content-area :-webkit-full-screen img,
+:root[data-theme="light"] .content-area :-webkit-full-screen video,
+:root[data-theme="light"] .content-area :-webkit-full-screen iframe,
+:root[data-theme="light"] .content-area :-webkit-full-screen [role="img"] {
+  filter: none;
+}
 /* .sidebar's real light palette (not filter-based — see the big comment above for why). Every
    color the sidebar and its children use in the base/dark styles gets a direct light equivalent
    here rather than relying on inversion, since the sidebar deliberately sits outside
