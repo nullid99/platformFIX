@@ -8509,3 +8509,8 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 /* Student follow-up in a discussion: textarea + "+" attach button, like the curator's reply. */
 .student-discussion-reply > div.student-discussion-input-wrap, .learner-course-view .student-discussion-reply > div.student-discussion-input-wrap { display: block; position: relative; }
 .student-discussion-input-wrap textarea { padding-right: 44px; }
+
+/* "Доработка · MEMPHIS" in the review queue — a resubmission that only that curator can accept. */
+.review-resubmission-tag { flex-shrink: 0; max-width: 150px; overflow: hidden; padding: 3px 7px; color: #9caabd; border: 1px solid #34465a; border-radius: 4px; font: 600 9px 'DM Mono', monospace; letter-spacing: .03em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.review-resubmission-tag.mine { color: #ffb15c; background: rgba(255, 145, 40, .1); border-color: rgba(255, 160, 60, .55); }
+@media (max-width: 600px) { .review-resubmission-tag { max-width: 92px; } }

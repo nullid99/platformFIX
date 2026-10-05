@@ -2681,7 +2681,14 @@ function CuratorQueueRow({ item, selected, onOpen }: { item: ReviewQueueItem; se
   // from pending at a glance. Green for accepted matches the tone the student's own
   // assignment list already uses for the same status.
   const effectiveTone = item.status === "Принято" ? "green" : item.tone;
-  return <button className={`review-queue-row ${selected ? "selected" : ""}`} onClick={onOpen} aria-pressed={selected}>{item.studentAvatarUrl ? <Image className="profile-avatar profile-avatar-image" src={item.studentAvatarUrl} alt={item.studentName} width={31} height={31} unoptimized /> : <div className="profile-avatar">{item.studentInitials}</div>}<div className="review-queue-copy"><StudentName name={item.studentName} advanced={item.studentIsAdvanced} /><span>{item.assignmentTitle} · {item.module}</span><small>{item.submittedAt} · {item.attempt}</small></div><div className={`assignment-badge ${item.selfCompleted ? "gray" : effectiveTone}`}>{item.selfCompleted ? "Без проверки" : item.status}</div><ChevronRight size={16} /></button>;
+  // A resubmission after "Вернуть на доработку" goes straight back to the curator who returned it
+  // (assignment-service carries reviewerId over), but in the list it looked like any first attempt
+  // (2026-10-05). Tag it with that curator's name — bright when it's yours, muted when someone else's.
+  const attemptNumber = Number(item.attempt.match(/\d+/)?.[0] ?? 1);
+  const isResubmission = item.status === "На проверке" && attemptNumber > 1;
+  const resubmissionMine = isResubmission && Boolean(item.reviewerId) && item.isReviewerSelf === true;
+  const resubmissionLabel = item.reviewerName ? `Доработка · ${item.reviewerName}` : "Доработка";
+  return <button className={`review-queue-row ${selected ? "selected" : ""}`} onClick={onOpen} aria-pressed={selected}>{item.studentAvatarUrl ? <Image className="profile-avatar profile-avatar-image" src={item.studentAvatarUrl} alt={item.studentName} width={31} height={31} unoptimized /> : <div className="profile-avatar">{item.studentInitials}</div>}<div className="review-queue-copy"><StudentName name={item.studentName} advanced={item.studentIsAdvanced} /><span>{item.assignmentTitle} · {item.module}</span><small>{item.submittedAt} · {item.attempt}</small></div>{isResubmission && <span className={`review-resubmission-tag ${resubmissionMine ? "mine" : ""}`} title={item.reviewerName ? `Повторная попытка после доработки — принимает ${item.reviewerName}` : "Повторная попытка после доработки"}>{resubmissionLabel}</span>}<div className={`assignment-badge ${item.selfCompleted ? "gray" : effectiveTone}`}>{item.selfCompleted ? "Без проверки" : item.status}</div><ChevronRight size={16} /></button>;
 }
 
 function formatAttemptCount(count: number) {
