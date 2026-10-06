@@ -5366,6 +5366,28 @@ function ChatMessageRow({ message, currentUserId, showAdvanced = false, onReact,
   </div>;
 }
 
+/**
+ * "F" toggles the stream's theater fullscreen (video + chat), same key as the recording player —
+ * asked for by students 2026-10-06. Ignored while typing (chat input) and with modifiers.
+ */
+function useFullscreenHotkey(toggle: () => void) {
+  const toggleRef = useRef(toggle);
+  useEffect(() => { toggleRef.current = toggle; });
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // A recording player on the same page already owns "F" (see RecordedVideoSurface).
+      if (activeRecordedPlayer !== null) return;
+      if (event.ctrlKey || event.metaKey || event.altKey || event.repeat || isTypingTarget(event.target)) return;
+      const key = event.key.toLowerCase();
+      if (key !== "f" && key !== "а") return;
+      event.preventDefault();
+      toggleRef.current();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+}
+
 function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete }: {
   state: { message: StreamChatMessage; x: number; y: number };
   canDelete: boolean;
@@ -5375,6 +5397,9 @@ function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete
   onDelete: (messageId: string) => void;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
+  // Into the fullscreen element when the stream is in theater mode — portaled to document.body
+  // it rendered behind the top layer, so reactions/"Ответить" never showed there (2026-10-06).
+  const portalTarget = useLightboxPortalTarget(true);
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(event.target as Node)) onClose(); };
     const handleKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -5387,13 +5412,13 @@ function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete
   const left = Math.min(state.x, window.innerWidth - 220);
   const top = Math.min(state.y, window.innerHeight - menuHeight);
 
-  return typeof document === "undefined" ? null : createPortal(
+  return !portalTarget ? null : createPortal(
     <div className="live-room-chat-menu" ref={menuRef} role="menu" style={{ left, top }}>
       <div className="live-room-chat-menu-reactions">{REACTION_OPTIONS.map((emoji) => <button type="button" key={emoji} onClick={() => { onReact(state.message.id, emoji); onClose(); }}>{emoji}</button>)}</div>
       <button type="button" className="live-room-chat-menu-item" role="menuitem" onClick={() => { onReply(state.message); onClose(); }}><CornerUpLeft size={14} /> Ответить</button>
       {canDelete && <button type="button" className="live-room-chat-menu-item danger" role="menuitem" onClick={() => { onDelete(state.message.id); onClose(); }}><Trash2 size={14} /> Удалить сообщение</button>}
     </div>,
-    document.body,
+    portalTarget,
   );
 }
 
@@ -5749,6 +5774,7 @@ function CuratorStreamsView({ onNavigate }: { onNavigate: (nextNav: CuratorNav) 
       void liveWrapRef.current?.requestFullscreen();
     }
   };
+  useFullscreenHotkey(toggleFullscreen);
 
   const setupLiveInput = async () => {
     setSettingUp(true);
@@ -7047,6 +7073,7 @@ function StudentLiveStreamView({ onNavigate }: { onNavigate: (nextNav: Dashboard
       void liveWrapRef.current?.requestFullscreen();
     }
   };
+  useFullscreenHotkey(toggleFullscreen);
 
   const nextEvent = upcoming[0];
   const msToNextEvent = nextEvent ? eventStartDate(nextEvent).getTime() - now : null;
