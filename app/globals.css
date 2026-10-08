@@ -8541,3 +8541,10 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
    can still be dragged. */
 .curator-feedback textarea, #assignment-answer { min-height: 220px; max-height: 60vh; field-sizing: content; }
 .curator-feedback textarea { font-size: 13px; line-height: 1.6; }
+
+/* Recording + its "Чат эфира" under a lesson: the stack is a grid with an auto column, so an
+   unwrappable line in the chat (a one-line reply quote, white-space: nowrap) widened the column —
+   and the player with it — far past the card, hiding the player's right-hand controls
+   (2026-10-08). Pin the column to the card width; long quotes get their ellipsis instead. */
+.module-video-stack { grid-template-columns: minmax(0, 1fr); }
+.module-video-item, .module-archived-chat { min-width: 0; max-width: 100%; }
