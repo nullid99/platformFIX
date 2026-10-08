@@ -5340,7 +5340,13 @@ function ChatMessageRow({ message, currentUserId, showAdvanced = false, onReact,
     window.setTimeout(() => target.classList.remove("is-jump-highlight"), 1400);
   };
 
-  return <div className={`live-room-chat-message ${isStaff ? "is-staff" : ""} ${isReplyToMe ? "is-reply-to-me" : ""}`} id={`chat-msg-${message.id}`} onContextMenu={(event) => onContextMenu(event, message)}>
+  return <div className={`live-room-chat-message ${isStaff ? "is-staff" : ""} ${isReplyToMe ? "is-reply-to-me" : ""}`} id={`chat-msg-${message.id}`} onContextMenu={(event) => {
+    // A right-click on a picture (in the message or its lightbox, which is portaled but still
+    // bubbles here through React) keeps the browser's own menu — "Копировать картинку",
+    // "Сохранить как". Curators couldn't copy students' charts at all (2026-10-09).
+    if (event.target instanceof Element && event.target.closest("img, .chat-image-lightbox-overlay")) return;
+    onContextMenu(event, message);
+  }}>
     <div className="live-room-chat-message-avatar">
       {message.authorAvatarUrl ? <Image className="live-room-chat-avatar-image" src={message.authorAvatarUrl} alt={message.authorName} width={32} height={32} unoptimized /> : <div className="live-room-chat-avatar-fallback">{getInitials(message.authorName, "?")}</div>}
     </div>
@@ -5388,6 +5394,19 @@ function useFullscreenHotkey(toggle: () => void) {
   }, []);
 }
 
+/** Puts a chat picture on the clipboard as PNG — the only image type browsers accept there. */
+async function copyImageToClipboard(url: string): Promise<void> {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) throw new Error(`image fetch failed: ${response.status}`);
+  const bitmap = await createImageBitmap(await response.blob());
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+  const png = await new Promise<Blob>((resolve, reject) => canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("png encode failed"))), "image/png"));
+  await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+}
+
 function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete }: {
   state: { message: StreamChatMessage; x: number; y: number };
   canDelete: boolean;
@@ -5408,7 +5427,7 @@ function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete
     return () => { window.removeEventListener("mousedown", handleClickOutside); window.removeEventListener("keydown", handleKeyDown); };
   }, [onClose]);
 
-  const menuHeight = canDelete ? 232 : 192;
+  const menuHeight = (canDelete ? 232 : 192) + (state.message.attachment ? 40 : 0);
   const left = Math.min(state.x, window.innerWidth - 220);
   const top = Math.min(state.y, window.innerHeight - menuHeight);
 
@@ -5416,6 +5435,11 @@ function ChatContextMenu({ state, canDelete, onClose, onReply, onReact, onDelete
     <div className="live-room-chat-menu" ref={menuRef} role="menu" style={{ left, top }}>
       <div className="live-room-chat-menu-reactions">{REACTION_OPTIONS.map((emoji) => <button type="button" key={emoji} onClick={() => { onReact(state.message.id, emoji); onClose(); }}>{emoji}</button>)}</div>
       <button type="button" className="live-room-chat-menu-item" role="menuitem" onClick={() => { onReply(state.message); onClose(); }}><CornerUpLeft size={14} /> Ответить</button>
+      {state.message.attachment && <button type="button" className="live-room-chat-menu-item" role="menuitem" onClick={() => {
+        const url = state.message.attachment!.url;
+        // No clipboard access (old browser, http) — open the picture so it can be saved from there.
+        void copyImageToClipboard(url).catch(() => window.open(url, "_blank", "noopener")).finally(onClose);
+      }}><Copy size={14} /> Копировать изображение</button>}
       {canDelete && <button type="button" className="live-room-chat-menu-item danger" role="menuitem" onClick={() => { onDelete(state.message.id); onClose(); }}><Trash2 size={14} /> Удалить сообщение</button>}
     </div>,
     portalTarget,
