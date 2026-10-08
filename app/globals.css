@@ -6409,6 +6409,7 @@ div.discussion-selected-preview-list { width: min(100%, 900px); display: grid; g
   font-size: 12.5px;
   line-height: 1.5;
   word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .live-room-chat-message p a {
@@ -6529,28 +6530,33 @@ div.discussion-selected-preview-list { width: min(100%, 900px); display: grid; g
 
 .live-room-chat-form {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
   padding: 10px;
   border-top: 1px solid rgba(255, 255, 255, .14);
 }
 
-.live-room-chat-form input {
+.live-room-chat-form textarea {
   flex: 1;
   min-width: 0;
-  height: 34px;
-  padding: 0 10px;
+  min-height: 34px;
+  max-height: 132px;
+  padding: 7px 10px;
+  overflow-y: auto;
+  resize: none;
+  font-family: inherit;
+  line-height: 1.5;
   color: rgba(255, 255, 255, .88);
   background: rgba(255, 255, 255, .05);
   border: 1px solid rgba(255, 255, 255, .16);
   font-size: 12.5px;
 }
 
-.live-room-chat-form input::placeholder {
+.live-room-chat-form textarea::placeholder {
   color: rgba(255, 255, 255, .35);
 }
 
-.live-room-chat-form input:disabled {
+.live-room-chat-form textarea:disabled {
   opacity: .5;
 }
 

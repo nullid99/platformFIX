@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, forwardRef, Fragment, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject } from "react";
+import { createContext, forwardRef, Fragment, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type Ref, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import Image from "next/image";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -5455,6 +5455,22 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boole
     if (atBottomRef.current || ownMessage) chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight });
   }, [chatMessages, lastMessage, currentUserId]);
 
+  // Multi-line input (2026-10-09): it was a one-line <input>, so a long message scrolled its own
+  // beginning out of sight. Grows with the text up to the CSS max-height, then scrolls; Enter still
+  // sends, Shift+Enter starts a new line.
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const field = chatInputRef.current;
+    if (!field) return;
+    field.style.height = "auto";
+    field.style.height = `${field.scrollHeight + 2}px`;
+  }, [chatDraft]);
+  const handleChatKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    event.currentTarget.form?.requestSubmit();
+  };
+
   const submitChatMessage = (event: FormEvent) => {
     event.preventDefault();
     if (!chatDraft.trim()) return;
@@ -5463,7 +5479,7 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boole
     setReplyingTo(null);
   };
 
-  const handlePaste = async (event: ClipboardEvent<HTMLInputElement>) => {
+  const handlePaste = async (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const item = Array.from(event.clipboardData.items).find((entry) => entry.type.startsWith("image/"));
     if (!item) return;
     event.preventDefault();
@@ -5508,7 +5524,7 @@ function ChatPanel({ isFullscreen, canModerate = false }: { isFullscreen?: boole
     {(chatError || uploadError) && <span className="live-room-error live-room-chat-error">{uploadError ?? chatError}</span>}
     {replyingTo && <div className="live-room-chat-replying-bar"><CornerUpLeft size={13} /><span>Ответ для <strong>{replyingTo.authorName}</strong>: {replyingTo.body || "Вложение"}</span><button type="button" className="icon-button compact" aria-label="Отменить ответ" onClick={() => setReplyingTo(null)}><X size={13} /></button></div>}
     <form className="live-room-chat-form" onSubmit={submitChatMessage}>
-      <input type="text" value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} onPaste={(event) => void handlePaste(event)} placeholder={uploadingImage ? "Загружаем скриншот…" : "Написать в чат…"} maxLength={2000} disabled={!chatConnected || uploadingImage} />
+      <textarea ref={chatInputRef} rows={1} value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} onKeyDown={handleChatKeyDown} onPaste={(event) => void handlePaste(event)} placeholder={uploadingImage ? "Загружаем скриншот…" : "Написать в чат… (Shift+Enter — новая строка)"} maxLength={2000} disabled={!chatConnected || uploadingImage} />
       <button type="submit" className="icon-button compact" aria-label="Отправить" disabled={!chatConnected || uploadingImage || !chatDraft.trim()}><ArrowRight size={15} /></button>
     </form>
   </aside>;
