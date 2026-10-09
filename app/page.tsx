@@ -461,11 +461,57 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return !["button", "checkbox", "radio", "submit", "reset", "file", "color", "image"].includes(type);
 }
 
-function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenRef: RefObject<HTMLDivElement | null> }) {
+/** Which recording player currently drives the phone's lock screen / Control Center controls. */
+let mediaSessionOwner: symbol | null = null;
+
+function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; title: string; fullscreenRef: RefObject<HTMLDivElement | null> }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   // YouTube-style keys (asked for by students 2026-10-04): ←/→ ±5 s, space play/pause, M mute,
   // F fullscreen — for the player last interacted with, and never while typing in a text field.
   const playerId = useRef(Symbol("recorded-player"));
+  // Lock screen / Control Center on iPhone (media notification on Android): title, play/pause,
+  // ±10 s and a draggable position — the picture-in-picture window itself only skips ±10 s, so
+  // getting back to the middle of a 90-minute recording meant tapping "10" over and over (2026-10-09).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !("mediaSession" in navigator)) return;
+    const session = navigator.mediaSession;
+    const id = playerId.current;
+    const updatePosition = () => {
+      if (mediaSessionOwner !== id || !Number.isFinite(video.duration) || video.duration <= 0) return;
+      try {
+        session.setPositionState({ duration: video.duration, playbackRate: video.playbackRate || 1, position: Math.min(video.currentTime, video.duration) });
+      } catch { /* older Safari: no position state, the controls still work without it */ }
+    };
+    const claim = () => {
+      mediaSessionOwner = id;
+      session.metadata = new MediaMetadata({ title, artist: "FIX · запись эфира" });
+      const handlers: Array<[MediaSessionAction, MediaSessionActionHandler]> = [
+        ["play", () => { void video.play(); }],
+        ["pause", () => video.pause()],
+        ["seekbackward", (details) => { video.currentTime = Math.max(0, video.currentTime - (details.seekOffset ?? 10)); }],
+        ["seekforward", (details) => { video.currentTime = Math.min(Number.isFinite(video.duration) ? video.duration : Infinity, video.currentTime + (details.seekOffset ?? 10)); }],
+        ["seekto", (details) => { if (details.seekTime !== undefined) video.currentTime = details.seekTime; }],
+      ];
+      for (const [action, handler] of handlers) {
+        try { session.setActionHandler(action, handler); } catch { /* this browser doesn't offer that button */ }
+      }
+      updatePosition();
+    };
+    const positionEvents = ["loadedmetadata", "seeked", "ratechange", "pause", "play"];
+    video.addEventListener("play", claim);
+    for (const name of positionEvents) video.addEventListener(name, updatePosition);
+    return () => {
+      video.removeEventListener("play", claim);
+      for (const name of positionEvents) video.removeEventListener(name, updatePosition);
+      if (mediaSessionOwner !== id) return;
+      mediaSessionOwner = null;
+      session.metadata = null;
+      for (const action of ["play", "pause", "seekbackward", "seekforward", "seekto"] as MediaSessionAction[]) {
+        try { session.setActionHandler(action, null); } catch { /* not supported — nothing to clear */ }
+      }
+    };
+  }, [title]);
   const [keyHint, setKeyHint] = useState<{ text: string; at: number } | null>(null);
   const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
   useEffect(() => {
@@ -682,7 +728,7 @@ const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src?:
       {livekit
         ? <LiveKitVideoSurface key={livekit.roomName} token={livekit.token} roomName={livekit.roomName} fullscreenRef={wrapperRef} />
         : src?.startsWith("/api/streams/recordings/")
-          ? <RecordedVideoSurface src={src} fullscreenRef={wrapperRef} />
+          ? <RecordedVideoSurface src={src} title={title} fullscreenRef={wrapperRef} />
           : <iframe src={src} title={title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}
       {viewerLabel && <div className="tracked-video-watermark" aria-hidden="true"><span>{viewerLabel}</span><span>{clock}</span></div>}
     </div>;
