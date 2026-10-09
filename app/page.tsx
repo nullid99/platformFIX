@@ -30,6 +30,7 @@ import {
   Maximize2,
   Menu,
   Minimize2,
+  PictureInPicture2,
   MessageSquareText,
   Pause,
   Play,
@@ -180,6 +181,41 @@ function nativeFullscreenElement(): Element | null {
  * on phones; otherwise the wrapper gets a CSS "pseudo-fullscreen" class (fixed, covers the
  * viewport) and the page underneath is scroll-locked until exit.
  */
+type PresentationModeVideo = HTMLVideoElement & {
+  webkitSetPresentationMode?: (mode: "inline" | "picture-in-picture" | "fullscreen") => void;
+  webkitPresentationMode?: string;
+};
+
+/**
+ * "Картинка в картинке" for our own players, like the Vimeo player has (asked for 2026-10-09:
+ * keep watching a recording/stream in a small floating window while working in the terminal).
+ * Standard API on desktop browsers; iPhone/iPad Safari only has webkitSetPresentationMode.
+ */
+function usePictureInPicture(videoRef: RefObject<HTMLVideoElement | null>, beforeEnter?: () => void) {
+  const [supported] = useState(() => typeof document !== "undefined"
+    && (Boolean(document.pictureInPictureEnabled) || "webkitSetPresentationMode" in HTMLVideoElement.prototype));
+  const [active, setActive] = useState(false);
+  useEffect(() => {
+    const video = videoRef.current as PresentationModeVideo | null;
+    if (!video) return;
+    const sync = () => setActive(document.pictureInPictureElement === video || video.webkitPresentationMode === "picture-in-picture");
+    const events = ["enterpictureinpicture", "leavepictureinpicture", "webkitpresentationmodechanged"];
+    for (const name of events) video.addEventListener(name, sync);
+    return () => { for (const name of events) video.removeEventListener(name, sync); };
+  }, [videoRef]);
+  const toggle = () => {
+    const video = videoRef.current as PresentationModeVideo | null;
+    if (!video) return;
+    if (document.pictureInPictureElement) { void document.exitPictureInPicture().catch(() => undefined); return; }
+    if (video.webkitPresentationMode === "picture-in-picture") { video.webkitSetPresentationMode?.("inline"); return; }
+    // Our fullscreen is the wrapper — leaving it on would show an empty black screen behind the window.
+    beforeEnter?.();
+    if (document.pictureInPictureEnabled && !video.disablePictureInPicture) { void video.requestPictureInPicture().catch(() => undefined); return; }
+    video.webkitSetPresentationMode?.("picture-in-picture");
+  };
+  return { supported, active, toggle };
+}
+
 function useVideoFullscreen(ref: RefObject<HTMLDivElement | null>) {
   const [native, setNative] = useState(false);
   const [pseudo, setPseudo] = useState(false);
@@ -277,6 +313,7 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
   const [volume, setVolume] = useState(() => (typeof window === "undefined" ? 1 : readSavedVolume()));
   const volumeRef = useRef(volume);
   const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef);
+  const pictureInPicture = usePictureInPicture(videoElRef, () => { if (fullscreen) toggleFullscreen(); });
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [quality, setQuality] = useState<VideoQuality | "auto">("auto");
   const tokenRef = useRef(token);
@@ -361,6 +398,7 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
         </div>}
       </div>
       <div className="video-volume-group"><button type="button" className="livekit-video-control-button" aria-label={muted ? "Включить звук" : "Выключить звук"} onClick={toggleMute}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button><VolumeSlider volume={volume} muted={muted} onChange={changeVolume} /></div>
+      {pictureInPicture.supported && <button type="button" className="livekit-video-control-button" aria-label={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке"} title={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке — смотреть эфир в маленьком окне поверх других программ"} onClick={pictureInPicture.toggle}><PictureInPicture2 size={15} /></button>}
       <button type="button" className="livekit-video-control-button" aria-label={fullscreen ? "Свернуть" : "На весь экран"} onClick={toggleFullscreen}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
     </div>
   </>;
@@ -461,6 +499,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
   // Remembered per browser, so the next recording starts at the speed the student last picked.
   const [playbackRate, setPlaybackRate] = useState(() => (typeof window === "undefined" ? 1 : readSavedPlaybackRate()));
   const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef);
+  const pictureInPicture = usePictureInPicture(videoRef, () => { if (fullscreen) toggleFullscreen(); });
   const applyPlaybackRate = (rate: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -597,6 +636,7 @@ function RecordedVideoSurface({ src, fullscreenRef }: { src: string; fullscreenR
       <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
       <button type="button" className="recorded-video-speed" onClick={cyclePlaybackRate} aria-label={`Скорость воспроизведения: ${playbackRate}x. Нажмите, чтобы изменить`} title="Скорость воспроизведения">{String(playbackRate).replace(".", ",")}x</button>
       <div className="video-volume-group"><button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button><VolumeSlider volume={volume} muted={muted} onChange={changeVolume} /></div>
+      {pictureInPicture.supported && <button type="button" onClick={pictureInPicture.toggle} aria-label={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке"} title={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке — смотреть в маленьком окне поверх других программ"}><PictureInPicture2 size={16} /></button>}
       <button type="button" onClick={toggleFullscreen} aria-label={fullscreen ? "Свернуть" : "На весь экран"}>{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
     </div>
   </div>;
