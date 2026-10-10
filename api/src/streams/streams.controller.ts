@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, HttpCode, InternalServerErrorException, NotFoundException, Param, Post, Put, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, HttpCode, InternalServerErrorException, NotFoundException, Param, Post, Put, Query, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { streamChatService, streamService, webhookReceiver } from "@/app/server/streams";
@@ -89,6 +89,13 @@ export class StreamsController {
    * the qualities, `<720p>.m3u8` is one quality with signed segment URLs. 404 until the
    * transcoder has made the copies — the player then falls back to `play` (the MP4).
    */
+  /** Curator media library: which recordings already have their HLS copies (`?ids=a,b,c`). */
+  @Get("recordings/hls-status")
+  public async recordingsHlsStatus(@Req() request: RequestWithCookies, @Query("ids") ids?: string) {
+    const mediaIds = (ids ?? "").split(",").map((id) => id.trim()).filter((id) => /^[A-Za-z0-9_-]{1,64}$/.test(id));
+    try { return { data: await streamService.getRecordingsHlsStatus(await sessionUser(request), mediaIds) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
   @Get("recordings/:mediaId/hls/:file")
   public async recordingHls(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Param("file") file: string, @Res() response: Response) {
     if (!file.endsWith(".m3u8")) throw new NotFoundException();

@@ -4661,6 +4661,7 @@ function CuratorMediaLibraryView({ viewingPracticumId = null }: { viewingPractic
     return [...moduleItems, ...globalItems, ...scheduleItems];
   }, [course]);
   const selected = items.find((item) => item.id === selectedId) ?? null;
+  const hlsStatuses = useRecordingHlsStatus(items.filter((item) => item.embedUrl?.startsWith("/api/streams/recordings/")).map((item) => item.id));
   // "Newest first": a draft has no publishedAt yet, so fall back to createdAt — otherwise every
   // still-unpublished recording (exactly the ones a curator most needs to find right after a
   // stream ends) sorted as if from 1970 and sank to the very bottom of the list.
@@ -4980,7 +4981,7 @@ function CuratorMediaLibraryView({ viewingPracticumId = null }: { viewingPractic
             onDragOver={(event) => librarySortMode === "manual" && event.preventDefault()}
             onDrop={() => moveLibraryItem(item.id)}
           >
-            <CuratorMediaCard item={item} onOpen={() => { setSelectedId(item.id); setReclassifying(false); setRenaming(false); }} />
+            <CuratorMediaCard item={item} hlsStatus={hlsStatuses[item.id]} onOpen={() => { setSelectedId(item.id); setReclassifying(false); setRenaming(false); }} />
           </div>
         ))}</div>}
     </section>}
@@ -4991,6 +4992,11 @@ function CuratorMediaLibraryView({ viewingPracticumId = null }: { viewingPractic
       <div className="video-modal">
         <div className="video-modal-head"><div><span className="section-kicker">{(selected.eventTitle ? `Событие · ${selected.eventTitle}` : selected.moduleTitle)} · {mediaKindLabel(selected.kind)}{formatFileSize(selected.byteSize) && ` · ${formatFileSize(selected.byteSize)}`}</span><strong>{selected.title ?? "Без названия"}</strong></div><button className="icon-button" aria-label="Закрыть" onClick={() => { setSelectedId(""); setReclassifying(false); setRenaming(false); }}><X size={18} /></button></div>
         {selected.embedUrl ? <TrackedVideo mediaId={selected.id} src={selected.embedUrl} title={selected.title ?? "Запись"} /> : <div className="stream-player-unavailable"><Play size={22} /><span>Видео для этой записи ещё не подключено.</span></div>}
+        {hlsStatuses[selected.id] && <p className="media-link-note recording-hls-note"><RecordingHlsBadge status={hlsStatuses[selected.id]} /> {hlsStatuses[selected.id] === "ready"
+          ? "Ученики смотрят запись кусочками с выбором качества — без подтормаживаний на слабом интернете."
+          : hlsStatuses[selected.id] === "processing"
+            ? "Сервер делает копии в 1440p/1080p/720p/480p — обычно около часа после эфира. Публиковать можно уже сейчас: пока копии готовятся, ученики смотрят запись одним файлом, потом плеер переключится сам."
+            : "Копии сделать не удалось — запись работает как раньше, одним файлом. Напишите разработчику."}</p>}
         <div className="video-modal-foot media-preview-actions"><button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => { if (renaming) { setRenaming(false); return; } setReclassifying(false); openRename(); }}>{renaming ? "Отменить переименование" : "Переименовать"}</button><button className="secondary-button" type="button" disabled={saving || deletingId !== ""} onClick={() => { if (reclassifying) { setReclassifying(false); return; } setRenaming(false); openReclassify(); }}>{reclassifying ? "Отменить изменение типа" : "Изменить тип"}</button>{selected.status === "PUBLISHED" && <button className="secondary-button" type="button" onClick={() => void loadViewers(selected.id)}><Eye size={15} /> {viewersFor === selected.id ? "Скрыть просмотры" : "Кто смотрел"}</button>}{selected.provider === "LIVEKIT_RECORDING" && <a className="secondary-button" href={`/api/streams/recordings/${selected.id}/download`} target="_blank" rel="noopener noreferrer"><Download size={15} /> Скачать</a>}<button className="secondary-button danger-button" type="button" disabled={saving || deletingId === selected.id} onClick={() => void archiveSelected()}>{deletingId === selected.id ? "Удаляем…" : "Удалить запись"}</button><button className="primary-button" type="button" disabled={saving || deletingId !== "" || selected.status === "PUBLISHED"} onClick={() => void publishMedia()}>{selected.status === "PUBLISHED" ? "Опубликовано" : "Опубликовать"} <ChevronRight size={16} /></button></div>
         {renaming && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет только отображаемое название этой записи.</p><div className="media-editor-fields"><label className="form-field"><span>Название</span><input value={renameTitle} onChange={(event) => setRenameTitle(event.target.value)} placeholder="Например, Q&A по Market Logic · 05.06" maxLength={180} /></label></div><div className="media-form-actions"><button className="primary-button" type="button" disabled={saving || !renameTitle.trim()} onClick={() => void renameSelected()}>Сохранить название</button></div></div>}
         {reclassifying && <div className="media-viewers-panel media-reclassify-panel"><p className="media-link-note">Меняет тип и привязку этой же записи — новая копия не создаётся. Урок и событие — варианты «или-или», выбор одного сбрасывает другое.</p><div className="media-editor-fields"><label className="form-field"><span>Тип</span><select value={reclassifyKind} onChange={(event) => { const nextKind = event.target.value as CuratorMediaItem["kind"]; setReclassifyKind(nextKind); if (nextKind !== "TALKS" && !reclassifyModuleId && !reclassifyScheduleEventId) setReclassifyModuleId(moduleOptions[0]?.id ?? ""); }}><option value="STREAM">Стрим</option><option value="QA">Q&A</option><option value="BREAKDOWN">Разбор</option><option value="LESSON_VIDEO">Урок</option></select></label><div className="form-field media-audience-field"><span>Аудитория</span>{reclassifySelectedModuleIsAdvanced ? <div className="media-audience-locked"><ShieldCheck size={15} /> Урок Advanced — доступ и так только у Advanced-учеников</div> : <button type="button" className={`media-audience-switch ${reclassifyAudience === "ADVANCED" ? "on" : ""}`} role="switch" aria-checked={reclassifyAudience === "ADVANCED"} onClick={() => setReclassifyAudience(reclassifyAudience === "ADVANCED" ? "ALL" : "ADVANCED")}><span className="media-audience-switch-track"><span className="media-audience-switch-knob" /></span>Только Advanced-ученикам</button>}</div>{reclassifyKind !== "TALKS" && <><label className="form-field"><span>Привязать к уроку</span><select value={reclassifyModuleId} onChange={(event) => { setReclassifyModuleId(event.target.value); setReclassifyGroupId(""); setAddingReclassifyGroup(false); setNewReclassifyGroupPreset(""); setNewReclassifyGroupCustom(""); setReclassifyAudience(moduleOptions.find((module) => module.id === event.target.value)?.section === "Advanced" ? "ADVANCED" : "ALL"); if (event.target.value) setReclassifyScheduleEventId(""); }}><option value="">Выбери урок</option><optgroup label="Теория">{theoryModuleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</optgroup>{practiceModuleOptions.length > 0 && <optgroup label="Практика">{practiceModuleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</optgroup>}{advancedModuleOptions.length > 0 && <optgroup label="Advanced">{advancedModuleOptions.map((module) => <option key={module.id} value={module.id}>{module.label}</option>)}</optgroup>}</select></label>
@@ -5022,7 +5028,47 @@ function CuratorMediaLibraryView({ viewingPracticumId = null }: { viewingPractic
 }
 
 /** One card in the curator's "all recordings" grid (mirroring the student "Записи" page) — opens the shared video-modal popup above rather than expanding in place. */
-function CuratorMediaCard({ item, onOpen }: { item: CuratorMediaItem; onOpen: () => void }) {
+type RecordingHlsStatus = "ready" | "processing" | "failed";
+
+/**
+ * Whether the server recordings shown to a curator already have their HLS copies (several
+ * qualities — see recording-hls.ts). Rechecks every 2 minutes while any is still being made.
+ */
+function useRecordingHlsStatus(mediaIds: string[]): Record<string, RecordingHlsStatus> {
+  const [statuses, setStatuses] = useState<Record<string, RecordingHlsStatus>>({});
+  const key = [...mediaIds].sort().join(",");
+  useEffect(() => {
+    if (!key) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const load = async () => {
+      try {
+        const response = await fetch(`${API_ORIGIN}/api/streams/recordings/hls-status?ids=${encodeURIComponent(key)}`, { credentials: "include", cache: "no-store" });
+        const payload = await response.json().catch(() => ({})) as { data?: Record<string, RecordingHlsStatus> };
+        if (cancelled || !response.ok || !payload.data) return;
+        setStatuses(payload.data);
+        if (Object.values(payload.data).includes("processing")) timer = window.setTimeout(() => void load(), 120_000);
+      } catch (error: unknown) {
+        console.error("Recording HLS status request failed", error instanceof Error ? error.message : error);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [key]);
+  return statuses;
+}
+
+const HLS_STATUS_LABELS: Record<RecordingHlsStatus, string> = { ready: "Качества готовы", processing: "Качества готовятся…", failed: "Качества: ошибка" };
+
+function RecordingHlsBadge({ status }: { status?: RecordingHlsStatus }) {
+  if (!status) return null;
+  return <span className={`recording-hls-badge ${status}`}>{HLS_STATUS_LABELS[status]}</span>;
+}
+
+function CuratorMediaCard({ item, onOpen, hlsStatus }: { item: CuratorMediaItem; onOpen: () => void; hlsStatus?: RecordingHlsStatus }) {
   return <article className="stream-card"><button className="stream-card-button" type="button" onClick={onOpen}>
     <div className={`stream-preview ${item.thumbnailUrl ? "has-cover" : ""}`}>
       {item.thumbnailUrl ? <div className="stream-cover" role="img" aria-label={`Обложка: ${item.title ?? "запись"}`} style={{ backgroundImage: `url("${item.thumbnailUrl}")` }} /> : <div className="mini-candles"><i /><i /><i /><i /><i /></div>}
@@ -5034,6 +5080,7 @@ function CuratorMediaCard({ item, onOpen }: { item: CuratorMediaItem; onOpen: ()
       <span>{item.eventTitle ? `Событие · ${item.eventTitle}` : item.moduleTitle}</span>
       <h3>{item.title ?? "Без названия"}</h3>
       <p>{mediaKindLabel(item.kind)}{formatFileSize(item.byteSize) && ` · ${formatFileSize(item.byteSize)}`}</p>
+      <RecordingHlsBadge status={hlsStatus} />
     </div>
   </button></article>;
 }

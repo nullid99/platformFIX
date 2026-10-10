@@ -20,6 +20,31 @@ const HLS_SIGNED_PLAYLIST_CACHE_MS = 60 * 60_000;
 const hlsManifestCache = new Map<string, { manifest: HlsManifest | null; expiresAt: number }>();
 const hlsPlaylistCache = new Map<string, { text: string; expiresAt: number }>();
 
+/**
+ * Curator-facing state of a recording's HLS copies: "ready" (players use them), "processing"
+ * (queued or being made — the MP4 plays meanwhile), "failed" (the transcoder gave up after its
+ * retries; the MP4 keeps playing). See transcoder/src/worker.ts for failed.json.
+ */
+export type RecordingHlsStatus = "ready" | "processing" | "failed";
+const TRANSCODER_MAX_ATTEMPTS = 3;
+const hlsFailureCache = new Map<string, { failed: boolean; expiresAt: number }>();
+
+async function hlsCopiesFailed(objectKey: string): Promise<boolean> {
+  const cached = hlsFailureCache.get(objectKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.failed;
+  const text = await readRecordingObjectText(`${recordingHlsPrefix(objectKey)}failed.json`);
+  let failed = false;
+  if (text) {
+    try {
+      failed = Number((JSON.parse(text) as { attempts?: unknown }).attempts) >= TRANSCODER_MAX_ATTEMPTS;
+    } catch {
+      failed = false;
+    }
+  }
+  hlsFailureCache.set(objectKey, { failed, expiresAt: Date.now() + HLS_MISSING_CACHE_MS });
+  return failed;
+}
+
 async function loadHlsManifest(objectKey: string): Promise<HlsManifest | null> {
   const cached = hlsManifestCache.get(objectKey);
   if (cached && cached.expiresAt > Date.now()) return cached.manifest;
@@ -199,6 +224,28 @@ export class StreamService {
     const objectKey = await this.resolveOwnRecordingKey(actorId, mediaAssetId);
     const manifest = await loadHlsManifest(objectKey);
     return manifest ? buildMasterPlaylist(manifest, (rendition) => `${rendition}.m3u8`) : null;
+  }
+
+  /**
+   * "Качества: готовятся / готовы" on the curator's media cards (2026-10-10: whoever publishes a
+   * stream right after it ends wanted to see when the copies are done). Staff only; ids that aren't
+   * our own recordings are simply left out of the answer.
+   */
+  public async getRecordingsHlsStatus(actorId: string, mediaAssetIds: string[]): Promise<Record<string, RecordingHlsStatus>> {
+    const { role } = await assertPracticumViewer(actorId);
+    if (role !== UserRole.CURATOR && role !== UserRole.OWNER) throw new AuthServiceError("FORBIDDEN", "Only staff can see transcoding state");
+    const ids = [...new Set(mediaAssetIds)].slice(0, 200);
+    const assets = await prisma.mediaAsset.findMany({ where: { id: { in: ids }, provider: LIVEKIT_RECORDING_PROVIDER }, select: { id: true, providerKey: true } });
+    const entries = await Promise.all(assets.map(async (asset): Promise<[string, RecordingHlsStatus] | null> => {
+      try {
+        if (await loadHlsManifest(asset.providerKey)) return [asset.id, "ready"];
+        return [asset.id, (await hlsCopiesFailed(asset.providerKey)) ? "failed" : "processing"];
+      } catch (error: unknown) {
+        console.error("Recording HLS status check failed", asset.id, error instanceof Error ? error.message : "unknown error");
+        return null;
+      }
+    }));
+    return Object.fromEntries(entries.filter((entry): entry is [string, RecordingHlsStatus] => entry !== null));
   }
 
   /** One quality's playlist with every segment signed for direct download, or null if that quality doesn't exist. */
