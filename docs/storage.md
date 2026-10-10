@@ -30,3 +30,12 @@ The production upload should use short-lived presigned URLs. The API must create
 - backups and retention policy;
 - audit events for upload, preview and download;
 - private Vimeo settings for externally hosted video.
+
+## Stream Recordings (LiveKit) and HLS Copies
+
+Broadcast recordings live in a separate MinIO bucket on the stream server (`recordings/<id>.mp4`,
+written by LiveKit egress) and are played through short-lived signed URLs minted by the API after
+the usual access check (`GET /api/streams/recordings/:id/play`). The transcoder on the stream
+server adds HLS copies in several qualities under `hls/<id>/`; when they exist the player uses
+them (`/api/streams/recordings/:id/hls/master.m3u8`, every segment signed the same way) and falls
+back to the MP4 otherwise. Layout, installation and operation: `transcoder/README.md`.
