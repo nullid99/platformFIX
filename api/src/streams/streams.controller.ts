@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, HttpCode, InternalServerErrorException, Param, Post, Put, Req, Res, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, HttpCode, InternalServerErrorException, NotFoundException, Param, Post, Put, Req, Res, UnauthorizedException } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { streamChatService, streamService, webhookReceiver } from "@/app/server/streams";
@@ -81,6 +81,25 @@ export class StreamsController {
     try {
       const url = await streamService.getRecordingPlaybackUrl(await sessionUser(request), mediaId);
       response.redirect(302, url);
+    } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  /**
+   * HLS playlists for a recording (see app/server/streams/recording-hls.ts): `master.m3u8` lists
+   * the qualities, `<720p>.m3u8` is one quality with signed segment URLs. 404 until the
+   * transcoder has made the copies — the player then falls back to `play` (the MP4).
+   */
+  @Get("recordings/:mediaId/hls/:file")
+  public async recordingHls(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Param("file") file: string, @Res() response: Response) {
+    if (!file.endsWith(".m3u8")) throw new NotFoundException();
+    try {
+      const actorId = await sessionUser(request);
+      const name = file.slice(0, -".m3u8".length);
+      const playlist = name === "master"
+        ? await streamService.getRecordingHlsMaster(actorId, mediaId)
+        : await streamService.getRecordingHlsPlaylist(actorId, mediaId, name);
+      if (!playlist) throw new NotFoundException();
+      response.status(200).type("application/vnd.apple.mpegurl").set("Cache-Control", "private, no-store").send(playlist);
     } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 

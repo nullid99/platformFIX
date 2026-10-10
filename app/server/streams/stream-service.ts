@@ -9,6 +9,26 @@ import { isModuleOpenForStudent } from "@/app/server/course/module-access";
 import { getActivePracticumId } from "@/app/server/course/practicum-service";
 import { isStreamPrivate } from "./stream-visibility";
 import { assertPracticumViewer } from "./access";
+import { buildMasterPlaylist, HLS_MANIFEST_FILE, hlsRenditionPlaylistKey, isHlsRenditionName, parseHlsManifest, recordingHlsPrefix, signMediaPlaylist, type HlsManifest } from "./recording-hls";
+
+// HLS copies are written once and never change, so they're cached in memory. "Not ready yet" is
+// rechecked every minute; a signed playlist is reused for an hour (its URLs live 6 h, so a cached
+// copy always has ≥5 h left) — the same for every viewer, since signed URLs carry no identity.
+const HLS_MANIFEST_CACHE_MS = 10 * 60_000;
+const HLS_MISSING_CACHE_MS = 60_000;
+const HLS_SIGNED_PLAYLIST_CACHE_MS = 60 * 60_000;
+const hlsManifestCache = new Map<string, { manifest: HlsManifest | null; expiresAt: number }>();
+const hlsPlaylistCache = new Map<string, { text: string; expiresAt: number }>();
+
+async function loadHlsManifest(objectKey: string): Promise<HlsManifest | null> {
+  const cached = hlsManifestCache.get(objectKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.manifest;
+  const text = await readRecordingObjectText(`${recordingHlsPrefix(objectKey)}${HLS_MANIFEST_FILE}`);
+  const manifest = text ? parseHlsManifest(text) : null;
+  if (text && !manifest) console.error("Recording HLS manifest is invalid", objectKey);
+  hlsManifestCache.set(objectKey, { manifest, expiresAt: Date.now() + (manifest ? HLS_MANIFEST_CACHE_MS : HLS_MISSING_CACHE_MS) });
+  return manifest;
+}
 import {
   EgressStatus,
   IngressInput,
@@ -23,6 +43,7 @@ import {
   mintRecordingPlaybackUrl,
   mintViewerToken,
   newRecordingObjectKey,
+  readRecordingObjectText,
   recordingFileOutput,
   recordingImageOutput,
   recordingThumbnailObjectKey,
@@ -167,6 +188,34 @@ export class StreamService {
   public async getRecordingPlaybackUrl(actorId: string, mediaAssetId: string): Promise<string> {
     const objectKey = await this.resolveOwnRecordingKey(actorId, mediaAssetId);
     return mintRecordingPlaybackUrl(objectKey);
+  }
+
+  /**
+   * HLS master playlist for a recording (several qualities, small segments — see recording-hls.ts),
+   * or null while the transcoder hasn't produced it yet; the player then keeps using the MP4 from
+   * getRecordingPlaybackUrl. Same access rules as the MP4.
+   */
+  public async getRecordingHlsMaster(actorId: string, mediaAssetId: string): Promise<string | null> {
+    const objectKey = await this.resolveOwnRecordingKey(actorId, mediaAssetId);
+    const manifest = await loadHlsManifest(objectKey);
+    return manifest ? buildMasterPlaylist(manifest, (rendition) => `${rendition}.m3u8`) : null;
+  }
+
+  /** One quality's playlist with every segment signed for direct download, or null if that quality doesn't exist. */
+  public async getRecordingHlsPlaylist(actorId: string, mediaAssetId: string, rendition: string): Promise<string | null> {
+    if (!isHlsRenditionName(rendition)) return null;
+    const objectKey = await this.resolveOwnRecordingKey(actorId, mediaAssetId);
+    const manifest = await loadHlsManifest(objectKey);
+    if (!manifest?.renditions.some((item) => item.name === rendition)) return null;
+    const cacheKey = `${objectKey}:${rendition}`;
+    const cached = hlsPlaylistCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.text;
+    const prefix = recordingHlsPrefix(objectKey);
+    const stored = await readRecordingObjectText(hlsRenditionPlaylistKey(prefix, rendition));
+    if (!stored) return null;
+    const text = await signMediaPlaylist(stored, (file) => mintRecordingPlaybackUrl(`${prefix}${rendition}/${file}`));
+    hlsPlaylistCache.set(cacheKey, { text, expiresAt: Date.now() + HLS_SIGNED_PLAYLIST_CACHE_MS });
+    return text;
   }
 
   /** Same idea as getRecordingPlaybackUrl, for the representative frame captured alongside the video (see mediaThumbnailUrl in course-service.ts). */

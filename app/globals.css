@@ -8554,3 +8554,7 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
    (2026-10-08). Pin the column to the card width; long quotes get their ellipsis instead. */
 .module-video-stack { grid-template-columns: minmax(0, 1fr); }
 .module-video-item, .module-archived-chat { min-width: 0; max-width: 100%; }
+
+/* "720p авто" — the quality button of the recording player when HLS copies exist (see RecordedVideoSurface). */
+.recorded-video-controls button.recorded-video-quality { display: inline-flex; align-items: baseline; gap: 3px; }
+.recorded-video-quality small { font: 500 9px 'Manrope', sans-serif; opacity: .7; }

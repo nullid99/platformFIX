@@ -1,9 +1,10 @@
 import { randomUUID } from "crypto";
 import { AccessToken, EgressClient, IngressClient, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
 import { EgressStatus, EncodedFileOutput, EncodedFileType, EncodingOptions, ImageCodec, ImageFileSuffix, ImageOutput, IngressInput, IngressState_Status, IngressVideoEncodingOptions, IngressVideoOptions, S3Upload, TrackType, VideoLayer, VideoQuality } from "@livekit/protocol";
-import { DeleteObjectCommand, GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { AuthServiceError } from "@/app/server/auth";
+import { recordingHlsPrefix } from "./recording-hls";
 
 export { EgressStatus, IngressInput, IngressState_Status, TrackType };
 
@@ -177,4 +178,31 @@ export async function deleteRecordingObjects(objectKey: string): Promise<void> {
     client.send(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey })),
     client.send(new DeleteObjectCommand({ Bucket: bucket, Key: recordingThumbnailObjectKey(objectKey) })),
   ]);
+  await deleteRecordingHls(objectKey);
+}
+
+/** The transcoder's HLS copies of a recording (see recording-hls.ts) — removed together with the MP4. */
+async function deleteRecordingHls(objectKey: string): Promise<void> {
+  const { client, bucket } = recordingS3Client();
+  const prefix = recordingHlsPrefix(objectKey);
+  let continuationToken: string | undefined;
+  do {
+    const page = await client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: continuationToken }));
+    const keys = (page.Contents ?? []).flatMap((item) => (item.Key ? [{ Key: item.Key }] : []));
+    if (keys.length > 0) await client.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: keys, Quiet: true } }));
+    continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (continuationToken);
+}
+
+/** A small text object (HLS manifest/playlist) from the recordings bucket, or null when it isn't there (yet). */
+export async function readRecordingObjectText(key: string): Promise<string | null> {
+  const { client, bucket } = recordingS3Client();
+  try {
+    const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    return (await result.Body?.transformToString("utf-8")) ?? null;
+  } catch (error: unknown) {
+    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+    if (status === 404 || (error instanceof Error && error.name === "NoSuchKey")) return null;
+    throw error;
+  }
 }

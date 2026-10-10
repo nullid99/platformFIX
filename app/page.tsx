@@ -6,6 +6,7 @@ import Image from "next/image";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { io, type Socket } from "socket.io-client";
 import { Room, RoomEvent, Track, VideoQuality, type RemoteTrackPublication } from "livekit-client";
+import type Hls from "hls.js";
 import {
   AlertTriangle,
   ArrowUpRight,
@@ -461,6 +462,26 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return !["button", "checkbox", "radio", "submit", "reset", "file", "color", "image"].includes(type);
 }
 
+/** `…/recordings/<id>/play` (the MP4) → `…/recordings/<id>/hls/master.m3u8` (see streams.controller.ts), or null for any other video. */
+function recordingHlsMasterUrl(src: string): string | null {
+  const match = /^(.*\/api\/streams\/recordings\/[^/?#]+)\/play$/.exec(src);
+  return match ? `${match[1]}/hls/master.m3u8` : null;
+}
+
+/** Safari on Mac, iPhone and iPad (every iOS browser is Safari inside): Apple's own HLS player works best there with PiP, AirPlay and the lock screen. */
+function prefersNativeHls(): boolean {
+  const userAgent = navigator.userAgent;
+  if (/iPhone|iPad|iPod/.test(userAgent) || (/Macintosh/.test(userAgent) && navigator.maxTouchPoints > 1)) return true;
+  return /Safari\//.test(userAgent) && !/Chrome|Chromium|Edg\/|OPR\/|Firefox|Android/.test(userAgent);
+}
+
+/**
+ * How a recording is played: "probing" while asking the API whether HLS copies exist,
+ * "hls" through hls.js, "hls-native" through Safari's own player, "mp4" — the original single
+ * file, exactly as before HLS (also the fallback whenever anything about HLS goes wrong).
+ */
+type RecordingPlaybackMode = "probing" | "mp4" | "hls" | "hls-native";
+
 /** Which recording player currently drives the phone's lock screen / Control Center controls. */
 let mediaSessionOwner: symbol | null = null;
 
@@ -546,6 +567,86 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
   const [playbackRate, setPlaybackRate] = useState(() => (typeof window === "undefined" ? 1 : readSavedPlaybackRate()));
   const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef);
   const pictureInPicture = usePictureInPicture(videoRef, () => { if (fullscreen) toggleFullscreen(); });
+
+  // HLS (small segments in several qualities, like Vimeo — 2026-10-10: one long MP4 request kept
+  // getting cut for some students and the video stalled every few seconds). Ask the API whether
+  // the transcoder has made the copies; until it has, or if HLS fails, play the MP4 as before.
+  const hlsMasterUrl = recordingHlsMasterUrl(src);
+  const [mode, setMode] = useState<RecordingPlaybackMode>(() => (recordingHlsMasterUrl(src) ? "probing" : "mp4"));
+  const hlsRef = useRef<Hls | null>(null);
+  const [qualityLevels, setQualityLevels] = useState<number[]>([]);
+  const [quality, setQuality] = useState(-1);
+  const [autoHeight, setAutoHeight] = useState<number | null>(null);
+  const playWhenReadyRef = useRef(false);
+  useEffect(() => {
+    const masterUrl = recordingHlsMasterUrl(src);
+    const video = videoRef.current;
+    if (!masterUrl || !video) return;
+    let cancelled = false;
+    let hls: Hls | null = null;
+    const fallBackToMp4 = (reason: string) => {
+      console.error("Recording HLS playback failed, using the MP4", reason);
+      hls?.destroy();
+      hls = null;
+      hlsRef.current = null;
+      if (!cancelled) setMode("mp4");
+    };
+    void (async () => {
+      try {
+        const response = await fetch(masterUrl, { credentials: "include", cache: "no-store" });
+        if (cancelled) return;
+        if (!response.ok) { setMode("mp4"); return; }
+        const nativeHls = video.canPlayType("application/vnd.apple.mpegurl") !== "";
+        if (nativeHls && prefersNativeHls()) { setMode("hls-native"); return; }
+        const { default: HlsPlayer } = await import("hls.js");
+        if (cancelled) return;
+        if (!HlsPlayer.isSupported()) { setMode(nativeHls ? "hls-native" : "mp4"); return; }
+        const saved = readSavedPosition(src);
+        const player = new HlsPlayer({ capLevelToPlayerSize: true, startLevel: -1, startPosition: saved > 30 ? saved : -1, maxBufferLength: 30, backBufferLength: 60 });
+        hls = player;
+        hlsRef.current = player;
+        let networkRetries = 0;
+        let mediaRecovered = false;
+        player.on(HlsPlayer.Events.MANIFEST_PARSED, (_event, data) => setQualityLevels(data.levels.map((level) => level.height)));
+        player.on(HlsPlayer.Events.LEVEL_SWITCHED, (_event, data) => setAutoHeight(player.levels[data.level]?.height ?? null));
+        player.on(HlsPlayer.Events.FRAG_LOADED, () => { networkRetries = 0; });
+        player.on(HlsPlayer.Events.ERROR, (_event, data) => {
+          if (!data.fatal) return;
+          // A dropped connection or an expired segment link: retry a few times before giving up.
+          if (data.type === HlsPlayer.ErrorTypes.NETWORK_ERROR && networkRetries < 3) { networkRetries += 1; player.startLoad(); return; }
+          if (data.type === HlsPlayer.ErrorTypes.MEDIA_ERROR && !mediaRecovered) { mediaRecovered = true; player.recoverMediaError(); return; }
+          fallBackToMp4(data.details);
+        });
+        player.loadSource(masterUrl);
+        player.attachMedia(video);
+        setMode("hls");
+      } catch (error: unknown) {
+        fallBackToMp4(error instanceof Error ? error.message : "HLS check failed");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      hls?.destroy();
+      hlsRef.current = null;
+    };
+  }, [src]);
+  // A play pressed during the split second of "probing" starts once the source is decided.
+  useEffect(() => {
+    if (mode === "probing" || !playWhenReadyRef.current) return;
+    playWhenReadyRef.current = false;
+    void videoRef.current?.play().catch(() => undefined);
+  }, [mode]);
+  const qualityOrder = [-1, ...qualityLevels.map((height, index) => ({ height, index })).sort((left, right) => right.height - left.height).map((level) => level.index)];
+  const cycleQuality = () => {
+    const hls = hlsRef.current;
+    if (!hls) return;
+    const next = qualityOrder[(qualityOrder.indexOf(quality) + 1) % qualityOrder.length];
+    hls.currentLevel = next;
+    setQuality(next);
+  };
+  const shownHeight = quality === -1 ? autoHeight : qualityLevels[quality];
+  const videoSrc = mode === "mp4" ? src : mode === "hls-native" ? hlsMasterUrl ?? undefined : undefined;
+
   const applyPlaybackRate = (rate: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -560,7 +661,13 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     try { window.localStorage.setItem(PLAYBACK_RATE_KEY, String(next)); } catch { /* private mode — speed just isn't remembered */ }
   };
 
-  const togglePlay = () => { const video = videoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause(); };
+  const togglePlay = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (mode === "probing") { playWhenReadyRef.current = true; return; }
+    if (video.paused) void video.play().catch(() => undefined);
+    else video.pause();
+  };
   // A click is play/pause in fullscreen too, like YouTube — it used to exit fullscreen, which
   // students kept doing by accident when they only wanted to pause (2026-10-06). Double-click
   // toggles fullscreen; the control-bar button and Escape still exit.
@@ -597,7 +704,8 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     pendingSeekRef.current = fraction;
     setSeekPending(true);
     video.preload = "auto";
-    if (video.readyState === 0) video.load();
+    // hls.js is already loading on its own — reloading the element would detach it.
+    if (video.readyState === 0 && mode === "mp4") video.load();
   };
   const handleLoadedMetadata = (video: HTMLVideoElement) => {
     setDuration(video.duration);
@@ -665,8 +773,9 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     {keyHint && <div className="recorded-video-key-hint" key={keyHint.at}>{keyHint.text}</div>}
     <video
       ref={videoRef}
-      src={src}
+      src={videoSrc}
       playsInline
+      onError={() => { if (mode === "hls-native") setMode("mp4"); }}
       onClick={handleVideoClick}
       onDoubleClick={toggleFullscreen}
       onPlay={() => { setPlaying(true); claimKeyboard(); }}
@@ -680,6 +789,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       <button type="button" onClick={togglePlay} aria-label={playing ? "Пауза" : "Воспроизвести"}>{playing ? <Pause size={16} /> : <Play size={16} />}</button>
       <span className="recorded-video-time">{seekPending ? "Загрузка…" : `${formatVideoTime(currentTime)} / ${formatVideoTime(duration)}`}</span>
       <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
+      {mode === "hls" && qualityLevels.length > 1 && <button type="button" className="recorded-video-speed recorded-video-quality" onClick={cycleQuality} aria-label={`Качество: ${quality === -1 ? "автоматически" : `${shownHeight}p`}. Нажмите, чтобы изменить`} title={quality === -1 ? `Качество выбирается автоматически под скорость интернета${autoHeight ? ` — сейчас ${autoHeight}p` : ""}. Нажмите, чтобы выбрать вручную` : "Качество выбрано вручную. Нажимайте, чтобы вернуть «Авто»"}>{shownHeight ? `${shownHeight}p` : "Авто"}{quality === -1 && shownHeight ? <small>авто</small> : null}</button>}
       <button type="button" className="recorded-video-speed" onClick={cyclePlaybackRate} aria-label={`Скорость воспроизведения: ${playbackRate}x. Нажмите, чтобы изменить`} title="Скорость воспроизведения">{String(playbackRate).replace(".", ",")}x</button>
       <div className="video-volume-group"><button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button><VolumeSlider volume={volume} muted={muted} onChange={changeVolume} /></div>
       {pictureInPicture.supported && <button type="button" onClick={pictureInPicture.toggle} aria-label={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке"} title={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке — смотреть в маленьком окне поверх других программ"}><PictureInPicture2 size={16} /></button>}
@@ -728,7 +838,7 @@ const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src?:
       {livekit
         ? <LiveKitVideoSurface key={livekit.roomName} token={livekit.token} roomName={livekit.roomName} fullscreenRef={wrapperRef} />
         : src?.startsWith("/api/streams/recordings/")
-          ? <RecordedVideoSurface src={src} title={title} fullscreenRef={wrapperRef} />
+          ? <RecordedVideoSurface key={src} src={src} title={title} fullscreenRef={wrapperRef} />
           : <iframe src={src} title={title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}
       {viewerLabel && <div className="tracked-video-watermark" aria-hidden="true"><span>{viewerLabel}</span><span>{clock}</span></div>}
     </div>;
