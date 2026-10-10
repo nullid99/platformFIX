@@ -54,8 +54,11 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
 }
 
+/** The AWS SDK reports a missing object on HEAD as just "UnknownError" — keep the name and HTTP status too. */
 function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (!(error instanceof Error)) return String(error);
+  const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+  return [error.name !== "Error" ? error.name : null, status ? `HTTP ${status}` : null, error.message].filter(Boolean).join(": ");
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
