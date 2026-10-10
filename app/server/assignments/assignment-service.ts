@@ -1008,6 +1008,8 @@ export class AssignmentService {
       status,
       tone: toneFromStatus(status),
       submittedAt: submission.submittedAt ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(submission.submittedAt) : "Без даты",
+      // The server formats in UTC; the browser re-renders this in the curator's own time zone.
+      submittedAtIso: submission.submittedAt?.toISOString() ?? null,
       attempt: `Попытка ${submission.attempt}`,
       studentNote: attachmentNames.map((name) => `Прикреплён файл: ${name}`).join(" · ") || "Ответ отправлен без файла.",
       answer: submission.answerText ?? "Ответ отправлен вложением.",
@@ -1017,6 +1019,7 @@ export class AssignmentService {
         attempt: attempt.attempt,
         status: assignmentStatusFromSubmission(attempt.status),
         submittedAt: attempt.submittedAt ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(attempt.submittedAt) : "Без даты",
+        submittedAtIso: attempt.submittedAt?.toISOString() ?? null,
         answerText: attempt.answerText,
         files: attempt.fileAttachments.map((item) => ({ id: item.file.id, name: item.file.originalName, type: item.file.mimeType, size: item.file.byteSize, url: `/api/files/${item.file.id}/content` })),
         feedback: mapFeedback(attempt.feedback),

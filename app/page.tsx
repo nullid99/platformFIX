@@ -1976,11 +1976,27 @@ function CuratorSectionView({ activeNav, requestedStudentId, isOwner, workingPra
     {activeNav === "Кабинет куратора" && <CuratorDashboardOverview onNavigate={onNavigate} isOwner={isOwner} onViewPracticum={viewPracticum} workingPracticumId={workingPracticumId} onWorkingPracticumChange={onWorkingPracticumChange} />} {activeNav === "Очередь проверки" && <CuratorReviewWorkspace onNavigate={onNavigate} />} {activeNav === "Создать задание" && <CreateAssignmentView onNavigate={onNavigate} />} {activeNav === "Ученики" && <CuratorStudentsView requestedStudentId={requestedStudentId} onInvite={() => onNavigate("Приглашения")} isOwner={isOwner} />} {activeNav === "Прогресс" && <CuratorProgressView onNavigate={onNavigate} />} {activeNav === "Программа" && <CuratorModuleAccessView onNavigate={onNavigate} viewingPracticumId={viewingPracticum?.id ?? null} />} {activeNav === "Приглашения" && <CuratorInvitationsView workingPracticumId={workingPracticumId} />} {activeNav === "Расписание" && <CuratorScheduleView onNavigate={onNavigate} viewingPracticumId={viewingPracticum?.id ?? null} />} {activeNav === "Стримы" && <CuratorStreamsView onNavigate={onNavigate} />} {activeNav === "Медиатека" && <CuratorMediaLibraryView viewingPracticumId={viewingPracticum?.id ?? null} />} {activeNav === "Обсуждения" && <CuratorDiscussionsView />} {activeNav === "Команда" && <CuratorTeamView isOwner={isOwner} />} {activeNav !== "Кабинет куратора" && activeNav !== "Очередь проверки" && activeNav !== "Создать задание" && activeNav !== "Расписание" && activeNav !== "Стримы" && activeNav !== "Ученики" && activeNav !== "Прогресс" && activeNav !== "Программа" && activeNav !== "Приглашения" && activeNav !== "Медиатека" && activeNav !== "Обсуждения" && activeNav !== "Команда" && <CuratorPlaceholder title={heading.title} />}</div>;
 }
 
+/**
+ * An exact time as "10.10.2026, 11:18" in the viewer's own time zone (Профиль or browser; Kyiv
+ * when unset). The review queue used to show the server's UTC text — 08:18 for 11:18 in Kyiv
+ * (2026-10-10). Falls back to the server's text when there's no exact time.
+ */
+function formatInViewerZone(iso: string | null | undefined, fallback: string): string {
+  if (!iso) return fallback;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return fallback;
+  return new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short", timeZone: viewerTimeZone ?? EVENT_TIMEZONE }).format(date);
+}
+
 async function fetchReviewQueue(): Promise<ReviewQueueItem[]> {
   const response = await fetch(`${API_ORIGIN}/api/review/submissions`, { credentials: "include", cache: "no-store" });
   if (!response.ok) return [];
   const payload = await response.json() as { data?: ReviewQueueItem[] };
-  return payload.data ?? [];
+  return (payload.data ?? []).map((item) => ({
+    ...item,
+    submittedAt: formatInViewerZone(item.submittedAtIso, item.submittedAt),
+    attemptHistory: item.attemptHistory?.map((attempt) => ({ ...attempt, submittedAt: formatInViewerZone(attempt.submittedAtIso, attempt.submittedAt) })),
+  }));
 }
 
 type CuratorDiscussionStatus = "NEW" | "WAITING" | "ANSWERED" | "CLOSED";

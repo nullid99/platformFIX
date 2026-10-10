@@ -14,6 +14,8 @@ export type ReviewQueueItem = {
   status: AssignmentStatus;
   tone: AssignmentTone;
   submittedAt: string;
+  /** Exact time for re-rendering submittedAt in the viewer's time zone (the server's text is UTC). */
+  submittedAtIso?: string | null;
   attempt: string;
   studentNote: string;
   answer: string;
@@ -26,6 +28,7 @@ export type ReviewQueueItem = {
     attempt: number;
     status: AssignmentStatus;
     submittedAt: string;
+    submittedAtIso?: string | null;
     answerText: string | null;
     files: readonly { id: string; name: string; type: string; size: number; url: string }[];
     feedback: readonly AssignmentFeedback[];
