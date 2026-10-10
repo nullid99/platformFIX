@@ -602,7 +602,10 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
         if (cancelled) return;
         if (!HlsPlayer.isSupported()) { setMode(nativeHls ? "hls-native" : "mp4"); return; }
         const saved = readSavedPosition(src);
-        const player = new HlsPlayer({ capLevelToPlayerSize: true, startLevel: -1, startPosition: saved > 30 ? saved : -1, maxBufferLength: 30, backBufferLength: 60 });
+        // hls.js otherwise fills up to 60 MB ahead — for these light recordings that was ~9 minutes
+        // of 720p after 20 s of watching: wasted on a phone and gone on the first seek. A minute
+        // ahead rides out any short drop.
+        const player = new HlsPlayer({ capLevelToPlayerSize: true, startLevel: -1, startPosition: saved > 30 ? saved : -1, maxBufferLength: 30, maxMaxBufferLength: 60, backBufferLength: 60 });
         hls = player;
         hlsRef.current = player;
         let networkRetries = 0;
