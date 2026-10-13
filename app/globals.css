@@ -279,7 +279,8 @@ button { color: inherit; font: inherit; border: 0; cursor: pointer; }
 .stat-value.amber { color: #f4c46f !important; background: #362a1b; }
 .stat-value.blue { color: #b4d2ff !important; background: #192d4a; }
 .curator-stats .stat-card { min-height: 116px; display: grid; align-content: center; justify-items: center; gap: 8px; padding: 16px 14px; text-align: center; background: #10151b; }
-.curator-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.curator-stats { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+@media (max-width: 1200px) { .curator-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 900px) { .curator-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .curator-stats .stat-icon { width: 32px; height: 32px; }
 .curator-stats .stat-copy { justify-items: center; gap: 5px; }

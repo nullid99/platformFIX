@@ -2505,7 +2505,11 @@ function CuratorDashboardOverview({ onNavigate, isOwner, onViewPracticum, workin
   // number told nobody which of them was actually doing the reviewing.
   const reviewCount = localQueue.filter((item) => item.status === "На проверке").length;
   const revisionCount = localQueue.filter((item) => item.status === "Нужна доработка").length;
-  const reviewedByMeCount = localQueue.filter((item) => item.status === "Принято" && item.reviewedByMe).length;
+  // Split by the student, not the lesson (2026-10-13): a work from an Advanced student counts as
+  // Advanced, any other as Practice — curators asked to see the two kinds of checks separately.
+  const reviewedByMe = localQueue.filter((item) => item.status === "Принято" && item.reviewedByMe);
+  const reviewedAdvancedCount = reviewedByMe.filter((item) => item.studentIsAdvanced).length;
+  const reviewedPracticeCount = reviewedByMe.length - reviewedAdvancedCount;
   const recentQueue = localQueue.slice(0, 3);
   const pendingDiscussions = discussions.filter((thread) => thread.status === "NEW" || thread.status === "WAITING").slice(0, 3);
   const nextEvents = upcomingEvents.slice(0, 3);
@@ -2514,7 +2518,8 @@ function CuratorDashboardOverview({ onNavigate, isOwner, onViewPracticum, workin
     <div className="stats-grid curator-stats">
       <StatCard icon={<FileCheck2 size={17} />} label="Работы на проверке" value={String(reviewCount)} detail="Ждут решения куратора" accent="blue" onClick={() => onNavigate("Очередь проверки")} />
       <StatCard icon={<RotateCcw size={17} />} label="Нужна доработка" value={String(revisionCount)} detail="Ждут ответа ученика" accent="amber" onClick={() => onNavigate("Очередь проверки")} />
-      <StatCard icon={<CheckCircle2 size={17} />} label="Проверено вами" value={String(reviewedByMeCount)} detail="Принято лично вами" accent="cyan" onClick={() => onNavigate("Очередь проверки")} />
+      <StatCard icon={<CheckCircle2 size={17} />} label="Проверено вами · Practice" value={String(reviewedPracticeCount)} detail="Принято вами у учеников Practice" accent="cyan" onClick={() => onNavigate("Очередь проверки")} />
+      <StatCard icon={<CheckCircle2 size={17} />} label="Проверено вами · Advanced" value={String(reviewedAdvancedCount)} detail="Принято вами у учеников Advanced" accent="amber" onClick={() => onNavigate("Очередь проверки")} />
       <StatCard icon={<GraduationCap size={17} />} label="Ученики в потоке" value={studentCount === null ? "—" : String(studentCount)} detail="Активные участники" accent="blue" onClick={() => onNavigate("Ученики")} />
     </div>
     <div className="curator-dashboard-widgets">
