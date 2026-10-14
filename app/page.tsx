@@ -500,6 +500,8 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     const id = playerId.current;
     const updatePosition = () => {
       if (mediaSessionOwner !== id || !Number.isFinite(video.duration) || video.duration <= 0) return;
+      // Without it Chrome's picture-in-picture window keeps advancing the clock on pause (2026-10-14).
+      session.playbackState = video.paused ? "paused" : "playing";
       try {
         session.setPositionState({ duration: video.duration, playbackRate: video.playbackRate || 1, position: Math.min(video.currentTime, video.duration) });
       } catch { /* older Safari: no position state, the controls still work without it */ }
@@ -519,7 +521,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       }
       updatePosition();
     };
-    const positionEvents = ["loadedmetadata", "seeked", "ratechange", "pause", "play"];
+    const positionEvents = ["loadedmetadata", "seeked", "ratechange", "pause", "play", "playing", "ended"];
     video.addEventListener("play", claim);
     for (const name of positionEvents) video.addEventListener(name, updatePosition);
     return () => {
@@ -528,6 +530,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       if (mediaSessionOwner !== id) return;
       mediaSessionOwner = null;
       session.metadata = null;
+      session.playbackState = "none";
       for (const action of ["play", "pause", "seekbackward", "seekforward", "seekto"] as MediaSessionAction[]) {
         try { session.setActionHandler(action, null); } catch { /* not supported — nothing to clear */ }
       }
