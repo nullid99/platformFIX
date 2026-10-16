@@ -75,8 +75,9 @@ ssh -i ~/.ssh/$KEY $HOST "cd $REMOTE_DIR && docker compose --env-file .env.stagi
 
 1. Загрузить инструменты одним вызовом ToolSearch:
    `select:mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__computer,mcp__claude-in-chrome__read_page,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__tabs_close_mcp,mcp__claude-in-chrome__javascript_tool`
-2. Заходить именно на `https://<TLS-домен из deploy-access.local.md>:8443`, **не** на
-   голый IP:8082 — см. "Вход как тестовый пользователь" ниже, почему это важно.
+2. Заходить на `https://fix-trading.info`. Порты `:8082` и `:8443` с 2026-10-16 слушают
+   только `127.0.0.1` (правило общего хоста: наружу только 80/443 через Caddy) — снаружи их
+   больше нет, с сервера они доступны как раньше.
 3. Для точечной проверки (например, "точно ли элемент по центру", "точно ли API
    отдаёт нужный порядок") использовать `javascript_tool` и читать
    `getBoundingClientRect()`/сам ответ API напрямую, а не только визуально

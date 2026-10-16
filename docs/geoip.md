@@ -11,7 +11,8 @@
 Старые записи с `::1` не переписываются. Для проверки нужно создать новый вход через публичный адрес Hetzner.
 ## Staging proxy
 
-On Hetzner, port `8082` is exposed only by the project's Nginx container. The
+On Hetzner, port `8082` (localhost only since 2026-10-16; the public site goes through the
+shared Caddy straight to api/web) belongs only to the project's Nginx container. The
 proxy overwrites `X-Forwarded-For` with its actual peer address before sending
 the request to the API; the API trusts exactly one proxy hop. This prevents a
 client from spoofing the recorded IP while preserving the public address for

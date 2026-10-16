@@ -5,7 +5,8 @@
 Для этого проекта подготовлен отдельный `docker-compose.staging.yml`. Он не изменяет
 локальный `docker-compose.yml` и использует свои контейнеры, сеть и тома:
 
-- `fix-platform-staging-web` — Next.js, единственный внешний порт `8082`;
+- `fix-platform-staging-web` — Next.js; публичный сайт идёт через общий Caddy на 80/443,
+  порты Nginx `8082`/`8443` с 2026-10-16 слушают только `127.0.0.1`;
 - `fix-platform-staging-api` — NestJS API, доступен только внутри сети Compose;
 - `fix-platform-staging-db` — отдельная PostgreSQL 16;
 - `fix-platform-staging-db` и `fix-platform-staging-storage` — отдельные Docker volumes.
@@ -66,7 +67,7 @@ npx prisma migrate status
 5. Обновить callback URL Discord.
 6. Создать резервное копирование базы и проверить восстановление.
 7. Создать тестовые приглашения для участников команды.
-The public `8082` mapping belongs to the isolated Nginx proxy, not the web
+The `8082` mapping (localhost only since 2026-10-16) belongs to the isolated Nginx proxy, not the web
 container. Keep the API and web containers unexposed on the Compose network.
 After deploying the proxy, create a fresh test login from an external network
 and inspect the student's security details: it should contain the public IP

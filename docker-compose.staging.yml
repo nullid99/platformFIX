@@ -53,8 +53,9 @@ services:
       - api
     networks: [staging]
 
-  # The only public entry point. It strips client-supplied forwarded headers
-  # and adds the real peer address before forwarding requests to the API.
+  # Strips client-supplied forwarded headers and adds the real peer address before
+  # forwarding requests to the API. Localhost only since 2026-10-16: the public site goes
+  # through the shared Caddy on 80/443 (the host's rule), this stays for checks over SSH.
   proxy:
     image: nginx:1.27-alpine
     container_name: fix-platform-staging-proxy
@@ -63,7 +64,7 @@ services:
       - api
       - web
     ports:
-      - "8082:80"
+      - "127.0.0.1:8082:80"
     volumes:
       - ./infra/nginx/staging.conf:/etc/nginx/nginx.conf:ro
     networks: [staging]
@@ -71,7 +72,8 @@ services:
   # Isolated HTTPS entry point for the public staging domain (Secure cookies and the
   # LiveKit webhook both need HTTPS). Kept separate from `proxy` (talks directly to
   # api/web) to avoid a double proxy hop and to avoid touching the plain-HTTP :8082
-  # path anything else may already rely on.
+  # path anything else may already rely on. Localhost only since 2026-10-16, like :8082
+  # (LiveKit's webhook now uses https://fix-trading.info only).
   tls-proxy:
     image: nginx:1.27-alpine
     container_name: fix-platform-staging-tls
@@ -80,7 +82,7 @@ services:
       - api
       - web
     ports:
-      - "8443:443"
+      - "127.0.0.1:8443:443"
     volumes:
       - ./infra/nginx/staging-tls.conf:/etc/nginx/nginx.conf:ro
       - /opt/fix-staging-cert/staging.fix-trading.info_ecc:/certs:ro
