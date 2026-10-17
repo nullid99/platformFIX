@@ -167,7 +167,9 @@ export class DiscussionService {
   // asker closing a settled thread shouldn't pull it out of the shared feed), but
   // WAITING doesn't — that means the student replied again and the conversation is
   // back in flux — and the `messages.some` guard keeps out threads a student closed
-  // before a curator ever actually answered.
+  // before a curator ever actually answered. Only threads the student agreed to share (COHORT —
+  // the "Можно показать другим ученикам анонимно" box) — it used to ignore visibility, so a
+  // student had no way to keep a personal question out of it (security review STG-1, 2026-10-17).
   public async listCohortForStudent(studentId: string) {
     await this.assertActiveUser(studentId, UserRole.STUDENT);
     const enrollment = await prisma.enrollment.findFirst({ where: { studentId, status: "ACTIVE" }, select: { practicumId: true } });
@@ -175,6 +177,7 @@ export class DiscussionService {
     const threads = await prisma.discussionThread.findMany({
       where: {
         status: { in: [DiscussionStatus.ANSWERED, DiscussionStatus.CLOSED] },
+        visibility: DiscussionVisibility.COHORT,
         studentId: { not: studentId },
         module: { practicumId: enrollment.practicumId },
         messages: { some: { author: { role: { in: [UserRole.CURATOR, UserRole.OWNER] } } } },

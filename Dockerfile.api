@@ -16,5 +16,10 @@ ENV NODE_ENV=production
 ENV API_PORT=4000
 EXPOSE 4000
 
+# Not root (security review STG-7, 2026-10-17). The uploads volume is mounted over
+# .storage/private, so an existing volume has to be chowned to 1000:1000 once (docs/deploy.md).
+RUN mkdir -p /app/.storage/private && chown -R node:node /app/.storage
+USER node
+
 # Migrations are idempotent. They run only against this compose project's database.
 CMD ["sh", "-c", "npx prisma migrate deploy && npx tsx api/src/main.ts"]

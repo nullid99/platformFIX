@@ -6,6 +6,7 @@ import { raw } from "express";
 import { NestFactory } from "@nestjs/core";
 import { IoAdapter } from "@nestjs/platform-socket.io";
 import { AppModule } from "./app.module";
+import { apiRateLimit } from "./common/rate-limit.middleware";
 
 function getTrustProxySetting(): boolean | number {
   const configuredHops = process.env.TRUST_PROXY_HOPS?.trim();
@@ -21,6 +22,8 @@ async function bootstrap(): Promise<void> {
   app.getHttpAdapter().getInstance().set("trust proxy", getTrustProxySetting());
   app.use(helmet());
   app.use(cookieParser());
+  // After cookieParser (counts per signed-in person) and trust proxy (request.ip is the client).
+  app.use(apiRateLimit);
   // LiveKit sends webhooks as Content-Type: application/webhook+json, which Nest's own
   // application/json parser never touches. WebhookReceiver needs the exact raw bytes to check
   // the JWT's payload hash, so this route gets its own raw-body parser ahead of Nest's routing.

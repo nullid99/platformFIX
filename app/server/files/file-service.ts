@@ -266,6 +266,28 @@ export class FileService {
     await rm(storagePath(file.storageKey), { force: true });
   }
 
+  /**
+   * Uploads that never finished (PENDING — the browser never sent the bytes, or FAILED) after
+   * `maxAgeMs`: row first, then whatever partial bytes exist. Neither status can be attached to
+   * anything; the relation count is a belt-and-braces check (security review STG-5, 2026-10-17).
+   */
+  public async cleanupStaleUploads(maxAgeMs: number, now = new Date()): Promise<number> {
+    const stale = await prisma.storedFile.findMany({
+      where: { status: { in: [StoredFileStatus.PENDING, StoredFileStatus.FAILED] }, createdAt: { lt: new Date(now.getTime() - maxAgeMs) } },
+      select: { id: true, storageKey: true, _count: { select: { submissions: true, assignmentMaterials: true, discussionAttachments: true, feedbackAttachments: true, streamMessages: true } } },
+      take: 500,
+    });
+    let removed = 0;
+    for (const file of stale) {
+      if (Object.values(file._count).some((count) => count > 0)) continue;
+      const deleted = await prisma.storedFile.deleteMany({ where: { id: file.id, status: { in: [StoredFileStatus.PENDING, StoredFileStatus.FAILED] } } });
+      if (deleted.count === 0) continue;
+      await rm(storagePath(file.storageKey), { force: true });
+      removed += 1;
+    }
+    return removed;
+  }
+
   /** Remove a module cover after the owning module has been deleted. */
   public async cleanupModuleCover(fileId: string, moduleId: string): Promise<void> {
     const file = await prisma.storedFile.findUnique({ where: { id: fileId }, select: { storageKey: true } });

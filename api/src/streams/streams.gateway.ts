@@ -2,6 +2,10 @@ import { ConnectedSocket, MessageBody, OnGatewayConnection, SubscribeMessage, We
 import type { Server, Socket } from "socket.io";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { streamChatService } from "@/app/server/streams";
+import { CHAT_SEND_LIMIT, FixedWindowLimiter } from "@/app/server/rate-limit";
+
+// Stream chat flood guard (security review STG-5) — one counter per person across their tabs.
+const chatSendLimiter = new FixedWindowLimiter();
 
 function parseCookies(header: string | undefined): Record<string, string> {
   const result: Record<string, string> = {};
@@ -70,6 +74,10 @@ export class StreamsGateway implements OnGatewayConnection {
   public async handleSend(@ConnectedSocket() client: Socket, @MessageBody() payload: { body?: unknown; fileId?: unknown; replyToId?: unknown }): Promise<void> {
     const userId = client.data.userId as string | undefined;
     if (!userId) return;
+    if (!chatSendLimiter.hit(userId, CHAT_SEND_LIMIT.limit, CHAT_SEND_LIMIT.windowMs)) {
+      client.emit("chat:error", "Слишком много сообщений подряд — подождите немного.");
+      return;
+    }
     const body = typeof payload?.body === "string" ? payload.body : "";
     const fileId = typeof payload?.fileId === "string" ? payload.fileId : undefined;
     const replyToId = typeof payload?.replyToId === "string" ? payload.replyToId : undefined;

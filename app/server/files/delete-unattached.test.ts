@@ -14,7 +14,7 @@ import { fileService } from "./file-service";
  * checked ДЗ attachments, so a file already attached elsewhere was wiped from disk and left as a
  * broken attachment. It must now be refused with the bytes intact.
  */
-describe("fileService#deleteUnattached (STG-4)", () => {
+describe("fileService file removal (STG-4, STG-5)", () => {
   const suffix = randomUUID().slice(0, 8);
   const savedRoot = process.env.FILE_STORAGE_ROOT;
   let root: string;
@@ -54,6 +54,18 @@ describe("fileService#deleteUnattached (STG-4)", () => {
     await expect(fileService.deleteUnattached(studentId, attachedFileId)).rejects.toMatchObject({ code: "FORBIDDEN" });
     expect(await prisma.storedFile.findUnique({ where: { id: attachedFileId } })).not.toBeNull();
     await expect(stat(join(root, "vitest", suffix, "attached.png"))).resolves.toBeTruthy();
+  });
+
+  it("cleans up only uploads that never finished and are old enough (STG-5)", async () => {
+    const stale = await createFile("stale.png");
+    const fresh = await createFile("fresh.png");
+    await prisma.storedFile.update({ where: { id: stale.id }, data: { status: "PENDING", createdAt: new Date(Date.now() - 2 * 86_400_000) } });
+    await prisma.storedFile.update({ where: { id: fresh.id }, data: { status: "PENDING" } });
+    await fileService.cleanupStaleUploads(86_400_000);
+    expect(await prisma.storedFile.findUnique({ where: { id: stale.id } })).toBeNull();
+    await expect(stat(stale.path)).rejects.toThrow();
+    expect(await prisma.storedFile.findUnique({ where: { id: fresh.id } })).not.toBeNull();
+    expect(await prisma.storedFile.findUnique({ where: { id: attachedFileId } })).not.toBeNull();
   });
 
   it("deletes a file nothing points at, row and bytes", async () => {

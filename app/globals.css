@@ -8567,3 +8567,11 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 .recording-hls-badge.failed { color: #ff8a8a; border-color: rgba(255, 138, 138, .4); background: rgba(255, 138, 138, .07); }
 .recording-hls-note { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
 .recording-hls-note .recording-hls-badge { margin-top: 0; }
+
+/* "Можно показать другим ученикам анонимно" in the question form + the matching note in a thread. */
+.discussion-share-toggle { display: flex; align-items: flex-start; gap: 10px; margin-top: 4px; cursor: pointer; }
+.discussion-share-toggle input { margin-top: 3px; accent-color: #4da3ff; flex: none; }
+.discussion-share-toggle span { display: grid; gap: 2px; }
+.discussion-share-toggle strong { font-size: 13px; font-weight: 600; }
+.discussion-share-toggle small { color: rgba(255, 255, 255, .55); font-size: 12px; line-height: 1.4; }
+.discussion-share-note { margin-top: 4px; color: rgba(255, 255, 255, .5); font-size: 12px; }

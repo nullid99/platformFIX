@@ -5,6 +5,7 @@ import { SecurityController, TeamSecurityController } from "./security/security.
 import { AssignmentsController, ReviewController } from "./assignments/assignments.controller";
 import { CourseController } from "./course/course.controller";
 import { FilesController } from "./files/files.controller";
+import { StaleUploadCleaner } from "./files/stale-upload-cleaner";
 import { DiscussionsController } from "./discussions/discussions.controller";
 import { ScheduleController } from "./schedule/schedule.controller";
 import { ScheduleReminderNotifier } from "./schedule/schedule-reminder-notifier";
@@ -15,6 +16,6 @@ import { NotificationsController } from "./notifications/notifications.controlle
 
 @Module({
   controllers: [AuthController, DiscordController, SecurityController, TeamSecurityController, AssignmentsController, ReviewController, CourseController, FilesController, DiscussionsController, ScheduleController, StreamsController, NotificationsController],
-  providers: [StreamsGateway, StreamLiveNotifier, ScheduleReminderNotifier],
+  providers: [StreamsGateway, StreamLiveNotifier, ScheduleReminderNotifier, StaleUploadCleaner],
 })
 export class AppModule {}

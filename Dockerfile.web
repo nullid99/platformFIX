@@ -23,4 +23,8 @@ ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
+# Not root (security review STG-7, 2026-10-17); next start writes its image cache under .next.
+RUN chown -R node:node /app/.next
+USER node
+
 CMD ["npm", "run", "start"]
