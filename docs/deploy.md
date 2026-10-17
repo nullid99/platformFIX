@@ -36,6 +36,7 @@ tar -czf /tmp/staging-deploy.tar.gz \
   --exclude='.claude' --exclude='.cursor' --exclude='.agents' \
   --exclude='test-results' --exclude='playwright-report' --exclude='e2e/.auth' \
   --exclude='*.tar.gz' --exclude='image*.png' --exclude='image*.jpg' --exclude='Untitled' \
+  --exclude='tg_image*' --exclude='docs/*.local.md' --exclude='ADVERSARIAL-REVIEW-*.md' \
   .
 
 # 2. Залить и распаковать на сервере (KEY и HOST — из deploy-access.local.md)

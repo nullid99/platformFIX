@@ -243,11 +243,27 @@ export class FileService {
     return { ...file, stream: createReadStream(path) };
   }
 
+  /**
+   * Only a file nothing points at, and the row goes before the bytes: this used to check only
+   * ДЗ attachments and `rm` first, so deleting a file attached to a discussion wiped it from disk
+   * and then failed on the FK — the curator was left with a broken attachment (security review
+   * STG-4, 2026-10-17).
+   */
   public async deleteUnattached(actorId: string, fileId: string): Promise<void> {
-    const file = await prisma.storedFile.findUnique({ where: { id: fileId }, include: { submissions: { select: { id: true } } } });
-    if (!file || file.ownerId !== actorId || file.submissions.length > 0) throw new AuthServiceError("FORBIDDEN", "File cannot be deleted");
+    const file = await prisma.storedFile.findUnique({
+      where: { id: fileId },
+      select: {
+        ownerId: true,
+        storageKey: true,
+        _count: { select: { submissions: true, assignmentMaterials: true, discussionAttachments: true, feedbackAttachments: true, streamMessages: true } },
+      },
+    });
+    const attached = file ? Object.values(file._count).some((count) => count > 0) : false;
+    if (!file || file.ownerId !== actorId || attached) throw new AuthServiceError("FORBIDDEN", "File cannot be deleted");
+    await prisma.storedFile.delete({ where: { id: fileId } }).catch(() => {
+      throw new AuthServiceError("FORBIDDEN", "File cannot be deleted");
+    });
     await rm(storagePath(file.storageKey), { force: true });
-    await prisma.storedFile.delete({ where: { id: fileId } });
   }
 
   /** Remove a module cover after the owning module has been deleted. */

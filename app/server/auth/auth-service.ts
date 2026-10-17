@@ -38,10 +38,13 @@ const SESSION_LIFETIME_DAYS = 30;
 const PENDING_SESSION_LIFETIME_MINUTES = 15;
 const MAX_DEVICES = 2;
 
-/** Local role switching is opt-in on production-like staging only. */
+/**
+ * Local role switching (dev-login) — local development and CI only, never a production build.
+ * There used to be a STAGING_DEV_AUTH_ENABLED override; "staging" turned out to be the live site
+ * (fix-trading.info), so anyone could log in as the test curator (security review STG-11, 2026-10-17).
+ */
 export function isLocalTestAuthEnabled(): boolean {
-  return process.env.DEV_AUTH_ENABLED === "true"
-    && (process.env.NODE_ENV !== "production" || process.env.STAGING_DEV_AUTH_ENABLED === "true");
+  return process.env.DEV_AUTH_ENABLED === "true" && process.env.NODE_ENV !== "production";
 }
 
 export type AuthErrorCode =
@@ -954,9 +957,8 @@ export class AuthService {
     if (!actor || actor.status !== UserStatus.ACTIVE || (actor.role !== UserRole.CURATOR && actor.role !== UserRole.OWNER)) {
       throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can edit students");
     }
-    const student = await prisma.user.update({ where: { id: studentId }, data: { isAdvanced }, select: { isAdvanced: true, role: true } }).catch(() => null);
-    if (!student) throw new AuthServiceError("INVALID_INPUT", "Student does not exist");
-    if (student.role !== UserRole.STUDENT) throw new AuthServiceError("INVALID_INPUT", "User is not a student");
+    await this.assertStudentTarget(studentId);
+    const student = await prisma.user.update({ where: { id: studentId }, data: { isAdvanced }, select: { isAdvanced: true } });
     return student.isAdvanced;
   }
 
@@ -966,9 +968,11 @@ export class AuthService {
       throw new AuthServiceError("FORBIDDEN", "Only an active owner or curator can edit students");
     }
     const normalized = rawEmail.trim() ? optionalEmail(rawEmail) : null;
+    // Check before the write — it used to update first and throw after, leaving e.g. the owner's
+    // email changed behind a 400 (security review STG-2/3, 2026-10-17).
+    await this.assertStudentTarget(studentId);
     try {
-      const student = await prisma.user.update({ where: { id: studentId }, data: { email: normalized }, select: { email: true, role: true } });
-      if (student.role !== UserRole.STUDENT) throw new AuthServiceError("INVALID_INPUT", "User is not a student");
+      const student = await prisma.user.update({ where: { id: studentId }, data: { email: normalized }, select: { email: true } });
       return student.email;
     } catch (error) {
       if (error instanceof AuthServiceError) throw error;
