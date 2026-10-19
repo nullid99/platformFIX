@@ -2123,13 +2123,7 @@ function DiscussionMessageAttachments({ message }: { message: CuratorDiscussionM
         : <div className="discussion-message-attachment" key={index}><FileCheck2 size={15} /><span>{attachment.originalName}</span></div>;
     })}
     {fallbackEmbedUrl && <div className="discussion-message-video"><iframe src={fallbackEmbedUrl} title="Видео в ответе куратора" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" /></div>}
-    {lightboxUrl && lightboxPortalTarget && createPortal(
-      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxUrl(null); }}>
-        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxUrl(null)}><X size={22} /></button>
-        <img className="chat-image-lightbox-image" src={lightboxUrl} alt="Просмотр изображения" />
-      </div>,
-      lightboxPortalTarget,
-    )}
+    {lightboxUrl && lightboxPortalTarget && <ImageLightbox src={lightboxUrl} alt="Просмотр изображения" target={lightboxPortalTarget} onClose={() => setLightboxUrl(null)} />}
   </>;
 }
 
@@ -2245,13 +2239,7 @@ function DiscussionAttachmentPreviewList({ attachments, onRemove }: { attachment
       {attachment.kind === "video" && <video src={attachment.previewUrl} controls playsInline preload="metadata" />}
       {attachment.kind === "file" && <div className="discussion-file-preview"><FileCheck2 size={18} /><span>{attachment.file.name}</span></div>}
     </div>)}</div>
-    {lightboxUrl && lightboxPortalTarget && createPortal(
-      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxUrl(null); }}>
-        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxUrl(null)}><X size={22} /></button>
-        <img className="chat-image-lightbox-image" src={lightboxUrl} alt="Просмотр изображения" />
-      </div>,
-      lightboxPortalTarget,
-    )}
+    {lightboxUrl && lightboxPortalTarget && <ImageLightbox src={lightboxUrl} alt="Просмотр изображения" target={lightboxPortalTarget} onClose={() => setLightboxUrl(null)} />}
   </>;
 }
 
@@ -3169,13 +3157,7 @@ function CuratorReviewPanel({ item }: { item: ReviewQueueItem }) {
       </div>)}</div></div>}
       {openAttempt.feedback.length > 0 && <div className="submission-section"><span className="detail-label">ОТВЕТ КУРАТОРА</span>{openAttempt.feedback.map((entry) => <div className="attempt-detail-feedback-entry" key={entry.id}>{entry.text && <p className="submission-answer">{linkifyText(entry.text)}</p>}{entry.attachments.map((attachment) => attachment.mimeType.startsWith("image/") ? <button type="button" key={attachment.id} className="assignment-history-feedback-image assignment-history-feedback-image-button" aria-label={`Увеличить изображение ${attachment.originalName}`} onClick={() => setZoomImageUrl(`${API_ORIGIN}${attachment.url}`)}><Image src={`${API_ORIGIN}${attachment.url}`} alt={attachment.originalName} fill sizes="320px" unoptimized /></button> : <a key={attachment.id} className="submission-file" href={`${API_ORIGIN}${attachment.url}`} target="_blank" rel="noreferrer"><FileCheck2 size={14} /><span>{attachment.originalName}</span><ArrowUpRight size={12} /></a>)}<small className="attempt-detail-feedback-date">{new Date(entry.createdAt).toLocaleString("ru-RU")}</small></div>)}</div>}
     </div></div>}
-    {zoomImageUrl && typeof document !== "undefined" && createPortal(
-      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
-        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
-        <img className="chat-image-lightbox-image" src={zoomImageUrl} alt="Просмотр вложения" />
-      </div>,
-      document.body,
-    )}
+    {zoomImageUrl && typeof document !== "undefined" && <ImageLightbox src={zoomImageUrl} alt="Просмотр вложения" target={document.body} onClose={() => setZoomImageUrl("")} />}
   </section>;
 }
 
@@ -5519,6 +5501,40 @@ function useLightboxPortalTarget(open: boolean): Element | null {
   return target;
 }
 
+/**
+ * Full-screen image viewer. A tap toggles between "fit the screen" and the picture's real size
+ * (scrollable) — on a phone a fitted chart screenshot is too small to read (2026-10-19).
+ */
+function ImageLightbox({ src, alt, target, onClose }: { src: string; alt: string; target: Element; onClose: () => void }) {
+  const [zoomable, setZoomable] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const toggleZoom = (event: ReactMouseEvent<HTMLImageElement>) => {
+    const image = event.currentTarget;
+    if (zoomed) { setZoomed(false); return; }
+    if (!zoomable) return;
+    const rect = image.getBoundingClientRect();
+    const relX = (event.clientX - rect.left) / rect.width;
+    const relY = (event.clientY - rect.top) / rect.height;
+    setZoomed(true);
+    // Keep the tapped spot under the finger after the picture grows to full size.
+    requestAnimationFrame(() => {
+      const overlay = overlayRef.current;
+      if (!overlay) return;
+      overlay.scrollLeft = relX * image.naturalWidth - overlay.clientWidth / 2;
+      overlay.scrollTop = relY * image.naturalHeight - overlay.clientHeight / 2;
+    });
+  };
+  return createPortal(
+    <div ref={overlayRef} className={`chat-image-lightbox-overlay${zoomed ? " is-zoomed" : ""}`} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={onClose}><X size={22} /></button>
+      <img className={`chat-image-lightbox-image${zoomable ? " is-zoomable" : ""}`} src={src} alt={alt} onLoad={(event) => setZoomable(event.currentTarget.naturalWidth > event.currentTarget.clientWidth + 1 || event.currentTarget.naturalHeight > event.currentTarget.clientHeight + 1)} onClick={toggleZoom} />
+      {zoomable && <span className="chat-image-lightbox-hint">{zoomed ? "Нажми на картинку, чтобы уменьшить" : "Нажми на картинку, чтобы увеличить"}</span>}
+    </div>,
+    target,
+  );
+}
+
 function formatHostTime(iso: string): string {
   return new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 }
@@ -5635,13 +5651,7 @@ function ChatMessageRow({ message, currentUserId, showAdvanced = false, onReact,
         <a className="live-room-chat-embed-title" href={message.linkPreview.sourceUrl} target="_blank" rel="noopener noreferrer">{message.linkPreview.title}</a>
         <button type="button" className="live-room-chat-embed-image-link" onClick={() => setLightboxImage(message.linkPreview!.imageUrl)}><img className="live-room-chat-embed-image" src={message.linkPreview.imageUrl} alt={message.linkPreview.title} loading="lazy" /></button>
       </div>}
-      {lightboxImage && lightboxPortalTarget && createPortal(
-        <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxImage(null); }}>
-          <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setLightboxImage(null)}><X size={22} /></button>
-          <img className="chat-image-lightbox-image" src={lightboxImage} alt="Просмотр изображения" />
-        </div>,
-        lightboxPortalTarget,
-      )}
+      {lightboxImage && lightboxPortalTarget && <ImageLightbox src={lightboxImage} alt="Просмотр изображения" target={lightboxPortalTarget} onClose={() => setLightboxImage(null)} />}
       {message.reactions.length > 0 && <div className="live-room-chat-reactions">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={`live-room-chat-reaction ${reaction.userIds.includes(currentUserId) ? "active" : ""}`} onClick={() => onReact(message.id, reaction.emoji)}>{reaction.emoji} <span>{reaction.userIds.length}</span></button>)}</div>}
     </div>
   </div>;
@@ -8088,13 +8098,7 @@ function AssignmentMaterials({ materials }: { materials: Assignment["materials"]
   const [zoomImageUrl, setZoomImageUrl] = useState("");
   if (!materials || materials.length === 0) return null;
   return <section className="content-panel assignment-materials-panel"><div className="section-heading"><div><span className="section-kicker">МАТЕРИАЛ К ЗАДАНИЮ</span><h2>Перед началом работы</h2><p className="section-heading-note">Материалы, которые добавил куратор к этому заданию.</p></div></div><div className="assignment-materials-list">{materials.map((material) => { const url = material.url?.startsWith("http") ? material.url : material.url ? `${API_ORIGIN}${material.url}` : ""; const embedUrl = material.kind === "LINK" && material.url ? assignmentMaterialEmbed(material.url) : null; return <article className="assignment-material-card" key={material.id}><div className="assignment-material-card-head"><strong>{material.title}</strong><span>{material.kind === "LINK" ? "Ссылка" : material.mimeType ?? "Файл"}</span></div>{embedUrl && <iframe src={embedUrl} title={material.title} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen referrerPolicy="strict-origin-when-cross-origin" />}{!embedUrl && material.kind === "FILE" && material.mimeType?.startsWith("image/") && <button type="button" className="assignment-material-image assignment-material-image-button" aria-label={`Увеличить изображение ${material.title}`} onClick={() => setZoomImageUrl(url)}><Image src={url} alt={material.title} fill sizes="(max-width: 950px) 100vw, 50vw" unoptimized /></button>}{!embedUrl && material.kind === "FILE" && material.mimeType?.startsWith("video/") && <video src={url} controls preload="metadata" />}{!embedUrl && material.kind === "FILE" && material.mimeType === "application/pdf" && <iframe src={url} title={material.title} />}{!embedUrl && material.kind === "LINK" && <a className="secondary-button" href={material.url} target="_blank" rel="noreferrer">Открыть материал <ArrowUpRight size={15} /></a>}</article>; })}</div>
-    {zoomImageUrl && typeof document !== "undefined" && createPortal(
-      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
-        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
-        <img className="chat-image-lightbox-image" src={zoomImageUrl} alt="Просмотр материала" />
-      </div>,
-      document.body,
-    )}
+    {zoomImageUrl && typeof document !== "undefined" && <ImageLightbox src={zoomImageUrl} alt="Просмотр материала" target={document.body} onClose={() => setZoomImageUrl("")} />}
   </section>;
 }
 
@@ -8144,13 +8148,7 @@ function AssignmentSubmissionSummary({ assignment }: { assignment: Assignment })
         </div>
       </div>;
     })}</div>
-    {zoomImageUrl && typeof document !== "undefined" && createPortal(
-      <div className="chat-image-lightbox-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setZoomImageUrl(""); }}>
-        <button type="button" className="chat-image-lightbox-close" aria-label="Закрыть просмотр" onClick={() => setZoomImageUrl("")}><X size={22} /></button>
-        <img className="chat-image-lightbox-image" src={zoomImageUrl} alt="Просмотр вложения" />
-      </div>,
-      document.body,
-    )}
+    {zoomImageUrl && typeof document !== "undefined" && <ImageLightbox src={zoomImageUrl} alt="Просмотр вложения" target={document.body} onClose={() => setZoomImageUrl("")} />}
   </section>;
 }
 

@@ -6504,8 +6504,51 @@ div.discussion-selected-preview-list { width: min(100%, 900px); display: grid; g
   display: block;
   max-width: 90vw;
   max-height: 90vh;
+  /* dvh: on iPhone 90vh is taller than the visible area while the browser bars show, which cut the picture top and bottom. */
+  max-height: 90dvh;
   object-fit: contain;
   box-shadow: 0 24px 70px rgba(0, 0, 0, .5);
+}
+
+.chat-image-lightbox-image.is-zoomable { cursor: zoom-in; }
+
+/* No centering (an oversized centered picture overflows to the left, out of scroll reach) and no
+   backdrop-filter (it would make the fixed close button and hint scroll away with the picture). */
+.chat-image-lightbox-overlay.is-zoomed {
+  display: block;
+  place-items: normal;
+  padding: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  backdrop-filter: none;
+  background: rgb(3, 5, 8);
+}
+
+.chat-image-lightbox-overlay.is-zoomed .chat-image-lightbox-image {
+  max-width: none;
+  max-height: none;
+  cursor: zoom-out;
+  box-shadow: none;
+}
+
+.chat-image-lightbox-hint {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  color: #dce6f2;
+  font-size: 12px;
+  white-space: nowrap;
+  background: rgba(3, 5, 8, .72);
+  border: 1px solid rgba(255, 255, 255, .14);
+  pointer-events: none;
+}
+
+@media (max-width: 850px) {
+  .chat-image-lightbox-overlay { padding: 8px; }
+  .chat-image-lightbox-image { max-width: 100%; max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+  .chat-image-lightbox-overlay .chat-image-lightbox-close { top: 10px; right: 10px; }
 }
 
 .chat-image-lightbox-close {
