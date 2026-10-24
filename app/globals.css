@@ -8602,6 +8602,12 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 /* "720p авто" — the quality button of the recording player when HLS copies exist (see RecordedVideoSurface). */
 .recorded-video-controls button.recorded-video-quality { display: inline-flex; align-items: baseline; gap: 3px; }
 .recorded-video-quality small { font: 500 9px 'Manrope', sans-serif; opacity: .7; }
+.recorded-video-keys-info { position: relative; display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex-shrink: 0; border-radius: 6px; color: rgba(255,255,255,.7); cursor: help; outline: none; }
+.recorded-video-keys-info:hover, .recorded-video-keys-info:focus-visible { background: rgba(255,255,255,.12); color: #fff; }
+.recorded-video-keys-tip { position: absolute; right: 0; bottom: calc(100% + 8px); display: none; padding: 8px 12px; border-radius: 8px; background: rgba(0, 0, 0, .85); color: #fff; font-size: 12px; line-height: 1.6; white-space: nowrap; pointer-events: none; }
+.recorded-video-keys-info:hover .recorded-video-keys-tip, .recorded-video-keys-info:focus-visible .recorded-video-keys-tip { display: block; }
+/* Phones and tablets have no keyboard shortcuts to explain. */
+@media (hover: none) { .recorded-video-keys-info { display: none; } }
 
 /* "Качества готовы / готовятся…" on the curator's recording cards (RecordingHlsBadge). */
 .recording-hls-badge { display: inline-block; width: fit-content; margin-top: 6px; padding: 2px 7px; border: 1px solid rgba(255, 255, 255, .18); border-radius: 4px; color: rgba(255, 255, 255, .62); font: 600 10px 'Manrope', sans-serif; letter-spacing: .02em; }

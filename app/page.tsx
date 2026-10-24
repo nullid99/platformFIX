@@ -24,6 +24,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  Keyboard,
   FileCheck2,
   GraduationCap,
   LayoutDashboard,
@@ -775,7 +776,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
   // Latest-handler ref: the window listener (registered once) always calls this render's handler.
   useEffect(() => { keyHandlerRef.current = handleKey; });
 
-  return <div className="recorded-video-surface" onPointerDown={claimKeyboard} onFocusCapture={claimKeyboard} title="Клавиши: ← → — 5 секунд назад/вперёд, пробел — пауза, M — звук, F — весь экран">
+  return <div className="recorded-video-surface" onPointerDown={claimKeyboard} onFocusCapture={claimKeyboard}>
     {keyHint && <div className="recorded-video-key-hint" key={keyHint.at}>{keyHint.text}</div>}
     <video
       ref={videoRef}
@@ -799,6 +800,8 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       <button type="button" className="recorded-video-speed" onClick={cyclePlaybackRate} aria-label={`Скорость воспроизведения: ${playbackRate}x. Нажмите, чтобы изменить`} title="Скорость воспроизведения">{String(playbackRate).replace(".", ",")}x</button>
       <div className="video-volume-group"><button type="button" onClick={toggleMute} aria-label={muted ? "Включить звук" : "Выключить звук"}>{muted ? <VolumeX size={16} /> : <Volume2 size={16} />}</button><VolumeSlider volume={volume} muted={muted} onChange={changeVolume} /></div>
       {pictureInPicture.supported && <button type="button" onClick={pictureInPicture.toggle} aria-label={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке"} title={pictureInPicture.active ? "Вернуть видео в окно" : "Картинка в картинке — смотреть в маленьком окне поверх других программ"}><PictureInPicture2 size={16} /></button>}
+      {/* The shortcut list used to be a title on the whole video and followed the cursor over the picture — now only this icon shows it. */}
+      <span className="recorded-video-keys-info" tabIndex={0} aria-label="Горячие клавиши"><Keyboard size={16} /><span className="recorded-video-keys-tip">← → — 5 секунд назад/вперёд<br />Пробел — пауза<br />M — звук<br />F — весь экран</span></span>
       <button type="button" onClick={toggleFullscreen} aria-label={fullscreen ? "Свернуть" : "На весь экран"}>{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
     </div>
   </div>;
