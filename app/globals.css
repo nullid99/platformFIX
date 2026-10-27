@@ -38,16 +38,11 @@ body { margin: 0; color: var(--text); background: var(--bg); font-family: var(--
   background: var(--bg);
   filter: invert(1) hue-rotate(180deg);
 }
-/* Same sticky+self-scroll compositor bug .sidebar has (see the big comment above) — .module-detail
-   lives inside .content-area (it's the course page's lesson-detail panel, not a sidebar), so it
-   can't be pulled outside the filter the way .sidebar was. Same fallback: drop position: sticky
-   back to relative in light mode only — it scrolls away with the page instead of staying pinned. */
-:root[data-theme="light"] .learner-course-view .module-detail {
-  position: relative;
-  top: auto;
-  max-height: none;
-  overflow-y: visible;
-}
+/* .module-detail (the course page's lesson panel) stays position: sticky in light mode too. It used
+   to fall back to relative here because of the .sidebar repaint bug above, so in light mode the
+   panel scrolled away and left an empty column (students' complaint, 2026-10-27). That bug only
+   shows when the filter changes under a mounted sticky element; the theme is switched in Профиль,
+   where this panel isn't rendered, so the course page always mounts with the filter already on. */
 :root[data-theme="light"] .content-area img,
 :root[data-theme="light"] .content-area video,
 :root[data-theme="light"] .content-area iframe,
