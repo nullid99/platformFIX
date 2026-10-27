@@ -3640,7 +3640,7 @@ function StudentDirectoryDetailContent({ student, onDeleted, isOwner = false }: 
     answerText: string | null;
     submittedAt: string | null;
     createdAt: string;
-    feedback: Array<{ id: string; text: string; createdAt: string }>;
+    feedback: Array<{ id: string; text: string; createdAt: string; attachments: Array<{ id: string; originalName: string; mimeType: string; url: string }> }>;
     files: Array<{ id: string; originalName: string; mimeType: string; byteSize: number }>;
   };
   type AssignmentHistory = AssignmentAttempt & {
@@ -3658,6 +3658,7 @@ function StudentDirectoryDetailContent({ student, onDeleted, isOwner = false }: 
   const [studentTab, setStudentTab] = useState<"overview" | "assignments">("overview");
   const [studentAssignments, setStudentAssignments] = useState<AssignmentHistory[]>([]);
   const [expandedAssignmentId, setExpandedAssignmentId] = useState("");
+  const [zoomImageUrl, setZoomImageUrl] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
 
@@ -3785,12 +3786,13 @@ function StudentDirectoryDetailContent({ student, onDeleted, isOwner = false }: 
                 </div>
                 <div><span className="detail-label">ОТВЕТ УЧЕНИКА</span><p>{linkifyText(attempt.answerText || "Ответ отправлен без текста.")}</p></div>
                 {attempt.files.length > 0 && <div><span className="detail-label">ВЛОЖЕНИЯ</span><div className="student-assignment-files">{attempt.files.map((file) => file.mimeType.startsWith("image/") ? <div className="student-assignment-image" key={file.id}><Image src={API_ORIGIN + "/api/files/" + file.id + "/content"} alt={file.originalName} width={320} height={210} unoptimized /><span>{file.originalName}</span></div> : <a key={file.id} href={API_ORIGIN + "/api/files/" + file.id + "/content"} target="_blank" rel="noreferrer">{file.originalName}</a>)}</div></div>}
-                {attempt.feedback.length > 0 ? <div className="student-assignment-feedback"><strong>КОММЕНТАРИИ КУРАТОРА</strong>{attempt.feedback.map((feedback) => <div className="student-assignment-feedback-item" key={feedback.id}><span>{linkifyText(feedback.text)}</span><small>{formatDateTime(feedback.createdAt)}</small></div>)}</div> : <div className="student-assignment-feedback empty"><strong>КОММЕНТАРИИ КУРАТОРА</strong><span>Комментариев по этой попытке пока нет.</span></div>}
+                {attempt.feedback.length > 0 ? <div className="student-assignment-feedback"><strong>КОММЕНТАРИИ КУРАТОРА</strong>{attempt.feedback.map((feedback) => <div className="student-assignment-feedback-item" key={feedback.id}>{feedback.text && <span>{linkifyText(feedback.text)}</span>}{feedback.attachments.map((file) => file.mimeType.startsWith("image/") ? <button type="button" key={file.id} className="assignment-history-feedback-image assignment-history-feedback-image-button" aria-label={`Увеличить изображение ${file.originalName}`} onClick={(event) => { event.stopPropagation(); setZoomImageUrl(`${API_ORIGIN}${file.url}`); }}><Image src={`${API_ORIGIN}${file.url}`} alt={file.originalName} fill sizes="320px" unoptimized /></button> : <a key={file.id} className="submission-file" href={`${API_ORIGIN}${file.url}`} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}><FileCheck2 size={14} /><span>{file.originalName}</span><ArrowUpRight size={12} /></a>)}<small>{formatDateTime(feedback.createdAt)}</small></div>)}</div> : <div className="student-assignment-feedback empty"><strong>КОММЕНТАРИИ КУРАТОРА</strong><span>Комментариев по этой попытке пока нет.</span></div>}
               </div>)}
             </div>
           </div>}
         </article>;
       })}
+      {zoomImageUrl && typeof document !== "undefined" && <ImageLightbox src={zoomImageUrl} alt="Просмотр вложения" target={document.body} onClose={() => setZoomImageUrl("")} />}
     </div> : <div className="directory-security">
       {securityError && <div className="file-error" role="alert">{securityError}</div>}
       {detail && pendingSessions.length > 0 && <div className="security-pending-list"><div className="security-pending-heading"><div><span className="section-kicker">ТРЕБУЕТСЯ РЕШЕНИЕ</span><h4>Новые устройства ожидают подтверждения</h4><p>Если уже заняты два места, сначала отзовите активное устройство, затем разрешите это.</p></div><span>{pendingSessions.length}</span></div>{pendingSessions.map((session) => <article className="security-device-card pending" key={session.id}><div className="security-device-head"><div><span className="security-device-status pending">ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ</span><h4>{formatDevice(session.userAgent)}</h4></div><div className="security-device-actions"><button className="primary-button" disabled={approving === session.id} onClick={() => void approve(session.id)}>{approving === session.id ? "Разрешаем…" : "Разрешить устройство"}</button><button className="secondary-button danger" disabled={revoking === session.id} onClick={() => void revoke(session.id)}>{revoking === session.id ? "Отклоняем…" : "Отклонить"}</button></div></div><div className="security-device-grid"><div><span>IP-АДРЕС</span><strong>{session.ipAddress ?? "Не определён"}</strong></div><div><span>РЕГИОН</span><strong>{formatRegion(session.city, session.countryCode)}</strong></div><div><span>ЗАПРОС</span><strong>{formatDateTime(session.createdAt)}</strong></div><div><span>ИСТЕКАЕТ</span><strong>{formatDateTime(session.expiresAt)}</strong></div></div></article>)}</div>}
