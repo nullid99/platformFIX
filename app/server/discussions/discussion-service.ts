@@ -33,7 +33,7 @@ export type CreateDiscussionMessageInput = {
 
 const MAX_TITLE_LENGTH = 240;
 const MAX_BODY_LENGTH = 10_000;
-const MAX_ATTACHMENT_COUNT = 5;
+const MAX_ATTACHMENT_COUNT = 20;
 const MAX_ATTACHMENT_NAME_LENGTH = 180;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const ALLOWED_MIME_TYPES = new Set(["image/png", "image/jpeg", "application/pdf", "video/mp4", "video/webm"]);

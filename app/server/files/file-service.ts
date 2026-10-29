@@ -229,7 +229,7 @@ export class FileService {
   public async attachToSubmission(studentId: string, submissionId: string, fileIds: string[]): Promise<void> {
     if (fileIds.length === 0) return;
     const uniqueIds = [...new Set(fileIds)];
-    if (uniqueIds.length > 5) throw new AuthServiceError("INVALID_INPUT", "Too many files");
+    if (uniqueIds.length > 20) throw new AuthServiceError("INVALID_INPUT", "Too many files");
     const files = await prisma.storedFile.findMany({ where: { id: { in: uniqueIds }, ownerId: studentId, status: StoredFileStatus.UPLOADED }, select: { id: true } });
     if (files.length !== uniqueIds.length) throw new AuthServiceError("FORBIDDEN", "File ownership is invalid");
     await prisma.submissionAttachment.createMany({ data: uniqueIds.map((fileId, position) => ({ submissionId, fileId, position })) });

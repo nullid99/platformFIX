@@ -2132,7 +2132,7 @@ function DiscussionMessageAttachments({ message }: { message: CuratorDiscussionM
 
 type PendingDiscussionAttachment = { file: File; previewUrl: string; kind: "image" | "video" | "file" };
 type DiscussionAttachmentPayload = { fileId: string; originalName: string; mimeType: string; byteSize: number };
-const MAX_DISCUSSION_ATTACHMENTS = 5;
+const MAX_DISCUSSION_ATTACHMENTS = 20;
 
 // Shared across every multi-file attach point (discussion composers, assignment submission) —
 // all need the same select-many/preview/remove/upload behavior; only the surrounding JSX differs.

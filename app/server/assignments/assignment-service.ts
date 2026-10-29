@@ -91,7 +91,7 @@ type QueueAttempt = {
 
 const MAX_TEXT_LENGTH = 10_000;
 const MAX_REQUIREMENTS = 20;
-const MAX_ATTACHMENT_COUNT = 10;
+const MAX_ATTACHMENT_COUNT = 20;
 const MAX_ATTACHMENT_NAME_LENGTH = 255;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 
@@ -182,7 +182,7 @@ function normalizeFileIds(values: SubmissionInput["fileIds"]): string[] {
     throw new AuthServiceError("INVALID_INPUT", "fileIds are invalid");
   }
   const unique = [...new Set(values.map((value) => value.trim()))];
-  if (unique.length > 5) throw new AuthServiceError("INVALID_INPUT", "Too many files");
+  if (unique.length > MAX_ATTACHMENT_COUNT) throw new AuthServiceError("INVALID_INPUT", "Too many files");
   return unique;
 }
 
