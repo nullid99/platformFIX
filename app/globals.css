@@ -8383,6 +8383,9 @@ html.pseudo-fullscreen-lock,
 html.pseudo-fullscreen-lock body {
   overflow: hidden;
   overscroll-behavior: none;
+  /* The browser paints the strips it keeps for itself in landscape (beside the notch, above the
+     home bar) with the page background — black, so they read as the player's frame, not gray page. */
+  background: #000;
 }
 
 /* Light theme: .content-area's invert filter makes it the containing block for position: fixed,
@@ -8598,6 +8601,17 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 .recorded-video-keys-info:hover .recorded-video-keys-tip, .recorded-video-keys-info:focus-visible .recorded-video-keys-tip { display: block; }
 /* Phones and tablets have no keyboard shortcuts to explain. */
 @media (hover: none) { .recorded-video-keys-info { display: none; } }
+/* ±10 s buttons and double-tap seeking are for touch screens; a computer has the arrow keys.
+   manipulation stops a double tap on the video from zooming the page instead of seeking. */
+.recorded-video-controls button.recorded-video-skip { display: none; min-width: 34px; padding: 0 4px; }
+.recorded-video-surface video { touch-action: manipulation; }
+@media (hover: none) {
+  .recorded-video-controls button.recorded-video-skip { display: flex; }
+  /* Phones change loudness with their own buttons (iPhone ignores the page's volume), and the
+     slider would squeeze the seek bar next to the new buttons. */
+  .recorded-video-controls .video-volume-slider { display: none; }
+}
+@media (hover: none) and (max-width: 480px) { .recorded-video-controls { gap: 6px; padding: 6px 8px; } }
 
 /* "Качества готовы / готовятся…" on the curator's recording cards (RecordingHlsBadge). */
 .recording-hls-badge { display: inline-block; width: fit-content; margin-top: 6px; padding: 2px 7px; border: 1px solid rgba(255, 255, 255, .18); border-radius: 4px; color: rgba(255, 255, 255, .62); font: 600 10px 'Manrope', sans-serif; letter-spacing: .02em; }

@@ -218,7 +218,14 @@ function usePictureInPicture(videoRef: RefObject<HTMLVideoElement | null>, befor
   return { supported, active, toggle };
 }
 
-function useVideoFullscreen(ref: RefObject<HTMLDivElement | null>) {
+type NativeFullscreenVideo = HTMLVideoElement & { webkitEnterFullscreen?: () => void };
+
+/**
+ * `iphoneNativePlayer`: on iPhone open the video in Apple's own player instead of the pseudo-
+ * fullscreen — truly full screen without the browser's address bar, with its own ±10 s and
+ * pinch-to-fill. The watermark doesn't show there; the owner accepted that for phones (2026-10-31).
+ */
+function useVideoFullscreen(ref: RefObject<HTMLDivElement | null>, { iphoneNativePlayer = false }: { iphoneNativePlayer?: boolean } = {}) {
   const [native, setNative] = useState(false);
   const [pseudo, setPseudo] = useState(false);
 
@@ -259,7 +266,15 @@ function useVideoFullscreen(ref: RefObject<HTMLDivElement | null>) {
     const element = ref.current as FullscreenCapableElement | null;
     if (!element) return;
     const request = element.requestFullscreen ? () => element.requestFullscreen() : element.webkitRequestFullscreen ? () => Promise.resolve(element.webkitRequestFullscreen!()) : null;
-    if (!request) { setPseudo(true); return; }
+    if (!request) {
+      const video = iphoneNativePlayer ? element.querySelector<NativeFullscreenVideo>("video") : null;
+      if (video?.webkitEnterFullscreen) {
+        // Throws until the video's metadata has loaded — the pinned player still works then.
+        try { video.webkitEnterFullscreen(); return; } catch (error: unknown) { console.warn("Native iPhone fullscreen unavailable, using the pinned player", error); }
+      }
+      setPseudo(true);
+      return;
+    }
     void request()
       // Phones only — desktop browsers reject the lock, which is fine to ignore.
       .then(() => (screen.orientation as LockableOrientation | undefined)?.lock?.("landscape").catch(() => undefined))
@@ -569,7 +584,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
   const [resumedFrom, setResumedFrom] = useState<number | null>(null);
   // Remembered per browser, so the next recording starts at the speed the student last picked.
   const [playbackRate, setPlaybackRate] = useState(() => (typeof window === "undefined" ? 1 : readSavedPlaybackRate()));
-  const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef);
+  const { fullscreen, toggle: toggleFullscreen } = useVideoFullscreen(fullscreenRef, { iphoneNativePlayer: true });
   const pictureInPicture = usePictureInPicture(videoRef, () => { if (fullscreen) toggleFullscreen(); });
 
   // HLS (small segments in several qualities, like Vimeo — 2026-10-10: one long MP4 request kept
@@ -675,10 +690,40 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     if (video.paused) void video.play().catch(() => undefined);
     else video.pause();
   };
+  const seekBy = (delta: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const limit = Number.isFinite(video.duration) ? video.duration : Infinity;
+    const next = Math.min(limit, Math.max(0, video.currentTime + delta));
+    video.currentTime = next;
+    setCurrentTime(next);
+    setResumedFrom(null);
+    setKeyHint({ text: delta < 0 ? `−${-delta} с` : `+${delta} с`, at: Date.now() });
+  };
   // A click is play/pause in fullscreen too, like YouTube — it used to exit fullscreen, which
   // students kept doing by accident when they only wanted to pause (2026-10-06). Double-click
   // toggles fullscreen; the control-bar button and Escape still exit.
-  const handleVideoClick = () => togglePlay();
+  // On a touch screen a double tap on the left/right half seeks ∓10 s, like YouTube on a phone
+  // (2026-10-31: phones had no way to skip back a little). So a single tap waits a moment before
+  // play/pause, and further taps right after a skip keep skipping.
+  const touchInputRef = useRef(false);
+  const tapRef = useRef<{ timer: number | null; skipUntil: number }>({ timer: null, skipUntil: 0 });
+  useEffect(() => () => { if (tapRef.current.timer !== null) window.clearTimeout(tapRef.current.timer); }, []);
+  const handleVideoClick = (event: ReactMouseEvent<HTMLVideoElement>) => {
+    if (!touchInputRef.current) { togglePlay(); return; }
+    const tap = tapRef.current;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const delta = event.clientX - bounds.left < bounds.width / 2 ? -10 : 10;
+    const now = Date.now();
+    if (tap.timer !== null || now < tap.skipUntil) {
+      if (tap.timer !== null) window.clearTimeout(tap.timer);
+      tap.timer = null;
+      tap.skipUntil = now + 600;
+      seekBy(delta);
+      return;
+    }
+    tap.timer = window.setTimeout(() => { tap.timer = null; togglePlay(); }, 280);
+  };
   const toggleMute = () => {
     const video = videoRef.current;
     if (!video) return;
@@ -753,13 +798,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     const key = event.key.toLowerCase();
     if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
       event.preventDefault();
-      const delta = event.key === "ArrowLeft" ? -5 : 5;
-      const limit = Number.isFinite(video.duration) ? video.duration : Infinity;
-      const next = Math.min(limit, Math.max(0, video.currentTime + delta));
-      video.currentTime = next;
-      setCurrentTime(next);
-      setResumedFrom(null);
-      showHint(delta < 0 ? "−5 с" : "+5 с");
+      seekBy(event.key === "ArrowLeft" ? -5 : 5);
     } else if (event.key === " " || key === "k" || key === "л") {
       // Space on a focused button would also "click" it — handle it here once instead.
       event.preventDefault();
@@ -783,8 +822,9 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       src={videoSrc}
       playsInline
       onError={() => { if (mode === "hls-native") setMode("mp4"); }}
+      onPointerDown={(event) => { touchInputRef.current = event.pointerType === "touch"; }}
       onClick={handleVideoClick}
-      onDoubleClick={toggleFullscreen}
+      onDoubleClick={() => { if (!touchInputRef.current) toggleFullscreen(); }}
       onPlay={() => { setPlaying(true); claimKeyboard(); }}
       onPause={() => setPlaying(false)}
       onTimeUpdate={(event) => handleTimeUpdate(event.currentTarget)}
@@ -794,6 +834,8 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
     {resumedFrom !== null && <div className="recorded-video-resume">Продолжаем с {formatVideoTime(resumedFrom)} · <button type="button" onClick={restartFromBeginning}>С начала</button></div>}
     <div className="recorded-video-controls">
       <button type="button" onClick={togglePlay} aria-label={playing ? "Пауза" : "Воспроизвести"}>{playing ? <Pause size={16} /> : <Play size={16} />}</button>
+      <button type="button" className="recorded-video-speed recorded-video-skip" onClick={() => seekBy(-10)} aria-label="10 секунд назад">−10</button>
+      <button type="button" className="recorded-video-speed recorded-video-skip" onClick={() => seekBy(10)} aria-label="10 секунд вперёд">+10</button>
       <span className="recorded-video-time">{seekPending ? "Загрузка…" : `${formatVideoTime(currentTime)} / ${formatVideoTime(duration)}`}</span>
       <div className="recorded-video-seek" onClick={seekTo}><i style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }} /></div>
       {mode === "hls" && qualityLevels.length > 1 && <button type="button" className="recorded-video-speed recorded-video-quality" onClick={cycleQuality} aria-label={`Качество: ${quality === -1 ? "автоматически" : `${shownHeight}p`}. Нажмите, чтобы изменить`} title={quality === -1 ? `Качество выбирается автоматически под скорость интернета${autoHeight ? ` — сейчас ${autoHeight}p` : ""}. Нажмите, чтобы выбрать вручную` : "Качество выбрано вручную. Нажимайте, чтобы вернуть «Авто»"}>{shownHeight ? `${shownHeight}p` : "Авто"}{quality === -1 && shownHeight ? <small>авто</small> : null}</button>}
