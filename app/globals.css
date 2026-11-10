@@ -8631,3 +8631,9 @@ button.assignment-materials-inline-file { font: inherit; cursor: pointer; text-a
 .discussion-share-toggle strong { font-size: 13px; font-weight: 600; }
 .discussion-share-toggle small { color: rgba(255, 255, 255, .55); font-size: 12px; line-height: 1.4; }
 .discussion-share-note { margin-top: 4px; color: rgba(255, 255, 255, .5); font-size: 12px; }
+
+/* Curator's "Записать ученика" on a free Бэктест/Пресессия slot (CuratorSlotBooking). */
+.curator-slot-booking { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.curator-slot-booking select { flex: 1; min-width: 200px; padding: 10px 12px; color: #d3dfeb; background: #0b141f; border: 1px solid #31506d; font: inherit; font-size: 14px; }
+.curator-slot-booking .file-error { flex-basis: 100%; }
+.curator-slot-booking-empty { color: rgba(255, 255, 255, .6); font-size: 13px; }

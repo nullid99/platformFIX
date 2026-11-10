@@ -6,7 +6,7 @@ import { activeStudentEmails, activeStudentIds } from "@/app/server/notification
 import { sendNewEventNotification } from "@/app/server/notifications/email-service";
 import { notificationService } from "@/app/server/notifications/notification-service";
 import { getWorkingPracticumId, isPracticumCompleted } from "@/app/server/course/practicum-service";
-import { dateKeyInZone, todayDateKey } from "@/app/domain/schedule-time";
+import { dateKeyInZone, slotBookingClosesAt, todayDateKey } from "@/app/domain/schedule-time";
 import { fileService } from "@/app/server/files";
 
 export type ScheduleEventInput = {
@@ -123,7 +123,7 @@ export class ScheduleService {
     await this.assertActiveUser(actorId, UserRole.STUDENT);
     try {
       const { event, limits } = await prisma.$transaction(async (tx) => {
-        const current = await tx.scheduleEvent.findUnique({ where: { id: eventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true, date: true } });
+        const current = await tx.scheduleEvent.findUnique({ where: { id: eventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true, date: true, time: true } });
         if (!current) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
         if (await isPracticumCompleted(current.practicumId, tx)) throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — новые записи уже не забронировать.");
         if (!BOOKABLE_TYPES.has(current.type)) throw new AuthServiceError("INVALID_INPUT", "This event type cannot be booked");
@@ -133,6 +133,10 @@ export class ScheduleService {
         // below: otherwise a finished slot could be un-booked after the fact to reclaim it against
         // the per-type limit.
         if (dateKeyInZone(current.date) < todayDateKey()) throw new AuthServiceError("INVALID_INPUT", "This slot is in the past and can no longer be booked");
+        // Less than 24 h to the start: only a curator can still put someone in (bookForStudent).
+        if (Date.now() >= slotBookingClosesAt(dateString(current.date), current.time).getTime()) {
+          throw new AuthServiceError("INVALID_INPUT", "Запись закрыта: до начала меньше 24 часов. Если нужно попасть на этот слот, напишите куратору.");
+        }
         const practicum = await tx.practicum.findUnique({ where: { id: current.practicumId }, select: { backtestSlotLimit: true, preSessionSlotLimit: true } });
         const limits: BookingLimits = { backtestSlotLimit: practicum?.backtestSlotLimit ?? 1, preSessionSlotLimit: practicum?.preSessionSlotLimit ?? 1 };
         const limit = slotLimitForType(current.type, limits) ?? 0;
@@ -159,6 +163,82 @@ export class ScheduleService {
       }
       throw error;
     }
+  }
+
+  /**
+   * A curator puts a student into an individual slot by hand (2026-11-10) — the way in once
+   * self-booking has closed 24 h before the start, e.g. two students swapping at the last moment.
+   * Deliberately skips the 24 h rule, the past-date lock and the student's per-type slot limit:
+   * the curator decides. The slot must be free; the student must be active in the event's поток.
+   */
+  public async bookForStudent(actorId: string, eventId: string, studentId: string) {
+    await this.assertCurator(actorId);
+    const normalizedEventId = requiredText(eventId, "eventId", 100);
+    const normalizedStudentId = requiredText(studentId, "studentId", 100);
+    try {
+      const { event, limits } = await prisma.$transaction(async (tx) => {
+        const current = await tx.scheduleEvent.findUnique({ where: { id: normalizedEventId }, select: { id: true, type: true, practicumId: true, bookedByStudentId: true } });
+        if (!current) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+        if (await isPracticumCompleted(current.practicumId, tx)) throw new AuthServiceError("INVALID_INPUT", "Практикум завершён — новые записи уже не забронировать.");
+        if (!BOOKABLE_TYPES.has(current.type)) throw new AuthServiceError("INVALID_INPUT", "This event type cannot be booked");
+        if (current.bookedByStudentId) throw new AuthServiceError("AUTH_CONFLICT", "Слот уже занят. Сначала освободите его.");
+        const enrollment = await tx.enrollment.findFirst({
+          where: {
+            practicumId: current.practicumId,
+            studentId: normalizedStudentId,
+            status: EnrollmentStatus.ACTIVE,
+            OR: [{ accessUntil: null }, { accessUntil: { gt: new Date() } }],
+            student: { status: UserStatus.ACTIVE, role: UserRole.STUDENT },
+          },
+          select: { id: true },
+        });
+        if (!enrollment) throw new AuthServiceError("INVALID_INPUT", "Этот ученик не состоит в потоке события.");
+        const updated = await tx.scheduleEvent.update({
+          where: { id: normalizedEventId },
+          data: { bookedByStudentId: normalizedStudentId, bookedAt: new Date() },
+          include: { mediaAssets: true, bookedBy: { include: { externalIdentities: { orderBy: { createdAt: "asc" }, take: 1 } } } },
+        });
+        await tx.scheduleBooking.create({
+          data: { practicumId: current.practicumId, eventId: normalizedEventId, eventType: current.type, eventTitle: updated.title, eventDate: updated.date, eventTime: updated.time, studentId: normalizedStudentId, action: ScheduleBookingAction.BOOKED, actorId },
+        });
+        const practicum = await tx.practicum.findUnique({ where: { id: current.practicumId }, select: { backtestSlotLimit: true, preSessionSlotLimit: true } });
+        const limits: BookingLimits = { backtestSlotLimit: practicum?.backtestSlotLimit ?? 1, preSessionSlotLimit: practicum?.preSessionSlotLimit ?? 1 };
+        return { event: updated, limits };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      // The student didn't press anything themselves — tell them in the bell.
+      void notificationService.create(normalizedStudentId, "NEW_EVENT", `Куратор записал вас: ${event.title}`, `${new Intl.DateTimeFormat("ru-RU").format(event.date)}, ${event.time} по Киеву`, event.id)
+        .catch((error: unknown) => console.error("Curator booking notification failed", error instanceof Error ? error.message : "unknown error"));
+      return this.toDto(event, actorId, limits);
+    } catch (error) {
+      if (error instanceof AuthServiceError) throw error;
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+        throw new AuthServiceError("AUTH_CONFLICT", "Слот только что заняли. Обновите расписание.");
+      }
+      throw error;
+    }
+  }
+
+  /** The picker for bookForStudent: active students of the event's own поток, by name. */
+  public async listBookableStudents(actorId: string, eventId: string) {
+    await this.assertCurator(actorId);
+    const event = await prisma.scheduleEvent.findUnique({ where: { id: requiredText(eventId, "eventId", 100) }, select: { practicumId: true, type: true } });
+    if (!event) throw new AuthServiceError("INVALID_INPUT", "Schedule event does not exist");
+    if (!BOOKABLE_TYPES.has(event.type)) throw new AuthServiceError("INVALID_INPUT", "This event type cannot be booked");
+    const enrollments = await prisma.enrollment.findMany({
+      where: {
+        practicumId: event.practicumId,
+        status: EnrollmentStatus.ACTIVE,
+        OR: [{ accessUntil: null }, { accessUntil: { gt: new Date() } }],
+        student: { status: UserStatus.ACTIVE, role: UserRole.STUDENT },
+      },
+      select: { studentId: true, student: { select: { email: true, externalIdentities: { orderBy: { createdAt: "asc" }, take: 1, select: { displayName: true, username: true } } } } },
+    });
+    const students = new Map<string, string>();
+    for (const enrollment of enrollments) {
+      const identity = enrollment.student.externalIdentities[0];
+      students.set(enrollment.studentId, identity?.displayName ?? identity?.username ?? enrollment.student.email ?? "Ученик");
+    }
+    return [...students.entries()].map(([id, name]) => ({ id, name })).sort((left, right) => left.name.localeCompare(right.name, "ru"));
   }
 
   public async cancelBooking(actorId: string, eventId: string) {
@@ -291,6 +371,9 @@ export class ScheduleService {
       bookedByStudentName: bookedByIdentity?.displayName ?? bookedByIdentity?.username ?? null,
       isBookedByActor: Boolean(actorId) && event.bookedByStudentId === actorId,
       slotLimit: limits ? slotLimitForType(event.type, limits) : null,
+      // When a student can no longer book this slot themselves (24 h before the start) — an
+      // instant, so the page compares it with its own clock whatever zone the viewer is in.
+      bookingClosesAt: BOOKABLE_TYPES.has(event.type) ? slotBookingClosesAt(dateString(event.date), event.time).toISOString() : null,
     };
   }
 
@@ -349,6 +432,8 @@ export class ScheduleService {
         eventDate: dateString(entry.eventDate),
         eventTime: entry.eventTime,
         action: entry.action,
+        // Booked or released by a curator rather than by the student themselves.
+        byCurator: entry.actorId !== entry.studentId,
         createdAt: entry.createdAt.toISOString(),
       })),
     };

@@ -134,6 +134,8 @@ export type ScheduleEvent = {
   isBookedByActor?: boolean;
   /** Per-student booking limit for this event's type, curator-configurable; null for non-bookable types. */
   slotLimit?: number | null;
+  /** ISO instant after which a student can't book this slot themselves (24 h before the start); null for non-bookable types. */
+  bookingClosesAt?: string | null;
   /** ISO time the curator pressed "Завершить эфир" for this event, or null. */
   streamEndedAt?: string | null;
   /** The event's own Kyiv date/time as stored — `date`/`time` above may be converted to the viewing student's time zone. */

@@ -44,6 +44,24 @@ export function todayDateKey(timeZone: string = EVENT_TIMEZONE): string {
   return dateKeyInZone(new Date(), timeZone);
 }
 
+/**
+ * A student can book an individual slot (Бэктест/Пресессия) only until this long before it starts
+ * (2026-11-10): a curator who saw the slot still empty a day ahead makes other plans, and a
+ * last-minute booking broke them. Cancelling stays open; a curator can still book by hand.
+ */
+export const SLOT_BOOKING_CLOSE_LEAD_MS = 24 * 60 * 60_000;
+
+/**
+ * When self-booking of a slot closes: SLOT_BOOKING_CLOSE_LEAD_MS before the start in its
+ * "HH:MM — HH:MM" time label (Kyiv). A label with no time counts from the start of that day.
+ */
+export function slotBookingClosesAt(dateKey: string, time: string): Date {
+  const startLabel = time.match(/^\s*(\d{1,2}:\d{2})/)?.[1] ?? "00:00";
+  const start = zonedTimeToUtc(dateKey, startLabel);
+  const startsAt = Number.isNaN(start.getTime()) ? zonedTimeToUtc(dateKey, "00:00") : start;
+  return new Date(startsAt.getTime() - SLOT_BOOKING_CLOSE_LEAD_MS);
+}
+
 /** Formats a UTC instant as "DD.MM.YYYY HH:MM" wall-clock time in `timeZone` — e.g. auto-naming an unattached stream recording that has no lesson/event title to borrow. */
 export function formatZonedDateTime(date: Date, timeZone: string = EVENT_TIMEZONE): string {
   const formatter = new Intl.DateTimeFormat("en-GB", {

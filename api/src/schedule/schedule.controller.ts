@@ -75,6 +75,18 @@ export class ScheduleController {
     try { return { data: await scheduleService.book(await sessionUser(request), eventId) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
   }
 
+  @Get(":eventId/bookable-students")
+  public async bookableStudents(@Req() request: RequestWithCookies, @Param("eventId") eventId: string) {
+    try { return { data: await scheduleService.listBookableStudents(await sessionUser(request), eventId) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
+  @Post(":eventId/book-student")
+  public async bookStudent(@Req() request: RequestWithCookies, @Param("eventId") eventId: string, @Body() body: unknown) {
+    const record = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    if (typeof record.studentId !== "string" || !record.studentId.trim()) throw new BadRequestException("studentId is required");
+    try { return { data: await scheduleService.bookForStudent(await sessionUser(request), eventId, record.studentId) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
+  }
+
   @Post(":eventId/cancel-booking")
   public async cancelBooking(@Req() request: RequestWithCookies, @Param("eventId") eventId: string) {
     try { return { data: await scheduleService.cancelBooking(await sessionUser(request), eventId) }; } catch (error) { if (error instanceof AuthServiceError) mapError(error); throw error; }
