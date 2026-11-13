@@ -108,6 +108,30 @@ function mediaThumbnailUrl(provider: string, providerKey: string, assetId: strin
   return null;
 }
 
+/**
+ * The Медиатека draft that keeps a replaced recording's own file reachable (see
+ * CourseService#replaceMediaWithVimeo) — unattached, never published, so students don't see it.
+ */
+export function replacedOriginalDraftData(
+  source: { practicumId: string; provider: string; providerKey: string; kind: MediaAssetKind; audience: MediaAudience; title: string | null; mimeType: string | null; durationSec: number | null; byteSize: bigint | null },
+  position: number,
+) {
+  return {
+    practicumId: source.practicumId,
+    provider: source.provider,
+    providerKey: source.providerKey,
+    kind: source.kind,
+    audience: source.audience,
+    status: MediaAssetStatus.DRAFT,
+    title: `${source.title ?? "Запись"} — оригинал с сервера`.slice(0, 180),
+    description: "Исходный файл записи, которую заменили на Vimeo. Удалите его, когда убедитесь, что Vimeo играет: файл сотрётся с сервера полностью.",
+    mimeType: source.mimeType,
+    durationSec: source.durationSec,
+    byteSize: source.byteSize,
+    position,
+  };
+}
+
 function normalizeVimeoKey(rawUrl: string): string {
   let url: URL;
   try {
@@ -1126,29 +1150,44 @@ export class CourseService {
    * archive and view log, and notify every student about a "new" recording. So the same row just
    * starts playing from Vimeo; title, dates, lesson/event, order, audience, status, durationSec
    * (future timecodes are seconds from the start, so they stay valid for the same video) and the
-   * chat window are untouched. The file itself is NOT deleted — its key is kept in replacedFromKey.
+   * chat window are untouched. The file itself is NOT deleted — its key is kept in replacedFromKey,
+   * and the original shows up in the Медиатека as a separate unattached DRAFT («… — оригинал с
+   * сервера», never visible to students) that the curator deletes once Vimeo is confirmed to play:
+   * archiveMedia on that draft wipes the MP4, thumbnail and HLS copies from the stream server.
    * Works for a Vimeo item too (fixing a wrong link); then there is no file to remember.
    */
   public async replaceMediaWithVimeo(actorId: string, mediaId: string, vimeoUrl: string) {
     await this.assertCurator(actorId);
     const normalizedMediaId = requiredText(mediaId, "mediaId", 100);
     const providerKey = normalizeVimeoKey(vimeoUrl);
-    const existing = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { provider: true, providerKey: true, status: true, replacedFromKey: true } });
+    const existing = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { provider: true, providerKey: true, status: true, practicumId: true, kind: true, audience: true, title: true, mimeType: true, durationSec: true, byteSize: true } });
     if (!existing || existing.status === MediaAssetStatus.ARCHIVED) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
     const isOwnRecording = existing.provider.toUpperCase() === "LIVEKIT_RECORDING";
     if (!isOwnRecording && existing.provider.toUpperCase() !== "VIMEO") throw new AuthServiceError("INVALID_INPUT", "This media cannot be replaced with Vimeo");
     if (!isOwnRecording && existing.providerKey === providerKey) throw new AuthServiceError("INVALID_INPUT", "Эта запись уже играет с этой ссылки Vimeo");
 
-    const media = await prisma.mediaAsset.update({
-      where: { id: normalizedMediaId },
-      data: {
-        provider: "VIMEO",
-        providerKey,
-        // Only our own recording has a file worth remembering; a Vimeo → Vimeo link fix keeps
-        // whatever an earlier replacement stored.
-        ...(isOwnRecording ? { replacedFromProvider: existing.provider, replacedFromKey: existing.providerKey, replacedAt: new Date() } : {}),
-      },
-      select: { id: true, provider: true, providerKey: true, kind: true, audience: true, status: true, title: true, description: true, durationSec: true, byteSize: true, position: true, publishedAt: true, scheduleEventId: true },
+    const media = await prisma.$transaction(async (tx) => {
+      const updated = await tx.mediaAsset.update({
+        where: { id: normalizedMediaId },
+        data: {
+          provider: "VIMEO",
+          providerKey,
+          // Only our own recording has a file worth remembering; a Vimeo → Vimeo link fix keeps
+          // whatever an earlier replacement stored.
+          ...(isOwnRecording ? { replacedFromProvider: existing.provider, replacedFromKey: existing.providerKey, replacedAt: new Date() } : {}),
+        },
+        select: { id: true, provider: true, providerKey: true, kind: true, audience: true, status: true, title: true, description: true, durationSec: true, byteSize: true, position: true, publishedAt: true, scheduleEventId: true },
+      });
+      if (isOwnRecording) {
+        // The same file can sit under several rows (attachMediaToModule copies it per lesson) —
+        // if another live row still shows it, the curator can already reach and delete it there.
+        const stillShown = await tx.mediaAsset.count({ where: { provider: existing.provider, providerKey: existing.providerKey, status: { not: MediaAssetStatus.ARCHIVED } } });
+        if (stillShown === 0) {
+          const lastUnattached = await tx.mediaAsset.findFirst({ where: { practicumId: existing.practicumId, moduleId: null, scheduleEventId: null }, orderBy: { position: "desc" }, select: { position: true } });
+          await tx.mediaAsset.create({ data: replacedOriginalDraftData(existing, (lastUnattached?.position ?? -1) + 1) });
+        }
+      }
+      return updated;
     }).catch((error: unknown) => {
       if (error instanceof Error && error.message.includes("Unique constraint")) {
         throw new AuthServiceError("INVALID_INPUT", "Это видео Vimeo уже добавлено в этот урок отдельной записью");
