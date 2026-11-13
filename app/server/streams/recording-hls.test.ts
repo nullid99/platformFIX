@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildMasterPlaylist, parseHlsManifest, recordingHlsPrefix, signMediaPlaylist } from "./recording-hls";
+import { buildMasterPlaylist, mayPlayRecordingAsFile, parseHlsManifest, recordingHlsPrefix, signMediaPlaylist } from "./recording-hls";
 
 const manifestJson = JSON.stringify({
   version: 1,
@@ -79,5 +79,17 @@ describe("signMediaPlaylist", () => {
     await expect(signMediaPlaylist(stored.replace("seg_00002.m4s", "https://evil.example/x.m4s"), sign)).rejects.toThrow();
     await expect(signMediaPlaylist(stored.replace('URI="init.mp4"', 'URI="../init.mp4"'), sign)).rejects.toThrow();
     await expect(signMediaPlaylist("not a playlist", sign)).rejects.toThrow();
+  });
+});
+
+describe("mayPlayRecordingAsFile", () => {
+  it("gives a student the whole MP4 only while there are no HLS copies", () => {
+    expect(mayPlayRecordingAsFile(false, false)).toBe(true);
+    expect(mayPlayRecordingAsFile(false, true)).toBe(false);
+  });
+
+  it("always lets staff play the file", () => {
+    expect(mayPlayRecordingAsFile(true, true)).toBe(true);
+    expect(mayPlayRecordingAsFile(true, false)).toBe(true);
   });
 });

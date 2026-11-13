@@ -9,7 +9,7 @@ import { isModuleOpenForStudent } from "@/app/server/course/module-access";
 import { getActivePracticumId } from "@/app/server/course/practicum-service";
 import { isStreamPrivate } from "./stream-visibility";
 import { assertPracticumViewer } from "./access";
-import { buildMasterPlaylist, HLS_MANIFEST_FILE, hlsRenditionPlaylistKey, isHlsRenditionName, parseHlsManifest, recordingHlsPrefix, signMediaPlaylist, type HlsManifest } from "./recording-hls";
+import { buildMasterPlaylist, HLS_MANIFEST_FILE, hlsRenditionPlaylistKey, isHlsRenditionName, mayPlayRecordingAsFile, parseHlsManifest, recordingHlsPrefix, signMediaPlaylist, type HlsManifest } from "./recording-hls";
 
 // HLS copies are written once and never change, so they're cached in memory. "Not ready yet" is
 // rechecked every minute; a signed playlist is reused for an hour (its URLs live 6 h, so a cached
@@ -212,6 +212,13 @@ export class StreamService {
    */
   public async getRecordingPlaybackUrl(actorId: string, mediaAssetId: string): Promise<string> {
     const objectKey = await this.resolveOwnRecordingKey(actorId, mediaAssetId);
+    const { role } = await assertPracticumViewer(actorId);
+    const isStaff = role === UserRole.CURATOR || role === UserRole.OWNER;
+    // Staff always may, so the storage lookup is skipped for them.
+    const hasHlsCopies = !isStaff && Boolean(await loadHlsManifest(objectKey));
+    if (!mayPlayRecordingAsFile(isStaff, hasHlsCopies)) {
+      throw new AuthServiceError("FORBIDDEN", "This recording plays in the player only");
+    }
     return mintRecordingPlaybackUrl(objectKey);
   }
 

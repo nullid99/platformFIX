@@ -401,7 +401,7 @@ function LiveKitVideoSurface({ token, roomName, fullscreenRef }: LiveKitPlayback
   };
 
   return <>
-    <video ref={videoElRef} autoPlay playsInline muted={muted} />
+    <video ref={videoElRef} autoPlay playsInline muted={muted} controlsList="nodownload" />
     {muted && (
       <button type="button" className="tracked-video-unmute" onClick={() => { setMuted(false); if (videoElRef.current) videoElRef.current.muted = false; }}>
         Включить звук
@@ -597,6 +597,11 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
   const [quality, setQuality] = useState(-1);
   const [autoHeight, setAutoHeight] = useState<number | null>(null);
   const playWhenReadyRef = useRef(false);
+  // The single-file fallback can now be refused (a student gets the whole MP4 only while the HLS
+  // copies don't exist — see mayPlayRecordingAsFile), so a failed load says so and offers a retry
+  // instead of a silently black player.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
   useEffect(() => {
     const masterUrl = recordingHlsMasterUrl(src);
     const video = videoRef.current;
@@ -651,7 +656,7 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       hls?.destroy();
       hlsRef.current = null;
     };
-  }, [src]);
+  }, [src, retryKey]);
   // A play pressed during the split second of "probing" starts once the source is decided.
   useEffect(() => {
     if (mode === "probing" || !playWhenReadyRef.current) return;
@@ -821,7 +826,8 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       ref={videoRef}
       src={videoSrc}
       playsInline
-      onError={() => { if (mode === "hls-native") setMode("mp4"); }}
+      controlsList="nodownload"
+      onError={() => { if (mode === "hls-native") setMode("mp4"); else if (mode === "mp4" && hlsMasterUrl) setLoadFailed(true); }}
       onPointerDown={(event) => { touchInputRef.current = event.pointerType === "touch"; }}
       onClick={handleVideoClick}
       onDoubleClick={() => { if (!touchInputRef.current) toggleFullscreen(); }}
@@ -831,7 +837,8 @@ function RecordedVideoSurface({ src, title, fullscreenRef }: { src: string; titl
       onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime)}
       onLoadedMetadata={(event) => handleLoadedMetadata(event.currentTarget)}
     />
-    {resumedFrom !== null && <div className="recorded-video-resume">Продолжаем с {formatVideoTime(resumedFrom)} · <button type="button" onClick={restartFromBeginning}>С начала</button></div>}
+    {loadFailed && <div className="recorded-video-resume" role="alert">Не удалось загрузить запись · <button type="button" onClick={() => { setLoadFailed(false); setMode("probing"); setRetryKey((current) => current + 1); }}>Повторить</button></div>}
+    {resumedFrom !== null && !loadFailed && <div className="recorded-video-resume">Продолжаем с {formatVideoTime(resumedFrom)} · <button type="button" onClick={restartFromBeginning}>С начала</button></div>}
     <div className="recorded-video-controls">
       <button type="button" onClick={togglePlay} aria-label={playing ? "Пауза" : "Воспроизвести"}>{playing ? <Pause size={16} /> : <Play size={16} />}</button>
       <button type="button" className="recorded-video-speed recorded-video-skip" onClick={() => seekBy(-10)} aria-label="10 секунд назад">−10</button>
@@ -885,7 +892,10 @@ const TrackedVideo = forwardRef<HTMLDivElement, { mediaId?: string | null; src?:
     // built-in controls include a Download option and (being cross-origin, after the redirect)
     // an unreliable fullscreen button. A same-origin <video> avoids both: controlsList hides the
     // download affordance, and fullscreen on an element in our own document just works.
-    return <div className={`tracked-video ${className}`} ref={mergeRefs(wrapperRef, forwardedRef)}>
+    // No right-click menu on the player (2026-11-13): it offered "Сохранить видео как…" whenever a
+    // recording played as a single MP4, plus the browser's own controls. Not real protection — the
+    // watermark is what deters copying — but it stops saving with the mouse.
+    return <div className={`tracked-video ${className}`} ref={mergeRefs(wrapperRef, forwardedRef)} onContextMenu={(event) => event.preventDefault()}>
       {livekit
         ? <LiveKitVideoSurface key={livekit.roomName} token={livekit.token} roomName={livekit.roomName} fullscreenRef={wrapperRef} />
         : src?.startsWith("/api/streams/recordings/")

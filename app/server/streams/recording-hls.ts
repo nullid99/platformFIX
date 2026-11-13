@@ -41,6 +41,16 @@ export function recordingHlsPrefix(objectKey: string): string {
   return `hls/${match[1]}/`;
 }
 
+/**
+ * Whether a viewer may get a recording as one whole MP4 (the `/play` route). Staff always. A
+ * student only while the HLS copies don't exist yet (the first hour after a stream, or a failed
+ * transcode): once they do, the player uses those, and the whole file is what "Сохранить видео
+ * как…" or a copied link would download (2026-11-13).
+ */
+export function mayPlayRecordingAsFile(isStaff: boolean, hasHlsCopies: boolean): boolean {
+  return isStaff || !hasHlsCopies;
+}
+
 export function isHlsRenditionName(value: string): boolean {
   return RENDITION_NAME.test(value);
 }
