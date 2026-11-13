@@ -1120,6 +1120,45 @@ export class CourseService {
     return this.toMediaDto(media);
   }
 
+  /**
+   * "Заменить на Vimeo" (2026-11-13): recordings are being moved off the stream server, and
+   * delete + re-add would send each one to the end of «Записи» (new publish date), drop its chat
+   * archive and view log, and notify every student about a "new" recording. So the same row just
+   * starts playing from Vimeo; title, dates, lesson/event, order, audience, status, durationSec
+   * (future timecodes are seconds from the start, so they stay valid for the same video) and the
+   * chat window are untouched. The file itself is NOT deleted — its key is kept in replacedFromKey.
+   * Works for a Vimeo item too (fixing a wrong link); then there is no file to remember.
+   */
+  public async replaceMediaWithVimeo(actorId: string, mediaId: string, vimeoUrl: string) {
+    await this.assertCurator(actorId);
+    const normalizedMediaId = requiredText(mediaId, "mediaId", 100);
+    const providerKey = normalizeVimeoKey(vimeoUrl);
+    const existing = await prisma.mediaAsset.findUnique({ where: { id: normalizedMediaId }, select: { provider: true, providerKey: true, status: true, replacedFromKey: true } });
+    if (!existing || existing.status === MediaAssetStatus.ARCHIVED) throw new AuthServiceError("INVALID_INPUT", "Media does not exist");
+    const isOwnRecording = existing.provider.toUpperCase() === "LIVEKIT_RECORDING";
+    if (!isOwnRecording && existing.provider.toUpperCase() !== "VIMEO") throw new AuthServiceError("INVALID_INPUT", "This media cannot be replaced with Vimeo");
+    if (!isOwnRecording && existing.providerKey === providerKey) throw new AuthServiceError("INVALID_INPUT", "Эта запись уже играет с этой ссылки Vimeo");
+
+    const media = await prisma.mediaAsset.update({
+      where: { id: normalizedMediaId },
+      data: {
+        provider: "VIMEO",
+        providerKey,
+        // Only our own recording has a file worth remembering; a Vimeo → Vimeo link fix keeps
+        // whatever an earlier replacement stored.
+        ...(isOwnRecording ? { replacedFromProvider: existing.provider, replacedFromKey: existing.providerKey, replacedAt: new Date() } : {}),
+      },
+      select: { id: true, provider: true, providerKey: true, kind: true, audience: true, status: true, title: true, description: true, durationSec: true, byteSize: true, position: true, publishedAt: true, scheduleEventId: true },
+    }).catch((error: unknown) => {
+      if (error instanceof Error && error.message.includes("Unique constraint")) {
+        throw new AuthServiceError("INVALID_INPUT", "Это видео Vimeo уже добавлено в этот урок отдельной записью");
+      }
+      throw error;
+    });
+
+    return this.toMediaDto(media);
+  }
+
   public async renameMedia(actorId: string, mediaId: string, title: string) {
     await this.assertCurator(actorId);
     const normalizedMediaId = requiredText(mediaId, "mediaId", 100);

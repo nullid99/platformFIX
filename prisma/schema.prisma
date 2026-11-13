@@ -552,6 +552,13 @@ model MediaAsset {
   // Null for anything not auto-created from a live recording (manual Vimeo uploads etc).
   chatSessionStartedAt DateTime?
   chatSessionEndedAt   DateTime?
+  // "Заменить на Vimeo" (CourseService#replaceMediaWithVimeo) switches provider/providerKey on
+  // the SAME row, so its place, date, lesson, chat archive and view log stay. These keep what it
+  // played from before — our recording's object key — so the file on the stream server can still
+  // be found (to restore it, or to delete it deliberately). Null for anything never replaced.
+  replacedFromProvider String?
+  replacedFromKey      String?
+  replacedAt           DateTime?
   createdAt            DateTime             @default(now())
   updatedAt            DateTime             @updatedAt
   practicum            Practicum            @relation(fields: [practicumId], references: [id], onDelete: Cascade)

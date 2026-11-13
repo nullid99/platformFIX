@@ -105,6 +105,15 @@ export function parseCreateMediaGroupBody(value: unknown): { title: string } {
   return { title: text(body.title, "title", 80)! };
 }
 
+export function parseReplaceMediaSourceBody(value: unknown): { vimeoUrl: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BadRequestException("body must be an object");
+  }
+
+  const body = value as Record<string, unknown>;
+  return { vimeoUrl: text(body.vimeoUrl, "vimeoUrl", 500)! };
+}
+
 export function parseRenameMediaBody(value: unknown): { title: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new BadRequestException("body must be an object");

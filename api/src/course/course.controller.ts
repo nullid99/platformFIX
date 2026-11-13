@@ -17,7 +17,7 @@ import type { Request } from "express";
 import { AUTH_COOKIE_NAMES, AuthServiceError, authService } from "@/app/server/auth";
 import { courseService, createNewPracticum, deletePracticum, getPracticumDeletionImpact, getStudentProgress, listPracticums, sendStudentReminder, setActivePracticum, setPracticumCompleted, setPracticumStreamsPrivate, setWorkingPracticum } from "@/app/server/course";
 import { getRequestContext } from "../common/request-context";
-import { parseCreateMediaGroupBody, parseCreateModuleBody, parseCreateVimeoMediaBody, parseRenameMediaBody, parseUpdateMediaKindBody } from "./course-input";
+import { parseCreateMediaGroupBody, parseCreateModuleBody, parseCreateVimeoMediaBody, parseRenameMediaBody, parseReplaceMediaSourceBody, parseUpdateMediaKindBody } from "./course-input";
 
 type RequestWithCookies = Request & { cookies?: Record<string, string | undefined> };
 
@@ -216,6 +216,20 @@ export class CourseController {
     try {
       const session = await authService.validateSession(token);
       return { data: await courseService.updateMediaClassification(session.userId, mediaId, parseUpdateMediaKindBody(body)) };
+    } catch (error) {
+      if (error instanceof AuthServiceError) mapError(error);
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException("Course media operation failed");
+    }
+  }
+
+  @Put("media/:mediaId/vimeo-source")
+  public async replaceMediaWithVimeo(@Req() request: RequestWithCookies, @Param("mediaId") mediaId: string, @Body() body: unknown) {
+    const token = request.cookies?.[AUTH_COOKIE_NAMES.session];
+    if (!token) throw new UnauthorizedException("Session is required");
+    try {
+      const session = await authService.validateSession(token);
+      return { data: await courseService.replaceMediaWithVimeo(session.userId, mediaId, parseReplaceMediaSourceBody(body).vimeoUrl) };
     } catch (error) {
       if (error instanceof AuthServiceError) mapError(error);
       if (error instanceof BadRequestException) throw error;
