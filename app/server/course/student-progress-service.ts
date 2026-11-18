@@ -1,4 +1,4 @@
-import { EnrollmentStatus, ModuleAccessStatus, SessionStatus, SubmissionStatus, UserRole, UserStatus } from "@/app/generated/prisma/enums";
+import { AssignmentStatus, EnrollmentStatus, ModuleAccessStatus, SessionStatus, SubmissionStatus, UserRole, UserStatus } from "@/app/generated/prisma/enums";
 import { prisma } from "@/app/server/db";
 import { AuthServiceError } from "@/app/server/auth";
 import { sendCuratorReminderNotification } from "@/app/server/notifications/email-service";
@@ -33,6 +33,19 @@ async function assertOwnerOrCurator(actorId: string): Promise<void> {
 }
 
 /**
+ * Whether a lesson counts as done for "Выполнено X/Y". Normally only COMPLETED, which is set when
+ * every ДЗ of the lesson is accepted or a curator presses "Урок пройден". A lesson with no ДЗ has
+ * nothing to accept, so it stayed "open" forever and a student who had seen everything showed
+ * 10/12 (2026-11-17). Such a lesson counts as done once it is open AND every lesson before it is
+ * done — the student gets there by having each earlier ДЗ accepted, so a student still on lesson 5
+ * isn't credited with the last two just because they're open to everyone.
+ */
+export function isLessonDone(status: ModuleAccessStatus, publishedAssignmentCount: number, allPreviousDone: boolean): boolean {
+  if (status === ModuleAccessStatus.COMPLETED) return true;
+  return status === ModuleAccessStatus.UNLOCKED && publishedAssignmentCount === 0 && allPreviousDone;
+}
+
+/**
  * Owner or curator — one row per actively-enrolled student in `practicumId`, built from three flat
  * queries (modules, enrollments+moduleAccesses, pending submissions) rather than one round-trip per
  * student, so this stays cheap no matter how large a cohort grows. "Прогресс %"/"Выполнено X/Y" both
@@ -57,7 +70,7 @@ export async function getStudentProgress(actorId: string, practicumId: string): 
       // inflated the denominator with modules that aren't part of the curriculum this page tracks.
       where: { practicumId, section: { in: ["Welcome", "Education", "Q&A"] } },
       orderBy: { position: "asc" },
-      select: { id: true, title: true, defaultAccess: true },
+      select: { id: true, title: true, defaultAccess: true, _count: { select: { assignments: { where: { status: AssignmentStatus.PUBLISHED } } } } },
     }),
     prisma.enrollment.findMany({
       where: { practicumId, ...activeEnrollmentFilter },
@@ -112,7 +125,8 @@ export async function getStudentProgress(actorId: string, practicumId: string): 
     let foundCurrent = false;
     for (const courseModule of modules) {
       const status = accessByModule.get(courseModule.id) ?? courseModule.defaultAccess;
-      if (status === ModuleAccessStatus.COMPLETED) {
+      // foundCurrent stays false exactly while every lesson so far has been done.
+      if (isLessonDone(status, courseModule._count.assignments, !foundCurrent)) {
         completedModules += 1;
       } else if (!foundCurrent) {
         currentLessonTitle = courseModule.title;
